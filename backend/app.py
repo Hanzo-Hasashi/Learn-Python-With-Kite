@@ -166,6 +166,9 @@ class QuizAttempt(Base):
     percentage: Mapped[int] = mapped_column(Integer)
     passed: Mapped[bool] = mapped_column(Boolean)
     feedback_json: Mapped[str] = mapped_column(Text)
+    submission_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -751,6 +754,9 @@ class ChallengeIn(BaseModel):
 
 class QuizIn(BaseModel):
     answers: list[int] = Field(max_length=30)
+    submission_id: str | None = Field(
+        default=None, min_length=16, max_length=64, pattern=r"^[a-f0-9-]+$",
+    )
 
 
 class GuestProgressImportIn(BaseModel):
@@ -795,14 +801,25 @@ def startup() -> None:
         raise RuntimeError("Set both SUPABASE_URL and SUPABASE_ANON_KEY, or leave both empty.")
     Base.metadata.create_all(engine)
     notification_columns = {column["name"] for column in inspect(engine).get_columns("notifications")}
+    quiz_attempt_columns = {column["name"] for column in inspect(engine).get_columns("quiz_attempts")}
     with engine.begin() as connection:
         if "event_key" not in notification_columns:
             connection.execute(text("ALTER TABLE notifications ADD COLUMN event_key VARCHAR(160)"))
         if "target_route" not in notification_columns:
             connection.execute(text("ALTER TABLE notifications ADD COLUMN target_route VARCHAR(40)"))
+        if "submission_id" not in quiz_attempt_columns:
+            connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN submission_id VARCHAR(64)"))
+        if "request_hash" not in quiz_attempt_columns:
+            connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN request_hash VARCHAR(64)"))
+        if "result_json" not in quiz_attempt_columns:
+            connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"))
         connection.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_user_event "
             "ON notifications (user_id, event_key)"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_attempts_submission "
+            "ON quiz_attempts (user_id, quiz_id, submission_id) WHERE submission_id IS NOT NULL"
         ))
     with SessionLocal() as db:
         for row in LESSONS:
@@ -1132,11 +1149,22 @@ def lesson_payload(lesson: Lesson, progress: dict[str, LessonProgress], premium:
 def list_modules(user: User | None = Depends(optional_user), db: Session = Depends(get_db)):
     premium = bool(user and premium_entitled(db, user.id))
     progress = {}
+    quiz_results = {}
+    quiz_attempt_counts = {}
     if user:
         progress = {
             item.lesson_id: item
             for item in db.scalars(select(LessonProgress).where(LessonProgress.user_id == user.id))
         }
+        quiz_results = {
+            result.quiz_id: result
+            for result in db.scalars(select(QuizResult).where(QuizResult.user_id == user.id))
+        }
+        quiz_attempt_counts = dict(db.execute(
+            select(QuizAttempt.quiz_id, func.count(QuizAttempt.id))
+            .where(QuizAttempt.user_id == user.id)
+            .group_by(QuizAttempt.quiz_id)
+        ).all())
     lessons = [
         lesson_payload(lesson, progress, premium)
         for lesson in db.scalars(select(Lesson).order_by(Lesson.order_num))
@@ -1150,6 +1178,15 @@ def list_modules(user: User | None = Depends(optional_user), db: Session = Depen
         quizzes = [item for item in QUIZ_METADATA if item["module_id"] == module["id"]]
         challenges = [item for item in CHALLENGE_METADATA if item["module_id"] == module["id"]]
         locked = bool(module_lessons) and all(lesson["locked"] for lesson in module_lessons)
+        available_quizzes = [] if locked else quizzes
+        module_quiz_results = [
+            quiz_results[quiz["id"]]
+            for quiz in available_quizzes if quiz["id"] in quiz_results
+        ]
+        best_percentages = [
+            round(result.best_score / result.total_questions * 100)
+            for result in module_quiz_results if result.total_questions
+        ]
         modules.append({
             **module,
             "locked": locked,
@@ -1157,7 +1194,33 @@ def list_modules(user: User | None = Depends(optional_user), db: Session = Depen
             "lesson_count": len(module_lessons),
             "lessons": module_lessons,
             "quiz_count": len(quizzes),
-            "quizzes": [{**item, "locked": locked} for item in quizzes],
+            "completed_quizzes": len(module_quiz_results),
+            "quiz_attempt_count": sum(
+                quiz_attempt_counts.get(quiz["id"], 0) for quiz in available_quizzes
+            ),
+            "average_quiz_score": (
+                round(sum(best_percentages) / len(best_percentages))
+                if best_percentages else None
+            ),
+            "quizzes": [
+                {
+                    **item,
+                    "locked": locked,
+                    "completed": not locked and item["id"] in quiz_results,
+                    "best_percentage": (
+                        round(
+                            quiz_results[item["id"]].best_score
+                            / quiz_results[item["id"]].total_questions * 100
+                        )
+                        if not locked and item["id"] in quiz_results
+                        and quiz_results[item["id"]].total_questions else None
+                    ),
+                    "attempt_count": (
+                        quiz_attempt_counts.get(item["id"], 0) if not locked else 0
+                    ),
+                }
+                for item in quizzes
+            ],
             "challenge_count": len(challenges),
             "challenges": [{**item, "locked": locked} for item in challenges],
         })
@@ -1923,6 +1986,23 @@ def submit_quiz(quiz_id: str, payload: QuizIn, user: User | None = Depends(optio
     if any(answer < -1 or answer >= len(question["options"])
            for answer, question in zip(payload.answers, questions)):
         raise HTTPException(status_code=400, detail="One or more selected answers are not valid.")
+    request_hash = hashlib.sha256(
+        json.dumps(payload.answers, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if user and payload.submission_id:
+        existing_attempt = db.scalar(select(QuizAttempt).where(
+            QuizAttempt.user_id == user.id,
+            QuizAttempt.quiz_id == quiz_id,
+            QuizAttempt.submission_id == payload.submission_id,
+        ))
+        if existing_attempt:
+            if existing_attempt.request_hash != request_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This submission has already been saved with different answers.",
+                )
+            return json.loads(existing_attempt.result_json)
+
     score = sum(1 for answer, question in zip(payload.answers, questions) if answer == question["answer"])
     total = len(questions)
     percentage = round(score / total * 100)
@@ -1952,7 +2032,7 @@ def submit_quiz(quiz_id: str, payload: QuizIn, user: User | None = Depends(optio
         awarded = xp if xp and not has_award else 0
         earned_before = {
             item["id"] for item in achievement_catalog(user, db) if item["earned"]
-        } if is_best else set()
+        }
         if quiz_result is None:
             quiz_result = QuizResult(
                 user_id=user.id,
@@ -1971,7 +2051,7 @@ def submit_quiz(quiz_id: str, payload: QuizIn, user: User | None = Depends(optio
                 QuizAttempt.user_id == user.id, QuizAttempt.quiz_id == quiz_id
             )
         ) or 0) + 1
-        db.add(QuizAttempt(
+        attempt = QuizAttempt(
             user_id=user.id,
             quiz_id=quiz_id,
             score=score,
@@ -1979,24 +2059,16 @@ def submit_quiz(quiz_id: str, payload: QuizIn, user: User | None = Depends(optio
             percentage=percentage,
             passed=passed,
             feedback_json=json.dumps(feedback),
+            submission_id=payload.submission_id,
+            request_hash=request_hash if payload.submission_id else None,
             created_at=utcnow(),
-        ))
+        )
+        db.add(attempt)
         if awarded:
             user.xp += awarded
             db.add(Activity(user_id=user.id, kind="quiz", item_id=quiz_id, xp=awarded))
-        if is_best:
-            update_streak(user, db)
-            create_notification(
-                user, db,
-                event_key="quiz-best:" + quiz_id + ":" + str(score),
-                title="Quiz result saved",
-                body="Best score: " + str(score) + "/" + str(total)
-                + (". You earned " + str(awarded) + " XP." if awarded else "."),
-                category="learning", target_route="quiz",
-            )
-            notify_new_achievements(user, db, earned_before)
-    db.commit()
-    return {
+        update_streak(user, db)
+    result = {
         "score": score,
         "total": total,
         "percentage": percentage,
@@ -2006,10 +2078,45 @@ def submit_quiz(quiz_id: str, payload: QuizIn, user: User | None = Depends(optio
         "xp_awarded": awarded,
         "total_xp": user.xp if user else None,
         "guest": user is None,
+        "submission_id": payload.submission_id,
         "feedback": feedback,
         "review_lesson_ids": metadata["lesson_ids"],
         "practice_challenge_id": metadata["practice_challenge_id"],
     }
+    if user:
+        attempt.result_json = json.dumps(result, separators=(",", ":"))
+        event_key = "quiz-attempt:" + quiz_id + ":" + (
+            payload.submission_id or secrets.token_hex(16)
+        )
+        create_notification(
+            user, db,
+            event_key=event_key,
+            title="Quiz result saved",
+            body="You scored " + str(score) + "/" + str(total) + " (" + str(percentage)
+            + "%) and " + ("passed." if passed else "did not pass.")
+            + ((" You earned " + str(awarded) + " XP.") if awarded else ""),
+            category="learning", target_route="quiz",
+        )
+        notify_new_achievements(user, db, earned_before)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if user and payload.submission_id:
+            existing_attempt = db.scalar(select(QuizAttempt).where(
+                QuizAttempt.user_id == user.id,
+                QuizAttempt.quiz_id == quiz_id,
+                QuizAttempt.submission_id == payload.submission_id,
+            ))
+            if existing_attempt:
+                if existing_attempt.request_hash != request_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This submission has already been saved with different answers.",
+                    )
+                return json.loads(existing_attempt.result_json)
+        raise
+    return result
 
 
 @app.exception_handler(Exception)

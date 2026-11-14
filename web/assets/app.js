@@ -19,6 +19,7 @@
   var pendingQuizAnswersKey = "kite.pendingQuizAnswers";
   var pendingQuizIndexKey = "kite.pendingQuizIndex";
   var pendingQuizDraftIdKey = "kite.pendingQuizDraftId";
+  var pendingQuizSubmissionIdKey = "kite.pendingQuizSubmissionId";
   var quizEntryModeKey = "kite.quizEntryMode";
   var completedQuizResultKey = "kite.completedQuizResult";
   var guestQuizAttemptsKey = "kite.guestQuizAttempts.v1";
@@ -1419,7 +1420,10 @@
               : 0;
             level.textContent = (module.completed_lessons + guestModuleCompletions) +
               " / " + module.lesson_count + " " + (module.lesson_count === 1 ? "lesson" : "lessons") +
-              " · " + module.quiz_count + " " + (module.quiz_count === 1 ? "quiz" : "quizzes") +
+              " · " + module.quizzes.filter(function (quiz) {
+                return !quiz.locked && (quiz.completed ||
+                  (guestProgress && guestQuizHistory(quiz).length > 0));
+              }).length + " / " + module.quiz_count + " quizzes" +
               " · " + module.challenge_count + " " +
               (module.challenge_count === 1 ? "challenge" : "challenges") + " · " + module.level;
             heading.append(title, level);
@@ -1564,6 +1568,7 @@
                 sessionStorage.setItem("kite.quizId", item.id);
                 sessionStorage.setItem(quizEntryModeKey, "runner");
                 sessionStorage.setItem(pendingQuizDraftIdKey, item.id);
+                sessionStorage.removeItem(pendingQuizSubmissionIdKey);
                 sessionStorage.removeItem(pendingQuizAnswersKey);
                 sessionStorage.removeItem(pendingQuizIndexKey);
                 sessionStorage.removeItem(completedQuizResultKey);
@@ -1724,6 +1729,7 @@
         drafts[state.id] = {
           answers: state.answers,
           index: state.index,
+          submission_id: sessionStorage.getItem(pendingQuizSubmissionIdKey),
           updated_at: new Date().toISOString()
         };
         try {
@@ -1748,7 +1754,21 @@
           sessionStorage.removeItem(pendingQuizDraftIdKey);
           sessionStorage.removeItem(pendingQuizAnswersKey);
           sessionStorage.removeItem(pendingQuizIndexKey);
+          sessionStorage.removeItem(pendingQuizSubmissionIdKey);
         }
+      }
+      function newQuizSubmissionId(doc) {
+        var cryptoApi = doc.defaultView && doc.defaultView.crypto;
+        if (cryptoApi && typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID();
+        if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
+          var bytes = new Uint8Array(16);
+          cryptoApi.getRandomValues(bytes);
+          return Array.prototype.map.call(bytes, function (byte) {
+            return ("0" + byte.toString(16)).slice(-2);
+          }).join("");
+        }
+        return Date.now().toString(16) + "-" + Math.random().toString(16).slice(2) +
+          Math.random().toString(16).slice(2);
       }
       function guestQuizHistory(item) {
         var history = readGuestQuizAttempts()[item.id];
@@ -1757,11 +1777,15 @@
       function storeGuestQuizAttempt(quizId, result) {
         var attempts = readGuestQuizAttempts();
         if (!Array.isArray(attempts[quizId])) attempts[quizId] = [];
+        if (result.submission_id && attempts[quizId].some(function (attempt) {
+          return attempt.submission_id === result.submission_id;
+        })) return;
         attempts[quizId].unshift({
           score: result.score,
           total: result.total,
           percentage: result.percentage,
           passed: result.passed,
+          submission_id: result.submission_id || null,
           created_at: new Date().toISOString(),
           feedback: result.feedback
         });
@@ -1849,8 +1873,12 @@
             sessionStorage.setItem("kite.quizId", item.id);
             sessionStorage.setItem(quizEntryModeKey, "runner");
             sessionStorage.removeItem(completedQuizResultKey);
+            if (sessionStorage.getItem(pendingQuizDraftIdKey) !== item.id) {
+              sessionStorage.removeItem(pendingQuizSubmissionIdKey);
+            }
             if (!hasDraft) {
               removeQuizDraft(item.id);
+              sessionStorage.removeItem(pendingQuizSubmissionIdKey);
               sessionStorage.removeItem(pendingQuizAnswersKey);
               sessionStorage.removeItem(pendingQuizIndexKey);
             }
@@ -2057,8 +2085,9 @@
         }
         previous.disabled = state.index === 0;
         previous.setAttribute("aria-label", "Previous question");
-        next.textContent = state.index === state.questions.length - 1 ? "Submit quiz" : "Next question";
-        next.disabled = !Number.isInteger(state.answers[state.index]);
+        var isFinalQuestion = state.index === state.questions.length - 1;
+        next.textContent = isFinalQuestion ? "Submit quiz" : "Next question";
+        next.disabled = !isFinalQuestion && !Number.isInteger(state.answers[state.index]);
         var validation = doc.getElementById("kite-quiz-validation");
         if (!validation) {
           validation = doc.createElement("div");
@@ -2067,7 +2096,10 @@
           validation.setAttribute("role", "status");
           footer.parentNode.insertBefore(validation, footer);
         }
-        validation.textContent = next.disabled ? "Select an answer to continue." : "";
+        validation.textContent = next.disabled ? "Select an answer to continue." :
+          (isFinalQuestion && !Number.isInteger(state.answers[state.index])
+            ? "Unanswered questions will be marked incorrect if you submit."
+            : "");
         footer.style.display = "";
       }
       function quizQuestionTypeLabel(type) {
@@ -2282,6 +2314,7 @@
           addContentPicker(doc, "quiz", catalog, selected.id, function (nextId) {
             sessionStorage.setItem("kite.quizId", nextId);
             sessionStorage.setItem(pendingQuizDraftIdKey, nextId);
+            sessionStorage.removeItem(pendingQuizSubmissionIdKey);
             sessionStorage.removeItem(pendingQuizAnswersKey);
             sessionStorage.removeItem(pendingQuizIndexKey);
             sessionStorage.removeItem(completedQuizResultKey);
@@ -2308,6 +2341,10 @@
               var drafts = readQuizDrafts();
               var storedDraft = drafts[selected.id];
               var storedAnswers = storedDraft && storedDraft.answers;
+              if (storedDraft && storedDraft.submission_id &&
+                  sessionStorage.getItem(pendingQuizSubmissionIdKey) !== storedDraft.submission_id) {
+                sessionStorage.setItem(pendingQuizSubmissionIdKey, storedDraft.submission_id);
+              }
               if (!Array.isArray(storedAnswers) && sessionDraftAnswers) {
                 try {
                   storedAnswers = JSON.parse(sessionDraftAnswers);
@@ -3027,6 +3064,7 @@
         sessionStorage.setItem("kite.quizId", target.value);
         sessionStorage.setItem(quizEntryModeKey, "runner");
         sessionStorage.setItem(pendingQuizDraftIdKey, target.value);
+        sessionStorage.removeItem(pendingQuizSubmissionIdKey);
         sessionStorage.removeItem(pendingQuizAnswersKey);
         sessionStorage.removeItem(pendingQuizIndexKey);
         sessionStorage.removeItem(completedQuizResultKey);
@@ -3430,7 +3468,11 @@
         var quizState = doc.documentElement.kiteQuizState;
         var choiceIndex = quizState ? quizState.index : quizQuestionIndex(doc);
         if (quizState && choiceIndex >= 0) {
-          quizState.answers[choiceIndex] = Number(target.dataset.k);
+          var selectedAnswer = Number(target.dataset.k);
+          if (quizState.answers[choiceIndex] !== selectedAnswer) {
+            sessionStorage.removeItem(pendingQuizSubmissionIdKey);
+          }
+          quizState.answers[choiceIndex] = selectedAnswer;
           sessionStorage.setItem(quizEntryModeKey, "runner");
           saveQuizDraft(quizState, doc);
           renderQuizQuestion(doc, quizState);
@@ -3452,34 +3494,73 @@
         event.preventDefault();
         event.stopImmediatePropagation();
         var quizState = doc.documentElement.kiteQuizState;
-        if (!quizState || !Number.isInteger(quizState.answers[quizState.index])) return;
+        if (!quizState) return;
         if (quizState.index < quizState.questions.length - 1) {
+          if (!Number.isInteger(quizState.answers[quizState.index])) return;
           quizState.index += 1;
           saveQuizDraft(quizState, doc);
           renderQuizQuestion(doc, quizState);
+          return;
+        }
+        var unanswered = [];
+        var invalidAnswer = quizState.answers.length !== quizState.questions.length;
+        quizState.questions.forEach(function (question, index) {
+          var answer = quizState.answers[index];
+          if (answer === null || answer === undefined) {
+            unanswered.push(index + 1);
+          } else if (!Number.isInteger(answer) || answer < 0 ||
+              answer >= question.options.length) {
+            invalidAnswer = true;
+          }
+        });
+        if (invalidAnswer) {
+          tell(doc, "Some saved answers are invalid. Review the quiz before submitting.", true);
           return;
         }
         sessionStorage.setItem("kite.quizId", quizState.id);
         sessionStorage.setItem(pendingQuizDraftIdKey, quizState.id);
         sessionStorage.setItem(pendingQuizAnswersKey, JSON.stringify(quizState.answers));
         var win = doc.defaultView;
-        if (win && typeof win.confirm === "function" &&
-            !win.confirm("Submit this quiz and view your score and explanations?")) return;
+        var confirmation = unanswered.length
+          ? "Questions " + unanswered.join(", ") +
+            " are unanswered and will be marked incorrect. Submit anyway?"
+          : "Submit this quiz and view your score and explanations?";
+        if (win && typeof win.confirm === "function" && !win.confirm(confirmation)) return;
+        var submissionId = sessionStorage.getItem(pendingQuizSubmissionIdKey) ||
+          newQuizSubmissionId(doc);
+        sessionStorage.setItem(pendingQuizSubmissionIdKey, submissionId);
+        saveQuizDraft(quizState, doc);
+        var submitLabel = target.textContent;
         target.disabled = true;
+        target.textContent = "Submitting…";
+        target.setAttribute("aria-busy", "true");
+        var validation = doc.getElementById("kite-quiz-validation");
+        if (validation) validation.textContent = "Submitting your answers…";
         api("/api/quizzes/" + encodeURIComponent(quizState.id) + "/submit", {
           answers: quizState.answers.map(function (answer) {
             return Number.isInteger(answer) ? answer : -1;
-          })
+          }),
+          submission_id: submissionId
         }).then(function (result) {
           if (result.guest) storeGuestQuizAttempt(quizState.id, result);
           removeQuizDraft(quizState.id);
+          if (validation) validation.textContent = "";
+          target.removeAttribute("aria-busy");
           sessionStorage.setItem(completedQuizResultKey, JSON.stringify({ id: quizState.id, result: result }));
           renderQuizResult(doc, quizState, result);
           tell(doc, result.guest ? "Quiz result saved on this device." :
             "Quiz score saved." + (result.xp_awarded ? " +" + result.xp_awarded + " XP." : ""), false);
         }).catch(function (error) {
+          var submitError = error.status ? error.message :
+            "A network problem interrupted submission. Check your connection and retry.";
           target.disabled = false;
-          tell(doc, error.message, true);
+          target.textContent = submitLabel;
+          target.removeAttribute("aria-busy");
+          if (validation) {
+            validation.textContent = "Your answers were not submitted. " +
+              submitError + " You can retry without losing your answers.";
+          }
+          tell(doc, submitError, true);
         });
         return;
       }

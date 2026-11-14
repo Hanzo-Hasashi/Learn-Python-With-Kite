@@ -273,9 +273,22 @@ class KiteApiTests(unittest.TestCase):
         self.assertTrue(all(item["explanation"] for item in result.json()["feedback"]))
         with patch("backend.app.premium_entitled", return_value=True):
             progress = self.client.get("/api/progress", headers=self.headers).json()
+            modules = self.client.get("/api/modules", headers=self.headers).json()
         self.assertEqual(progress["quiz_count"], 1)
         self.assertEqual(progress["quiz_attempt_count"], 1)
         self.assertEqual(progress["average_quiz_score"], 100)
+        module = next(
+            item for item in modules
+            if item["id"] == next(
+                quiz["module_id"] for quiz in QUIZ_METADATA if quiz["id"] == "strings-reading"
+            )
+        )
+        self.assertEqual(module["completed_quizzes"], 1)
+        self.assertEqual(module["quiz_attempt_count"], 1)
+        self.assertEqual(module["average_quiz_score"], 100)
+        strings_quiz = next(item for item in module["quizzes"] if item["id"] == "strings-reading")
+        self.assertTrue(strings_quiz["completed"])
+        self.assertEqual(strings_quiz["attempt_count"], 1)
 
     def test_guest_can_submit_free_quizzes_without_account_or_server_history(self):
         catalog = self.client.get("/api/quizzes")
@@ -375,6 +388,39 @@ class KiteApiTests(unittest.TestCase):
         )
         self.assertEqual(other_quiz["attempt_count"], 0)
         self.assertEqual(other_quiz["attempts"], [])
+
+    def test_quiz_submission_idempotency_replays_saved_result_without_duplicate_attempt(self):
+        answers = [0, 1, 1, 2, 1, 1, 2, 2, 1, 1]
+        payload = {"answers": answers, "submission_id": uuid.uuid4().hex}
+        first = self.client.post(
+            "/api/quizzes/python-basics/submit", headers=self.headers, json=payload,
+        )
+        replay = self.client.post(
+            "/api/quizzes/python-basics/submit", headers=self.headers, json=payload,
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json(), first.json())
+        self.assertEqual(first.json()["attempt_number"], 1)
+        self.assertEqual(first.json()["submission_id"], payload["submission_id"])
+
+        changed_answers = self.client.post(
+            "/api/quizzes/python-basics/submit",
+            headers=self.headers,
+            json={"answers": [-1] + answers[1:], "submission_id": payload["submission_id"]},
+        )
+        self.assertEqual(changed_answers.status_code, 409)
+
+        quiz = next(
+            item for item in self.client.get("/api/quizzes", headers=self.headers).json()
+            if item["id"] == "python-basics"
+        )
+        self.assertEqual(quiz["attempt_count"], 1)
+        notices = [
+            item for item in self.client.get("/api/notifications", headers=self.headers).json()
+            if item["category"] == "learning" and item["target_route"] == "quiz"
+        ]
+        self.assertEqual(len(notices), 1)
 
     def test_new_challenge_uses_runner_tests_and_awards_xp_once(self):
         with patch("backend.app.premium_entitled", return_value=True), \
@@ -824,7 +870,7 @@ class KiteApiTests(unittest.TestCase):
             item for item in self.client.get("/api/notifications", headers=self.headers).json()
             if item["category"] == "learning" and item["target_route"] == "quiz"
         ]
-        self.assertEqual(len(quiz_notices), 1)
+        self.assertEqual(len(quiz_notices), 2)
 
     def test_quiz_best_score_updates_on_retry_without_extra_xp(self):
         correct = [0, 1, 1, 2, 1, 1, 2, 2, 1, 1]
@@ -834,6 +880,8 @@ class KiteApiTests(unittest.TestCase):
         )
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(first.json()["score"], 7)
+        self.assertIsNone(first.json()["feedback"][0]["your_answer"])
+        self.assertFalse(first.json()["feedback"][0]["correct"])
         self.assertNotIn(
             "Quiz Master", self.client.get("/api/progress", headers=self.headers).json()["achievements"],
         )
