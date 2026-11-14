@@ -1,0 +1,64 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/kite.db}
+      RUNNER_URL: http://runner:8010
+    ports:
+      - "8000:8000"
+    volumes:
+      - kite-data:/data
+    depends_on:
+      runner:
+        condition: service_healthy
+    networks:
+      - default
+      - runner-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  runner:
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+    environment:
+      RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET}
+    networks:
+      - runner-net
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=0755
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 32
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health')"]
+      interval: 20s
+      timeout: 4s
+      retries: 3
+
+volumes:
+  kite-data:
+
+networks:
+  runner-net:
+    internal: true

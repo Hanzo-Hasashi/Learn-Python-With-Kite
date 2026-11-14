@@ -1,0 +1,221 @@
+#kite-playground-shortcut {
+  position: fixed;
+  z-index: 9;
+  top: auto;
+  right: calc(16px + env(safe-area-inset-right, 0px));
+  bottom: calc(94px + env(safe-area-inset-bottom, 0px));
+  color: var(--ink);
+  font: 500 13px/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+  transform: none;
+  transition: opacity .16s ease, transform .18s ease;
+}
+
+#kite-playground-shortcut[hidden],
+#kite-playground-shortcut .kite-playground-panel[hidden] {
+  display: none !important;
+}
+
+#kite-playground-shortcut .kite-playground-toggle {
+  display: flex;
+  width: 48px;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 9px;
+  background: var(--card);
+  color: inherit;
+  box-shadow: 0 5px 18px rgba(15, 30, 55, .2);
+  cursor: pointer;
+  transition: background-color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+
+#kite-playground-shortcut .kite-playground-toggle:hover {
+  background: var(--soft);
+  box-shadow: 0 10px 28px rgba(15, 30, 55, .2);
+}
+
+#kite-playground-shortcut .kite-playground-toggle:active {
+  transform: translateX(-2px);
+}
+
+#kite-playground-shortcut .kite-python-mark {
+  display: block;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  object-fit: contain;
+}
+
+#kite-playground-shortcut .kite-playground-label {
+  display: none;
+  flex: 1;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+#kite-playground-shortcut .kite-playground-chevron {
+  display: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  color: var(--mut);
+  transition: transform .18s ease;
+}
+
+#kite-playground-shortcut.is-expanded .kite-playground-chevron {
+  transform: rotate(180deg);
+}
+
+#kite-playground-shortcut .kite-playground-panel {
+  position: absolute;
+  top: auto;
+  right: 0;
+  bottom: calc(100% + 9px);
+  width: min(228px, calc(100vw - 28px));
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 16px;
+  background: var(--card);
+  box-shadow: 0 14px 36px rgba(15, 30, 55, .2);
+  transform: translateY(6px);
+  animation: kite-playground-in-mobile .18s ease-out forwards;
+}
+
+#kite-playground-shortcut .kite-playground-panel p {
+  margin: 0 40px 12px 0;
+  color: var(--mut);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+#kite-playground-shortcut .kite-playground-panel strong {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+#kite-playground-shortcut .kite-playground-open {
+  display: flex;
+  width: 100%;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 11px;
+  padding: 9px 12px;
+  background: var(--blue);
+  color: #fff;
+  font: 700 13px/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+  cursor: pointer;
+  transition: filter .16s ease, transform .16s ease;
+}
+
+#kite-playground-shortcut .kite-playground-open:hover {
+  filter: brightness(1.06);
+}
+
+#kite-playground-shortcut .kite-playground-open:active {
+  transform: translateY(1px);
+}
+
+#kite-playground-shortcut .kite-playground-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mut);
+  font: 500 18px/1 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+#kite-playground-shortcut .kite-playground-close:hover {
+  background: var(--soft);
+  color: var(--ink);
+}
+
+#kite-playground-shortcut :focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 3px;
+}
+
+@media (max-width: 900px) {
+  #kite-playground-shortcut.is-scrolling,
+  #kite-playground-shortcut.is-input-focused {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(12px);
+  }
+}
+
+@media (min-width: 901px) {
+  #kite-playground-shortcut {
+    top: 50%;
+    right: 0;
+    bottom: auto;
+    transform: translateY(-50%);
+  }
+
+  #kite-playground-shortcut .kite-playground-toggle {
+    width: 150px;
+    min-height: 50px;
+    justify-content: flex-start;
+    gap: 9px;
+    border-right: 0;
+    border-radius: 14px 0 0 14px;
+    padding: 8px 11px 8px 9px;
+    box-shadow: 0 8px 24px rgba(15, 30, 55, .16);
+  }
+
+  #kite-playground-shortcut .kite-python-mark {
+    width: 26px;
+    height: 26px;
+    flex-basis: 26px;
+  }
+
+  #kite-playground-shortcut .kite-playground-label,
+  #kite-playground-shortcut .kite-playground-chevron {
+    display: block;
+  }
+
+  #kite-playground-shortcut .kite-playground-panel {
+    top: 50%;
+    right: calc(100% + 9px);
+    bottom: auto;
+    width: 228px;
+    transform: translateY(-50%) translateX(6px);
+    animation-name: kite-playground-in;
+  }
+}
+
+@keyframes kite-playground-in-mobile {
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes kite-playground-in {
+  to {
+    transform: translateY(-50%) translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #kite-playground-shortcut *,
+  #kite-playground-shortcut *::before,
+  #kite-playground-shortcut *::after {
+    animation-duration: .01ms !important;
+    transition-duration: .01ms !important;
+  }
+}

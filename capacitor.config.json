@@ -1,0 +1,8 @@
+{
+  "appId": "com.kite.learn",
+  "appName": "Learn Python with Kite",
+  "webDir": "web",
+  "android": {
+    "allowMixedContent": false
+  }
+}
