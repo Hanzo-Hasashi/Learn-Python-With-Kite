@@ -8,6 +8,7 @@
   var googleVerifierKey = "kite.googleCodeVerifier";
   var authDestinationKey = "kite.authDestination";
   var authModeKey = "kite.authMode";
+  var rememberMeKey = "kite.rememberMe";
   var guestProgressKey = "kite.guestProgress.v1";
   var guestNotificationsKey = "kite.guestNotifications.v1";
   var pendingPlaygroundCodeKey = "kite.pendingPlaygroundCode";
@@ -21,6 +22,7 @@
   var pendingQuizDraftIdKey = "kite.pendingQuizDraftId";
   var pendingQuizSubmissionIdKey = "kite.pendingQuizSubmissionId";
   var quizEntryModeKey = "kite.quizEntryMode";
+  var lessonQuizContextKey = "kite.lessonQuizContext";
   var completedQuizResultKey = "kite.completedQuizResult";
   var guestQuizAttemptsKey = "kite.guestQuizAttempts.v1";
   var quizDraftsKey = "kite.quizDrafts.v1";
@@ -31,6 +33,9 @@
   var knownRoutes = ["about", "challenge", "home", "launch", "leaderboard", "learn", "lesson",
     "notifications", "playground", "preferences", "profile", "progress", "quiz"];
   var refreshInFlight = null;
+  var authRestoration = null;
+  var authUser = null;
+  var authCsrf = "";
   var busy = false;
   var oauthCallbackStarted = false;
   var activePlaygroundRun = null;
@@ -38,7 +43,7 @@
   var shellUserRequest = null;
 
   function token() {
-    return sessionStorage.getItem(tokenKey);
+    return authUser ? "cookie-session" : null;
   }
   function setMoreMenuAuthState(authenticated) {
     var menu = document.getElementById("pn");
@@ -46,9 +51,25 @@
     var signIn = menu.querySelector(".kite-menu-sign-in");
     var exitGuest = menu.querySelector(".kite-menu-exit-guest");
     var logOut = menu.querySelector("button.out");
-    if (signIn) signIn.style.display = authenticated ? "none" : "";
-    if (exitGuest) exitGuest.style.display = authenticated ? "none" : "";
-    if (logOut) logOut.style.display = authenticated ? "" : "none";
+    if (signIn) signIn.style.display = authenticated === null || authenticated ? "none" : "";
+    if (exitGuest) exitGuest.style.display = authenticated === null || authenticated ? "none" : "";
+    if (logOut) logOut.style.display = authenticated === true ? "" : "none";
+    if (authenticated === false) {
+      try {
+        var who = parent.document.getElementById("dr");
+        who = who && who.querySelector(".who");
+        if (who) {
+          var avatar = who.querySelector(".av");
+          var name = who.querySelector("b");
+          var detail = who.querySelector("small");
+          if (avatar) avatar.textContent = "G";
+          if (name) name.textContent = "Guest";
+          if (detail) detail.textContent = "Progress is stored on this device";
+        }
+      } catch (error) {
+        console.error("Could not update the Kite account menu.", error);
+      }
+    }
   }
   function ensureMoreMenuActions() {
     var menu = document.getElementById("pn");
@@ -71,7 +92,8 @@
     });
   }
   function navigate(route, replace) {
-    if (route !== "quiz" && route !== "challenge" && route !== "lesson") {
+    var preservingLessonQuiz = route === "playground" && sessionStorage.getItem(lessonQuizContextKey);
+    if (route !== "quiz" && route !== "challenge" && route !== "lesson" && !preservingLessonQuiz) {
       sessionStorage.removeItem(quizEntryModeKey);
     }
     if (typeof window.kiteNavigate === "function") window.kiteNavigate(route, replace);
@@ -80,7 +102,85 @@
   function clearAuthTokens() {
     sessionStorage.removeItem(tokenKey);
     sessionStorage.removeItem(refreshKey);
+    sessionStorage.removeItem(rememberMeKey);
+    authUser = null;
+    authCsrf = "";
+    authRestoration = Promise.resolve(null);
     setMoreMenuAuthState(false);
+  }
+  function rememberChoice(doc, form) {
+    var checkbox = form ? form.querySelector('input[name="remember_me"]') : null;
+    if (!checkbox) {
+      var choices = doc.querySelectorAll('input[name="remember_me"]');
+      for (var index = 0; index < choices.length; index += 1) {
+        if (choices[index].getClientRects().length) {
+          checkbox = choices[index];
+          break;
+        }
+      }
+    }
+    return Boolean(checkbox && checkbox.checked);
+  }
+  function acceptAuthSession(data) {
+    authUser = data && data.user ? data.user : null;
+    authCsrf = data && data.csrf_token ? data.csrf_token : "";
+    setMoreMenuAuthState(Boolean(authUser));
+    return authUser;
+  }
+  function restoreAuthentication() {
+    if (authRestoration) return authRestoration;
+    function fetchCurrentSession() {
+      return fetch((window.KITE_API_BASE || "") + "/api/auth/session", {
+        method: "GET",
+        credentials: "include"
+      }).then(responseData).then(acceptAuthSession);
+    }
+    var legacyAccessToken = sessionStorage.getItem(tokenKey);
+    var legacyRefreshToken = sessionStorage.getItem(refreshKey);
+    function clearLegacyTokens() {
+      sessionStorage.removeItem(tokenKey);
+      sessionStorage.removeItem(refreshKey);
+      sessionStorage.removeItem(rememberMeKey);
+    }
+    if (legacyAccessToken || legacyRefreshToken) {
+      var migration = fetch((window.KITE_API_BASE || "") + "/api/auth/session", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          access_token: legacyAccessToken || null,
+          refresh_token: legacyRefreshToken,
+          remember_me: sessionStorage.getItem(rememberMeKey) === "true"
+        })
+      }).then(responseData).then(function (data) {
+        clearLegacyTokens();
+        return acceptAuthSession(data);
+      }).catch(function (error) {
+        if (error.status !== 401) throw error;
+        clearLegacyTokens();
+        return null;
+      });
+      authRestoration = migration.then(function (restored) {
+        return restored || fetchCurrentSession();
+      }).catch(function (error) {
+        if (error.status === 401) {
+          clearAuthTokens();
+          return null;
+        }
+        authRestoration = null;
+        throw error;
+      });
+    } else {
+      authRestoration = fetchCurrentSession().catch(function (error) {
+        if (error.status === 401) {
+          clearAuthTokens();
+          return null;
+        }
+        authRestoration = null;
+        throw error;
+      });
+    }
+    return authRestoration;
   }
   function signInForRoute(route) {
     if (knownRoutes.indexOf(route) >= 0) sessionStorage.setItem(authDestinationKey, route);
@@ -105,15 +205,11 @@
   }
   function refreshSession() {
     if (refreshInFlight) return refreshInFlight;
-    refreshInFlight = fetch((window.KITE_API_BASE || "") + "/api/auth/refresh", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: sessionStorage.getItem(refreshKey) })
-    }).then(responseData).then(function (data) {
-      if (!data.access_token) throw new Error("Authentication service returned no access token.");
-      sessionStorage.setItem(tokenKey, data.access_token);
-      if (data.refresh_token) sessionStorage.setItem(refreshKey, data.refresh_token);
-      else sessionStorage.removeItem(refreshKey);
+    refreshInFlight = fetch((window.KITE_API_BASE || "") + "/api/auth/session", {
+      method: "GET",
+      credentials: "include"
+    }).then(responseData).then(acceptAuthSession).then(function (user) {
+      if (!user) throw new Error("Your session has expired. Sign in again.");
     }).catch(function (error) {
       if (error.status === 400 || error.status === 401) clearAuthTokens();
       throw error;
@@ -123,19 +219,28 @@
   function api(path, body, method) {
     function send(retried) {
       var headers = { "Content-Type": "application/json" };
-      if (token()) headers.Authorization = "Bearer " + token();
-      return fetch((window.KITE_API_BASE || "") + path, { method: method || (body ? "POST" : "GET"), headers: headers, body: body ? JSON.stringify(body) : undefined })
+      if (token() && authCsrf && (method || (body ? "POST" : "GET")) !== "GET") {
+        headers["X-Kite-CSRF"] = authCsrf;
+      }
+      return fetch((window.KITE_API_BASE || "") + path, {
+        method: method || (body ? "POST" : "GET"),
+        credentials: "include",
+        headers: headers,
+        body: body ? JSON.stringify(body) : undefined
+      })
         .then(function (response) {
-          if (response.status === 401 && !retried && sessionStorage.getItem(refreshKey) && path.indexOf("/api/auth/") !== 0) {
+          var isAuthRequest = path.indexOf("/api/auth/") === 0;
+          if (response.status === 401 && !retried && token() && !isAuthRequest) {
             return refreshSession().then(function () { return send(true); });
           }
-          if (response.status === 401 && !retried && path.indexOf("/api/auth/") !== 0 && token()) {
+          if (response.status === 401 && !retried && token() && !isAuthRequest) {
             clearAuthTokens();
           }
           return responseData(response);
         });
     }
-    return send(false);
+    return (authRestoration || Promise.resolve()).catch(function () { return null; })
+      .then(function () { return send(false); });
   }
   function tell(doc, text, isError) {
     var target = doc.getElementById("kite-verification-status") ||
@@ -422,15 +527,17 @@
     addGuestProgressPrompt(doc, body, false);
   }
   function completeAuthentication(doc, data, destination) {
-    sessionStorage.setItem(tokenKey, data.access_token);
-    if (data.refresh_token) sessionStorage.setItem(refreshKey, data.refresh_token);
-    else sessionStorage.removeItem(refreshKey);
-    setMoreMenuAuthState(true);
+    authUser = data.user || null;
+    authCsrf = data.csrf_token || "";
+    authRestoration = Promise.resolve(authUser);
+    setMoreMenuAuthState(Boolean(authUser));
+    if (authUser) hydrateShellUser(doc, authUser);
     var requestedDestination = sessionStorage.getItem(authDestinationKey);
     var nextDestination = requestedDestination || destination;
     sessionStorage.removeItem(authDestinationKey);
     sessionStorage.removeItem(authModeKey);
     sessionStorage.removeItem("kite.pendingVerificationEmail");
+    sessionStorage.removeItem(rememberMeKey);
     if (sessionStorage.getItem(subscriptionReturnKey) === "preferences") {
       sessionStorage.removeItem(subscriptionReturnKey);
       navigate("preferences", true);
@@ -445,10 +552,10 @@
   function logOut(doc) {
     function finish(error) {
       [tokenKey, refreshKey, pendingPlanKey, subscriptionReturnKey, authDestinationKey, authModeKey,
-        pendingPlaygroundCodeKey, pendingChallengeCodeKey, pendingQuizAnswersKey, googleVerifierKey]
+        rememberMeKey, pendingPlaygroundCodeKey, pendingChallengeCodeKey, pendingQuizAnswersKey,
+        googleVerifierKey]
         .forEach(function (key) { sessionStorage.removeItem(key); });
-      setMoreMenuAuthState(false);
-      hydrateShellUser(null);
+      clearAuthTokens();
       if (doc && doc.getElementById("sbody")) {
         doc.defaultView.location.hash = "#welcome";
         if (error) setTimeout(function () { tell(doc, "Signed out on this device, but server session revocation failed.", true); }, 0);
@@ -498,7 +605,8 @@
       }
       api("/api/auth/session", {
         access_token: accessToken,
-        refresh_token: hashParams.get("refresh_token")
+        refresh_token: hashParams.get("refresh_token"),
+        remember_me: sessionStorage.getItem(rememberMeKey) === "true"
       }).then(function (data) {
         completeAuthentication(doc, data, type === "signup" ? "home" : undefined);
       }).catch(function (error) {
@@ -516,7 +624,11 @@
     }
     if (oauthCallbackStarted) return true;
     oauthCallbackStarted = true;
-    api("/api/auth/google/exchange", { code: code, code_verifier: verifier }).then(function (data) {
+    api("/api/auth/google/exchange", {
+      code: code,
+      code_verifier: verifier,
+      remember_me: sessionStorage.getItem(rememberMeKey) === "true"
+    }).then(function (data) {
       sessionStorage.removeItem(googleVerifierKey);
       cleanAuthCallbackUrl();
       completeAuthentication(doc, data);
@@ -539,13 +651,14 @@
     bytes.forEach(function (byte) { binary += String.fromCharCode(byte); });
     return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
-  function startGoogleSignIn(doc) {
+  function startGoogleSignIn(doc, form) {
     if (!window.crypto || !window.crypto.subtle) {
       return Promise.reject(new Error("Secure Google sign-in is unavailable in this browser."));
     }
     if (doc.defaultView.location.hash === "#sign-up" && !sessionStorage.getItem(authDestinationKey)) {
       sessionStorage.setItem(authDestinationKey, "home");
     }
+    sessionStorage.setItem(rememberMeKey, String(rememberChoice(doc, form)));
     var random = new Uint8Array(32);
     window.crypto.getRandomValues(random);
     var verifier = base64UrlEncode(random);
@@ -561,53 +674,74 @@
     });
   }
   function enhanceRegistrationForm(doc) {
-    var form = doc.querySelector('form[data-f="up"]');
-    if (!form) return;
-    var name = form.elements.namedItem("nm");
-    var email = form.elements.namedItem("em");
-    var password = form.elements.namedItem("pw");
-    if (name) name.required = true;
-    if (email) email.required = true;
-    if (email && !email.value) {
-      var pendingEmail = sessionStorage.getItem("kite.pendingVerificationEmail");
-      if (pendingEmail) {
-        email.value = pendingEmail;
-        sessionStorage.removeItem("kite.pendingVerificationEmail");
+    var forms = doc.querySelectorAll('form[data-f="up"], form[data-f="in"]');
+    Array.prototype.forEach.call(forms, function (form) {
+      var isRegistration = form.getAttribute("data-f") === "up";
+      var name = form.elements.namedItem("nm");
+      var email = form.elements.namedItem("em");
+      var password = form.elements.namedItem("pw");
+      if (name) name.required = true;
+      if (email) email.required = true;
+      if (email && isRegistration && !email.value) {
+        var pendingEmail = sessionStorage.getItem("kite.pendingVerificationEmail");
+        if (pendingEmail) {
+          email.value = pendingEmail;
+          sessionStorage.removeItem("kite.pendingVerificationEmail");
+        }
       }
-    }
-    if (password) {
-      password.required = true;
-      password.minLength = 8;
-      password.maxLength = 128;
-      addPasswordStrengthFeedback(doc, password);
-    }
-    if (form.elements.namedItem("cpw")) return;
-    var error = form.querySelector("#err");
-    if (!error) return;
-    var label = doc.createElement("label");
-    label.htmlFor = "cpw";
-    label.textContent = "Confirm password";
-    var wrapper = doc.createElement("div");
-    wrapper.className = "pw";
-    var confirm = doc.createElement("input");
-    confirm.className = "fi";
-    confirm.id = "cpw";
-    confirm.name = "cpw";
-    confirm.type = "password";
-    confirm.autocomplete = "new-password";
-    confirm.placeholder = "Confirm your password";
-    confirm.required = true;
-    confirm.minLength = 8;
-    confirm.maxLength = 128;
-    var toggle = doc.createElement("button");
-    toggle.type = "button";
-    toggle.className = "tgl";
-    toggle.dataset.a = "show";
-    toggle.setAttribute("aria-label", "Show password");
-    toggle.textContent = "Show";
-    wrapper.append(confirm, toggle);
-    form.insertBefore(label, error);
-    form.insertBefore(wrapper, error);
+      if (password) {
+        password.required = true;
+        if (isRegistration) {
+          password.minLength = 8;
+          password.maxLength = 128;
+          addPasswordStrengthFeedback(doc, password);
+        }
+      }
+      var error = form.querySelector("#err");
+      if (isRegistration && !form.elements.namedItem("cpw") && error) {
+        var label = doc.createElement("label");
+        label.htmlFor = "cpw";
+        label.textContent = "Confirm password";
+        var wrapper = doc.createElement("div");
+        wrapper.className = "pw";
+        var confirm = doc.createElement("input");
+        confirm.className = "fi";
+        confirm.id = "cpw";
+        confirm.name = "cpw";
+        confirm.type = "password";
+        confirm.autocomplete = "new-password";
+        confirm.placeholder = "Confirm your password";
+        confirm.required = true;
+        confirm.minLength = 8;
+        confirm.maxLength = 128;
+        var toggle = doc.createElement("button");
+        toggle.type = "button";
+        toggle.className = "tgl";
+        toggle.dataset.a = "show";
+        toggle.setAttribute("aria-label", "Show password");
+        toggle.textContent = "Show";
+        wrapper.append(confirm, toggle);
+        form.insertBefore(label, error);
+        form.insertBefore(wrapper, error);
+      }
+      if (!form.querySelector("#kite-remember-me")) {
+        var rememberWrapper = doc.createElement("div");
+        rememberWrapper.style.cssText = "display:flex;align-items:flex-start;gap:8px;margin:12px 0 4px";
+        var remember = doc.createElement("input");
+        remember.id = "kite-remember-me-" + (isRegistration ? "up" : "in");
+        remember.name = "remember_me";
+        remember.type = "checkbox";
+        remember.style.cssText = "width:18px;height:18px;margin:1px 0 0;accent-color:var(--blue,#1d6bf0)";
+        remember.checked = sessionStorage.getItem(rememberMeKey) === "true";
+        var rememberLabel = doc.createElement("label");
+        rememberLabel.htmlFor = remember.id;
+        rememberLabel.style.cssText = "margin:0;font-size:13px;font-weight:600;line-height:1.4";
+        rememberLabel.textContent = "Keep me signed in on this device";
+        rememberWrapper.append(remember, rememberLabel);
+        if (error) form.insertBefore(rememberWrapper, error);
+        else form.appendChild(rememberWrapper);
+      }
+    });
   }
   function watchRegistrationForm(doc) {
     var body = doc.getElementById("sbody");
@@ -1297,17 +1431,17 @@
         }
         badge.textContent = count > 99 ? "99+" : String(count);
       }
-      function hydrateShellUser(me) {
+      function hydrateShellUser(doc, me) {
         try {
           if (!me && token()) {
             setMoreMenuAuthState(true);
             if (!shellUserRequest) {
               shellUserRequest = api("/api/me").then(function (account) {
-                hydrateShellUser(account);
+                hydrateShellUser(doc, account);
               }).catch(function (error) {
                 if (error.status === 401) {
                   clearAuthTokens();
-                  hydrateShellUser(null);
+                  hydrateShellUser(doc, null);
                 } else tell(doc, error.message, true);
               }).finally(function () {
                 shellUserRequest = null;
@@ -1516,11 +1650,132 @@
         paragraph.textContent = value;
         panel.appendChild(paragraph);
       }
+      function readLessonQuizContext() {
+        try {
+          var context = JSON.parse(sessionStorage.getItem(lessonQuizContextKey) || "null");
+          return context && typeof context.lessonId === "string" ? context : null;
+        } catch (error) {
+          console.error("Could not restore the lesson quiz context.", error);
+          sessionStorage.removeItem(lessonQuizContextKey);
+          return null;
+        }
+      }
+      function returnToLessonFromQuiz() {
+        var context = readLessonQuizContext();
+        if (!context) return false;
+        sessionStorage.setItem("kite.lessonId", context.lessonId);
+        sessionStorage.removeItem(quizEntryModeKey);
+        sessionStorage.removeItem(completedQuizResultKey);
+        navigate("lesson");
+        return true;
+      }
+      function restoreLessonQuizPosition(doc, lesson) {
+        var context = readLessonQuizContext();
+        if (!context || context.lessonId !== lesson.id) return;
+        sessionStorage.removeItem(lessonQuizContextKey);
+        var scrollTop = Number(context.scrollTop);
+        var scroll = doc.querySelector(".scroll");
+        var win = doc.defaultView;
+        if (!scroll || !Number.isFinite(scrollTop) || scrollTop < 0 || !win) return;
+        win.requestAnimationFrame(function () { scroll.scrollTop = scrollTop; });
+      }
+      function renderLessonQuizCard(doc, lesson, item) {
+        var signedIn = Boolean(token());
+        var attempts = quizHistory(item, signedIn);
+        var attemptCount = signedIn ? item.attempt_count : attempts.length;
+        var hasDraft = !item.locked && quizHasDraft(item);
+        var card = doc.createElement("article");
+        card.className = "kite-assessment-card kite-lesson-quiz-card";
+        var title = doc.createElement("h3");
+        title.textContent = item.title;
+        var description = doc.createElement("p");
+        description.textContent = "Questions are mapped to " + lesson.title +
+          " and its related " + item.topic.toLowerCase() + " concepts.";
+        var badges = doc.createElement("div");
+        badges.className = "kite-assessment-badges";
+        [
+          item.locked ? "Kite Premium · Locked" : item.difficulty,
+          attemptCount ? attemptCount + (attemptCount === 1 ? " attempt" : " attempts") : "Not attempted"
+        ].forEach(function (text) {
+          var badge = doc.createElement("span");
+          badge.className = "kite-assessment-badge";
+          badge.textContent = text;
+          badges.appendChild(badge);
+        });
+        var facts = doc.createElement("p");
+        facts.textContent = item.question_count + " questions · Pass mark " + item.pass_threshold + "%" +
+          (Number.isFinite(item.estimated_minutes) && item.estimated_minutes > 0
+            ? " · About " + item.estimated_minutes + " minutes" : "");
+        card.append(title, description, badges, facts);
+
+        var bestScore = signedIn ? item.best_score : null;
+        var bestTotal = signedIn ? item.best_total : null;
+        if (!signedIn && attempts.length) {
+          var bestAttempt = attempts.reduce(function (best, attempt) {
+            return !best || attempt.score > best.score ? attempt : best;
+          }, null);
+          bestScore = bestAttempt.score;
+          bestTotal = bestAttempt.total;
+        }
+        if (bestScore !== null && bestScore !== undefined && bestTotal) {
+          var best = doc.createElement("p");
+          best.textContent = "Best score: " + bestScore + " / " + bestTotal +
+            " (" + Math.round(bestScore / bestTotal * 100) + "%)";
+          card.appendChild(best);
+        }
+        if (attempts.length && attempts[0].created_at) {
+          var previous = doc.createElement("p");
+          previous.textContent = "Last attempt: " + attempts[0].score + " / " + attempts[0].total +
+            " (" + attempts[0].percentage + "%)" +
+            (quizDate(attempts[0].created_at) ? " · " + quizDate(attempts[0].created_at) : "");
+          card.appendChild(previous);
+        }
+
+        var actions = doc.createElement("div");
+        actions.className = "kite-assessment-actions";
+        var action = doc.createElement("button");
+        action.type = "button";
+        action.className = "kite-assessment-button" + (item.locked ? "" : " primary");
+        action.textContent = item.locked ? "View subscription options" :
+          hasDraft ? "Continue quiz" : attemptCount ? "Retry quiz" : "Start quiz";
+        action.addEventListener("click", function () {
+          if (item.locked) {
+            navigate("preferences");
+            return;
+          }
+          var previousQuiz = sessionStorage.getItem(pendingQuizDraftIdKey);
+          if (previousQuiz !== item.id) {
+            sessionStorage.removeItem(pendingQuizSubmissionIdKey);
+            sessionStorage.removeItem(pendingQuizAnswersKey);
+            sessionStorage.removeItem(pendingQuizIndexKey);
+          }
+          if (!hasDraft) {
+            removeQuizDraft(item.id);
+            sessionStorage.removeItem(pendingQuizSubmissionIdKey);
+            sessionStorage.removeItem(pendingQuizAnswersKey);
+            sessionStorage.removeItem(pendingQuizIndexKey);
+          }
+          sessionStorage.setItem("kite.lessonId", lesson.id);
+          sessionStorage.setItem("kite.quizId", item.id);
+          sessionStorage.setItem(quizEntryModeKey, "runner");
+          sessionStorage.setItem(pendingQuizDraftIdKey, item.id);
+          sessionStorage.setItem(lessonQuizContextKey, JSON.stringify({
+            lessonId: lesson.id,
+            lessonTab: "quiz",
+            scrollTop: (doc.querySelector(".scroll") || {}).scrollTop || 0
+          }));
+          navigate("quiz");
+        });
+        actions.appendChild(action);
+        card.appendChild(actions);
+        return card;
+      }
       function renderLessonTab(doc, lesson, tab) {
         var panel = doc.getElementById("pn");
         if (!panel) return;
         var sections = parseLessonSections(lesson.content);
         panel.textContent = "";
+        panel.dataset.kiteActiveLessonTab = tab;
         panel.setAttribute("aria-labelledby", "tb-" + tab);
         Array.prototype.forEach.call(doc.querySelectorAll("[data-tab]"), function (button) {
           var selected = button.getAttribute("data-tab") === tab;
@@ -1541,41 +1796,29 @@
           return;
         }
         if (tab === "quiz") {
+          ensureQuizStyles(doc);
           var quizTitle = doc.createElement("h2");
-          quizTitle.textContent = "Check your understanding";
+          quizTitle.textContent = "Lesson assessment";
           panel.appendChild(quizTitle);
           var quizDescription = doc.createElement("p");
-          quizDescription.textContent = "Choose a scored quiz from " + lesson.module_title +
-            ". Your answers and explanations are handled by Kite's existing quiz flow.";
+          quizDescription.textContent = "Check what you learned in " + lesson.title +
+            " with a topic-matched assessment. Your answers, score, and explanations use Kite's existing quiz system.";
           panel.appendChild(quizDescription);
-          api("/api/quizzes").then(function (catalog) {
+          api("/api/quizzes?lesson_id=" + encodeURIComponent(lesson.id)).then(function (catalog) {
+            if (panel.dataset.kiteActiveLessonTab !== "quiz") return;
             var matching = catalog.filter(function (item) {
-              return item.module_id === lesson.module_id && !item.locked;
+              return Array.isArray(item.lesson_ids) && item.lesson_ids.indexOf(lesson.id) >= 0;
             });
             if (!matching.length) {
               var empty = doc.createElement("p");
-              empty.textContent = "No quiz is currently available for this module.";
+              empty.className = "kite-assessment-empty";
+              empty.textContent = "A lesson-specific assessment has not been added for this lesson yet. No unrelated module quiz is shown here.";
               panel.appendChild(empty);
+              restoreLessonQuizPosition(doc, lesson);
               return;
             }
-            matching.forEach(function (item) {
-              var button = doc.createElement("button");
-              button.type = "button";
-              button.className = "go";
-              button.style.cssText = "display:block;margin:10px 0";
-              button.textContent = "Start quiz: " + item.title + " (" + item.question_count + " questions)";
-              button.addEventListener("click", function () {
-                sessionStorage.setItem("kite.quizId", item.id);
-                sessionStorage.setItem(quizEntryModeKey, "runner");
-                sessionStorage.setItem(pendingQuizDraftIdKey, item.id);
-                sessionStorage.removeItem(pendingQuizSubmissionIdKey);
-                sessionStorage.removeItem(pendingQuizAnswersKey);
-                sessionStorage.removeItem(pendingQuizIndexKey);
-                sessionStorage.removeItem(completedQuizResultKey);
-                navigate("quiz");
-              });
-              panel.appendChild(button);
-            });
+            matching.forEach(function (item) { panel.appendChild(renderLessonQuizCard(doc, lesson, item)); });
+            restoreLessonQuizPosition(doc, lesson);
           }).catch(function (error) { tell(doc, error.message, true); });
           return;
         }
@@ -1610,8 +1853,12 @@
           }, true);
           var initialTab = "lesson";
           try {
+            var lessonQuizContext = readLessonQuizContext();
             var returnContext = JSON.parse(sessionStorage.getItem(playgroundReturnContextKey) || "null");
-            if (returnContext && returnContext.route === "lesson" &&
+            if (lessonQuizContext && lessonQuizContext.lessonId === lesson.id &&
+                lessonQuizContext.lessonTab === "quiz") {
+              initialTab = "quiz";
+            } else if (returnContext && returnContext.route === "lesson" &&
                 ["lesson", "example", "quiz"].indexOf(returnContext.lessonTab) >= 0) {
               initialTab = returnContext.lessonTab;
             }
@@ -2057,6 +2304,8 @@
           });
       }
       function showQuizDashboard(doc) {
+        if (readLessonQuizContext() && returnToLessonFromQuiz()) return;
+        sessionStorage.removeItem(lessonQuizContextKey);
         sessionStorage.removeItem(quizEntryModeKey);
         sessionStorage.removeItem(completedQuizResultKey);
         doc.documentElement.kiteQuizState = null;
@@ -2132,8 +2381,11 @@
         var back = doc.createElement("button");
         back.type = "button";
         back.className = "kite-assessment-button kite-quiz-back";
-        back.textContent = "Back to quiz list";
-        back.addEventListener("click", function () { showQuizDashboard(doc); });
+        var lessonContext = readLessonQuizContext();
+        back.textContent = lessonContext ? "Return to lesson" : "Back to quiz list";
+        back.addEventListener("click", function () {
+          if (!returnToLessonFromQuiz()) showQuizDashboard(doc);
+        });
         panel.appendChild(back);
         var intro = doc.createElement("div");
         intro.className = "kite-quiz-intro";
@@ -2264,9 +2516,10 @@
           removeQuizDraft(state.id);
           hydrateQuiz(doc, state.id, true, true);
         }, true, false));
-        actions.appendChild(makeQuizButton(doc, "Back to quizzes", function () {
-          showQuizDashboard(doc);
-        }, false, false));
+        actions.appendChild(makeQuizButton(doc,
+          readLessonQuizContext() ? "Return to lesson" : "Back to quizzes", function () {
+            if (!returnToLessonFromQuiz()) showQuizDashboard(doc);
+          }, false, false));
         if (result.practice_challenge_id) {
           actions.appendChild(makeQuizButton(doc,
             result.guest ? "Coding practice · sign in to run" : "Open coding practice", function () {
@@ -2294,14 +2547,31 @@
         else renderQuizQuestion(doc, state);
       }
       function hydrateQuiz(doc, selectedId, forceRunner, resetDraft) {
-        api("/api/quizzes").then(function (catalog) {
+        var initialLessonContext = readLessonQuizContext();
+        var catalogPath = initialLessonContext
+          ? "/api/quizzes?lesson_id=" + encodeURIComponent(initialLessonContext.lessonId)
+          : "/api/quizzes";
+        api(catalogPath).then(function (catalog) {
+          var runQuiz = forceRunner || sessionStorage.getItem(quizEntryModeKey) === "runner";
+          var lessonQuizContext = readLessonQuizContext();
+          if (lessonQuizContext && !runQuiz) {
+            sessionStorage.removeItem(lessonQuizContextKey);
+            lessonQuizContext = null;
+          }
           var requested = selectedId || sessionStorage.getItem("kite.quizId") || "python-basics";
           var selected = catalog.find(function (item) { return item.id === requested; });
+          if (!selected && lessonQuizContext) {
+            throw new Error("This lesson assessment is no longer available. Return to the lesson and choose its current quiz.");
+          }
           if (!selected) selected = catalog.find(function (item) { return item.id === "python-basics"; }) ||
             catalog.find(function (item) { return !item.locked; });
           if (!selected) throw new Error("No quizzes are currently available.");
+          if (lessonQuizContext &&
+              (!Array.isArray(selected.lesson_ids) ||
+               selected.lesson_ids.indexOf(lessonQuizContext.lessonId) < 0)) {
+            throw new Error("This quiz is not mapped to the lesson you came from.");
+          }
           doc.documentElement.kiteQuizCatalog = catalog;
-          var runQuiz = forceRunner || sessionStorage.getItem(quizEntryModeKey) === "runner";
           if (!runQuiz) {
             hydrateQuizDashboard(doc);
             return;
@@ -2311,15 +2581,23 @@
             sessionStorage.getItem(pendingQuizDraftIdKey) === selected.id;
           var sessionDraftAnswers = sessionDraftMatches ? sessionStorage.getItem(pendingQuizAnswersKey) : null;
           var sessionDraftIndex = sessionDraftMatches ? sessionStorage.getItem(pendingQuizIndexKey) : null;
-          addContentPicker(doc, "quiz", catalog, selected.id, function (nextId) {
-            sessionStorage.setItem("kite.quizId", nextId);
-            sessionStorage.setItem(pendingQuizDraftIdKey, nextId);
-            sessionStorage.removeItem(pendingQuizSubmissionIdKey);
-            sessionStorage.removeItem(pendingQuizAnswersKey);
-            sessionStorage.removeItem(pendingQuizIndexKey);
-            sessionStorage.removeItem(completedQuizResultKey);
-            hydrateQuiz(doc, nextId, true);
-          });
+          if (!lessonQuizContext) {
+            addContentPicker(doc, "quiz", catalog, selected.id, function (nextId) {
+              sessionStorage.setItem("kite.quizId", nextId);
+              sessionStorage.removeItem(lessonQuizContextKey);
+              sessionStorage.setItem(pendingQuizDraftIdKey, nextId);
+              sessionStorage.removeItem(pendingQuizSubmissionIdKey);
+              sessionStorage.removeItem(pendingQuizAnswersKey);
+              sessionStorage.removeItem(pendingQuizIndexKey);
+              sessionStorage.removeItem(completedQuizResultKey);
+              hydrateQuiz(doc, nextId, true);
+            });
+          } else {
+            var picker = doc.getElementById("kite-quiz-select");
+            if (picker && picker.closest(".kite-content-picker")) {
+              picker.closest(".kite-content-picker").style.display = "none";
+            }
+          }
           if (resetDraft) {
             removeQuizDraft(selected.id);
             sessionStorage.removeItem(pendingQuizAnswersKey);
@@ -2330,7 +2608,11 @@
           sessionStorage.setItem(quizEntryModeKey, "runner");
           sessionStorage.setItem(pendingQuizDraftIdKey, selected.id);
           setText(doc, "#ttl", selected.title);
-          return api("/api/quizzes/" + encodeURIComponent(selected.id)).then(function (quiz) {
+          var quizPath = "/api/quizzes/" + encodeURIComponent(selected.id);
+          if (lessonQuizContext) {
+            quizPath += "?lesson_id=" + encodeURIComponent(lessonQuizContext.lessonId);
+          }
+          return api(quizPath).then(function (quiz) {
             doc.documentElement.kiteModules = doc.documentElement.kiteModules || [];
             return api("/api/modules").then(function (modules) {
               doc.documentElement.kiteModules = modules;
@@ -2449,7 +2731,9 @@
             return best === null || attempt.percentage > best ? attempt.percentage : best;
           }, null);
         }).filter(function (score) { return Number.isFinite(score); });
-        var quizRecommendations = availableQuizzes.map(function (quiz) {
+        var quizRecommendations = availableQuizzes.filter(function (quiz) {
+          return !quiz.lesson_only;
+        }).map(function (quiz) {
           var attempts = quizHistories[quiz.id] || [];
           var best = attempts.reduce(function (score, attempt) {
             return score === null || attempt.percentage > score ? attempt.percentage : score;
@@ -2529,7 +2813,7 @@
             if (error.status !== 401) throw error;
             clearAuthTokens();
             routeUser = null;
-            hydrateShellUser(null);
+            hydrateShellUser(doc, null);
             return api("/api/modules").then(function (modules) {
               return guestProgressSnapshot(doc, modules);
             });
@@ -2962,6 +3246,7 @@
     if (!doc || doc.documentElement.dataset.kiteBridge) return;
     doc.documentElement.dataset.kiteBridge = "ready";
     var route = (location.hash || "#launch").slice(1);
+    var sessionReady = restoreAuthentication();
     if (route.indexOf("access_token=") === 0 || route.indexOf("error=") === 0) route = "launch";
     applyPythonBranding(doc, route);
     if (route === "notifications") addNotificationBackButton(doc);
@@ -3163,7 +3448,11 @@
           sessionStorage.setItem(authDestinationKey, "home");
           ownsAuthDestination = true;
         }
-        operation = api("/api/auth/register", { name: fullName, email: email, password: password });
+        var rememberRegistration = rememberChoice(doc, form);
+        sessionStorage.setItem(rememberMeKey, String(rememberRegistration));
+        operation = api("/api/auth/register", {
+          name: fullName, email: email, password: password, remember_me: rememberRegistration
+        });
       }
       else if (kind === "in") {
         var loginEmail = fields.em.value.trim();
@@ -3182,7 +3471,11 @@
           fields.pw.focus();
           return;
         }
-        operation = api("/api/auth/login", { email: loginEmail, password: fields.pw.value });
+        var rememberLogin = rememberChoice(doc, form);
+        sessionStorage.setItem(rememberMeKey, String(rememberLogin));
+        operation = api("/api/auth/login", {
+          email: loginEmail, password: fields.pw.value, remember_me: rememberLogin
+        });
       }
       else if (kind === "rs") {
         if (!fields.em.value.trim()) {
@@ -3208,7 +3501,7 @@
       }
       form.setAttribute("aria-busy", "true");
       operation.then(function (data) {
-        if (data.access_token) {
+        if (data.user) {
           completeAuthentication(doc, data, kind === "up" ? "home" : undefined);
         } else if (kind === "up") {
           sessionStorage.setItem("kite.pendingVerificationEmail", fields.em.value.trim());
@@ -3301,7 +3594,7 @@
         googleButton.disabled = true;
         googleButton.setAttribute("aria-busy", "true");
         if (googleText) googleText.textContent = "Connecting…";
-        startGoogleSignIn(doc).catch(function (error) {
+        startGoogleSignIn(doc, target.closest("form")).catch(function (error) {
           tell(doc, friendlyAuthMessage(error, "google"), true);
         }).finally(function () {
           busy = false;
@@ -3536,7 +3829,12 @@
         target.setAttribute("aria-busy", "true");
         var validation = doc.getElementById("kite-quiz-validation");
         if (validation) validation.textContent = "Submitting your answers…";
-        api("/api/quizzes/" + encodeURIComponent(quizState.id) + "/submit", {
+        var submitPath = "/api/quizzes/" + encodeURIComponent(quizState.id) + "/submit";
+        var lessonContext = readLessonQuizContext();
+        if (lessonContext) {
+          submitPath += "?lesson_id=" + encodeURIComponent(lessonContext.lessonId);
+        }
+        api(submitPath, {
           answers: quizState.answers.map(function (answer) {
             return Number.isInteger(answer) ? answer : -1;
           }),
@@ -3605,7 +3903,7 @@
 
     function hydrateRouteData(me) {
       routeUser = me;
-      hydrateShellUser(me);
+      hydrateShellUser(doc, me);
       if (route === "preferences") addSubscriptionSection(doc);
       if (route === "preferences") hydratePreferences(doc);
       if (route === "home") hydrateHome(doc, me);
@@ -3686,49 +3984,59 @@
         setTimeout(function () {
           tell(doc, "This password-reset link is invalid or expired. Request a new one and try again.", true);
         }, 0);
-      } else if (token()) {
-        api("/api/me").then(function (me) {
-          hydrateShellUser(me);
-          showSignedIn(doc, me.name);
-        }).catch(function (error) {
-          if (error.status !== 401) tell(doc, error.message, true);
-        });
       }
     }
 
-    if (route === "progress" && token()) {
-      api("/api/me").then(function (me) {
-        hydrateRouteData(me);
-      }).catch(function (error) {
-        if (error.status === 401) {
-          clearAuthTokens();
-          routeUser = null;
-          hydrateRouteData(null);
-          return;
+    sessionReady.then(function () {
+      if (route === "launch") {
+        var resetCredential = resetToken();
+        var callbackType = new URLSearchParams(window.location.hash.slice(1)).get("type");
+        if (resetCredential || callbackType === "recovery") return;
+        if (token()) {
+          api("/api/me").then(function (me) {
+            hydrateShellUser(doc, me);
+            showSignedIn(doc, me.name);
+          }).catch(function (error) {
+            if (error.status !== 401) tell(doc, error.message, true);
+          });
         }
-        tell(doc, error.message, true);
-      });
-      return;
-    }
-
-    if (protectedRoutes[route] || (route === "home" && token())) {
-      if (!token()) {
-        signInForRoute(route);
         return;
       }
-      api("/api/me").then(function (me) {
-        hydrateRouteData(me);
-      }).catch(function (error) {
-        if (error.status === 401) {
-          clearAuthTokens();
+      if (protectedRoutes[route] || (route === "home" && token())) {
+        if (!token()) {
           signInForRoute(route);
           return;
         }
-        tell(doc, error.message, true);
-      });
-      return;
-    }
-    if (route !== "launch") hydrateRouteData(null);
+        api("/api/me").then(function (me) {
+          hydrateRouteData(me);
+        }).catch(function (error) {
+          if (error.status === 401) {
+            clearAuthTokens();
+            signInForRoute(route);
+            return;
+          }
+          tell(doc, error.message, true);
+        });
+        return;
+      }
+      if (route === "progress" && token()) {
+        api("/api/me").then(function (me) {
+          hydrateRouteData(me);
+        }).catch(function (error) {
+          if (error.status === 401) {
+            clearAuthTokens();
+            hydrateRouteData(null);
+            return;
+          }
+          tell(doc, error.message, true);
+        });
+        return;
+      }
+      if (route !== "launch") hydrateRouteData(null);
+    }).catch(function (error) {
+      tell(doc, "Kite couldn't confirm your saved session. Check your connection and try again.", true);
+      if (route !== "launch" && !protectedRoutes[route]) hydrateRouteData(null);
+    });
     ["b-terms", "b-priv", "b-con"].forEach(function (id) {
       var button = doc.getElementById(id);
       if (!button) return;
@@ -3747,7 +4055,7 @@
     try { if (frame.contentDocument && frame.contentDocument.readyState === "complete") install(frame.contentDocument); } catch (error) { console.error("Kite bridge could not attach.", error); }
   }
   ensureMoreMenuActions();
-  setMoreMenuAuthState(Boolean(token()));
+  setMoreMenuAuthState(null);
   document.addEventListener("click", function (event) {
     var signIn = event.target.closest && event.target.closest("#pn button.kite-menu-sign-in");
     if (signIn) {
@@ -3767,7 +4075,7 @@
       sessionStorage.removeItem(authDestinationKey);
       sessionStorage.removeItem(subscriptionReturnKey);
       clearAuthTokens();
-      hydrateShellUser(null);
+      hydrateShellUser(frame && frame.contentDocument, null);
       navigate("launch", true);
       return;
     }

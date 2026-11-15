@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import (
     Activity, Base, CHALLENGES, LESSONS, LessonProgress, PlaygroundError, PlaygroundExecution,
-    MODULES, QUIZZES, QUIZ_METADATA, QuizAttempt, SessionLocal, User, app, engine,
+    MODULES, QUIZZES, QUIZ_METADATA, QuizAttempt, SessionLocal, User, app, engine, issue_token,
 )
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
 
@@ -46,8 +46,15 @@ class KiteApiTests(unittest.TestCase):
             "password": "secure-example-password",
         })
         self.assertEqual(response.status_code, 201, response.text)
-        self.token = response.json()["access_token"]
+        self.token = self.issue_token(self.email)
         self.headers = {"Authorization": "Bearer " + self.token}
+        self.client.cookies.clear()
+
+    @staticmethod
+    def issue_token(email):
+        with SessionLocal() as db:
+            user = db.query(User).filter_by(email=email).one()
+            return issue_token(user, False)[0]
 
     def test_registration_login_and_persisted_profile(self):
         response = self.client.get("/api/me", headers=self.headers)
@@ -59,6 +66,50 @@ class KiteApiTests(unittest.TestCase):
         })
         self.assertEqual(login.status_code, 200)
         self.assertEqual(login.json()["user"]["email"], self.email)
+
+    def test_cookie_session_is_http_only_csrf_protected_and_restorable(self):
+        email = f"remembered-{uuid.uuid4().hex}@example.com"
+        response = self.client.post("/api/auth/register", json={
+            "name": "Remembered Learner",
+            "email": email,
+            "password": "secure-example-password",
+            "remember_me": True,
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertNotIn("access_token", response.json())
+        cookies = response.headers.get_list("set-cookie")
+        access_cookie = next(value for value in cookies if value.startswith("kite_access="))
+        self.assertIn("httponly", access_cookie.lower())
+        self.assertIn("max-age=2592000", access_cookie.lower())
+
+        restored = self.client.get("/api/auth/session")
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertTrue(restored.json()["remember_me"])
+        self.assertEqual(restored.json()["user"]["email"], email)
+        self.assertEqual(self.client.patch("/api/me", json={"name": "Changed Name"}).status_code, 403)
+        csrf = restored.json()["csrf_token"]
+        updated = self.client.patch(
+            "/api/me", headers={"X-Kite-CSRF": csrf}, json={"name": "Changed Name"},
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        logged_out = self.client.post("/api/auth/logout", headers={"X-Kite-CSRF": csrf})
+        self.assertEqual(logged_out.status_code, 200, logged_out.text)
+        self.assertEqual(self.client.get("/api/auth/session").status_code, 401)
+
+    def test_nonremembered_cookie_session_expires_with_browser_session(self):
+        email = f"session-{uuid.uuid4().hex}@example.com"
+        response = self.client.post("/api/auth/register", json={
+            "name": "Session Learner",
+            "email": email,
+            "password": "secure-example-password",
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        access_cookie = next(
+            value for value in response.headers.get_list("set-cookie")
+            if value.startswith("kite_access=")
+        )
+        self.assertNotIn("max-age=", access_cookie.lower())
+        self.assertFalse(self.client.get("/api/auth/session").json()["remember_me"])
 
     def test_logout_revokes_local_access_token(self):
         response = self.client.post("/api/auth/logout", headers=self.headers)
@@ -178,8 +229,10 @@ class KiteApiTests(unittest.TestCase):
         self.assertTrue(all(module["lesson_count"] == 8 for module in modules[:11]))
         self.assertEqual(modules[11]["lesson_count"], 13)
         self.assertEqual(sum(module["lesson_count"] for module in modules), 101)
-        self.assertTrue(all(module["quiz_count"] == 2 for module in modules[:11]))
-        self.assertEqual(modules[11]["quiz_count"], 3)
+        self.assertEqual(
+            [module["quiz_count"] for module in modules],
+            [4, 2, 3, 3, 3, 4, 3, 3, 2, 3, 3, 5],
+        )
         self.assertEqual([module["challenge_count"] for module in modules[:6]], [2, 3, 3, 4, 3, 3])
         self.assertTrue(all(module["challenge_count"] == 10 for module in modules[6:11]))
         self.assertEqual(modules[11]["challenge_count"], 12)
@@ -349,6 +402,88 @@ class KiteApiTests(unittest.TestCase):
             self.assertIsNotNone(challenge)
             self.assertEqual(challenge["module_id"], quiz["module_id"])
 
+    def test_every_lesson_has_a_contextual_assessment_without_changing_quiz_catalog(self):
+        catalog = self.client.get("/api/quizzes").json()
+        self.assertEqual(len(catalog), 25)
+        self.assertFalse(any(item.get("lesson_only") for item in catalog))
+        lessons = self.client.get("/api/lessons").json()
+        self.assertEqual(len(lessons), 101)
+
+        for lesson in lessons:
+            response = self.client.get(
+                "/api/quizzes", params={"lesson_id": lesson["id"]},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            assessments = response.json()
+            self.assertTrue(assessments, lesson["id"])
+            for assessment in assessments:
+                self.assertIn(lesson["id"], assessment["lesson_ids"])
+                self.assertEqual(assessment["module_id"], lesson["module_id"])
+                if assessment["locked"]:
+                    detail = self.client.get(
+                        "/api/quizzes/" + assessment["id"],
+                        params={"lesson_id": lesson["id"]},
+                    )
+                    self.assertEqual(detail.status_code, 402, detail.text)
+                    continue
+
+                detail = self.client.get(
+                    "/api/quizzes/" + assessment["id"],
+                    params={"lesson_id": lesson["id"]},
+                )
+                self.assertEqual(detail.status_code, 200, detail.text)
+                self.assertEqual(
+                    len(detail.json()["questions"]), assessment["question_count"],
+                )
+                self.assertNotIn("answer", detail.json()["questions"][0])
+
+        self.assertEqual(
+            self.client.get("/api/quizzes/lesson-first-errors").status_code, 404,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/quizzes/lesson-first-errors/submit",
+                json={"answers": [0, 0, 0, 1]},
+            ).status_code,
+            404,
+        )
+
+    def test_lesson_only_quiz_attempt_persists_against_its_lesson(self):
+        lesson_id = "python-foundations-first-errors"
+        quiz_id = "lesson-first-errors"
+        result = self.client.post(
+            "/api/quizzes/" + quiz_id + "/submit",
+            params={"lesson_id": lesson_id},
+            headers=self.headers,
+            json={"answers": [0, 0, 0, 1]},
+        )
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["score"], 4)
+        self.assertTrue(result.json()["passed"])
+        self.assertEqual(result.json()["review_lesson_ids"], [lesson_id])
+
+        history = self.client.get(
+            "/api/quizzes", params={"lesson_id": lesson_id}, headers=self.headers,
+        )
+        assessment = next(item for item in history.json() if item["id"] == quiz_id)
+        self.assertEqual(assessment["attempt_count"], 1)
+        self.assertEqual(assessment["best_score"], 4)
+        self.assertEqual(len(assessment["attempts"]), 1)
+        self.assertFalse(any(
+            item["id"] == quiz_id for item in self.client.get("/api/quizzes").json()
+        ))
+        progress = self.client.get("/api/progress", headers=self.headers).json()
+        self.assertEqual(progress["quiz_count"], 1)
+        self.assertEqual(progress["quiz_attempt_count"], 1)
+        module = next(
+            item for item in self.client.get("/api/modules", headers=self.headers).json()
+            if item["id"] == "python-foundations"
+        )
+        self.assertEqual(module["completed_quizzes"], 1)
+        self.assertEqual(module["quiz_attempt_count"], 1)
+        self.assertEqual(module["completed_lessons"], 0)
+        self.assertTrue(any(item["id"] == quiz_id for item in module["quizzes"]))
+
     def test_quiz_attempt_history_is_persisted_per_account(self):
         answers = [0, 1, 1, 2, 1, 1, 2, 2, 1, 1]
         for _ in range(2):
@@ -381,7 +516,8 @@ class KiteApiTests(unittest.TestCase):
             "email": other_email,
             "password": "secure-example-password",
         })
-        other_headers = {"Authorization": "Bearer " + other.json()["access_token"]}
+        other_headers = {"Authorization": "Bearer " + self.issue_token(other_email)}
+        self.client.cookies.clear()
         other_quiz = next(
             item for item in self.client.get("/api/quizzes", headers=other_headers).json()
             if item["id"] == "python-basics"
@@ -607,7 +743,8 @@ class KiteApiTests(unittest.TestCase):
         ):
             linked = self.client.post("/api/auth/session", json={"access_token": "provider-token"})
         self.assertEqual(linked.status_code, 200, linked.text)
-        self.assertEqual(linked.json()["access_token"], "provider-token")
+        self.assertNotIn("access_token", linked.json())
+        self.assertEqual(linked.json()["user"]["email"], self.email)
 
         conflicting_user = dict(verified_user, id="different-provider-user")
         with patch.dict(os.environ, env), patch(
@@ -757,7 +894,7 @@ class KiteApiTests(unittest.TestCase):
             )
             accepted = self.client.post(
                 "/api/execution/cancel",
-                headers={"Authorization": "Bearer " + other.json()["access_token"]},
+                headers={"Authorization": "Bearer " + self.issue_token(other_email)},
                 json={"execution_id": execution_id},
             )
         self.assertEqual(rejected.status_code, 404)
@@ -847,7 +984,8 @@ class KiteApiTests(unittest.TestCase):
         self.assertIn("provider=google", authorization_url)
         self.assertIn("code_challenge_method=s256", authorization_url)
         self.assertEqual(exchange.status_code, 200, exchange.text)
-        self.assertEqual(exchange.json()["access_token"], "google-access")
+        self.assertNotIn("access_token", exchange.json())
+        self.assertTrue(exchange.cookies.get("kite_access"))
         self.assertEqual(auth_request.call_args.args[0], "/token?grant_type=pkce")
         self.assertEqual(auth_request.call_args.kwargs["data"]["code_verifier"], "v" * 43)
 

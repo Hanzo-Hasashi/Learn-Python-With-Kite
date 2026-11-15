@@ -17,7 +17,7 @@ from typing import Annotated, Any
 from urllib.parse import quote, urlencode
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +36,8 @@ from backend.curriculum import (
     NEW_CHALLENGE_META,
     NEW_QUIZ_DATA,
     NEW_QUIZ_META,
+    LESSON_ONLY_QUIZ_DATA,
+    LESSON_ONLY_QUIZ_LESSONS,
 )
 
 
@@ -79,6 +81,7 @@ class User(Base):
     best_streak: Mapped[int] = mapped_column(Integer, default=0)
     last_active: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     settings: Mapped[str] = mapped_column(Text, default="{}")
+    auth_session_version: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -86,6 +89,19 @@ class RevokedToken(Base):
     __tablename__ = "revoked_tokens"
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    remember_me: Mapped[bool] = mapped_column(Boolean, default=False)
+    user_agent: Mapped[str] = mapped_column(String(200), default="Browser")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Lesson(Base):
@@ -310,12 +326,55 @@ for quiz in QUIZ_METADATA:
         item for item in CHALLENGE_METADATA if item["module_id"] == quiz["module_id"]
     ]
     quiz["practice_challenge_id"] = module_challenges[0]["id"] if module_challenges else None
+LESSON_ONLY_QUIZ_METADATA = []
+for quiz_id, data in LESSON_ONLY_QUIZ_DATA.items():
+    lesson_id = LESSON_ONLY_QUIZ_LESSONS[quiz_id]
+    module_id = LESSON_MODULES.get(lesson_id, (None, 0))[0]
+    if module_id != data["module_id"]:
+        raise ValueError("Lesson-only quiz module does not match its lesson.")
+    module = MODULE_BY_ID[module_id]
+    module_challenges = [
+        item for item in CHALLENGE_METADATA if item["module_id"] == module_id
+    ]
+    LESSON_ONLY_QUIZ_METADATA.append({
+        "id": quiz_id,
+        "module_id": module_id,
+        "module_title": module["title"],
+        "module_order": module["order"],
+        "title": data["title"],
+        "topic": data["title"],
+        "difficulty": (
+            "Beginner" if module["order"] <= 4 else
+            "Intermediate" if module["order"] <= 9 else "Advanced"
+        ),
+        "pass_threshold": 80,
+        "question_count": len(data["questions"]),
+        "lesson_ids": [lesson_id],
+        "practice_challenge_id": module_challenges[0]["id"] if module_challenges else None,
+        "estimated_minutes": 5,
+        "lesson_only": True,
+    })
 QUIZ_METADATA_BY_ID = {item["id"]: item for item in QUIZ_METADATA}
+QUIZ_METADATA_BY_ID.update(
+    {item["id"]: item for item in LESSON_ONLY_QUIZ_METADATA}
+)
 CHALLENGE_METADATA_BY_ID = {item["id"]: item for item in CHALLENGE_METADATA}
+
+
+def quiz_questions(quiz_id: str) -> list[dict[str, Any]] | None:
+    questions = QUIZZES.get(quiz_id)
+    if questions is not None:
+        return questions
+    lesson_quiz = LESSON_ONLY_QUIZ_DATA.get(quiz_id)
+    return lesson_quiz["questions"] if lesson_quiz else None
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def ensure_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 def same_instant(left: datetime | None, right: datetime | None) -> bool:
@@ -518,10 +577,139 @@ def local_user_for_supabase(auth_user: dict[str, Any], db: Session) -> User:
     return user
 
 
-def issue_token(user_id: int) -> str:
-    payload = f"{user_id}.{int(time.time()) + 60 * 60 * 24 * 30}"
+AUTH_ACCESS_COOKIE = "kite_access"
+AUTH_REFRESH_COOKIE = "kite_refresh"
+AUTH_SESSION_COOKIE = "kite_session"
+SESSION_HOURS = 8
+REMEMBER_DAYS = 30
+
+
+def issue_token(user: User, remember_me: bool) -> tuple[str, datetime]:
+    lifetime = timedelta(days=REMEMBER_DAYS) if remember_me else timedelta(hours=SESSION_HOURS)
+    expires_at = utcnow() + lifetime
+    payload = f"{user.id}.{int(expires_at.timestamp())}.{user.auth_session_version}.{secrets.token_hex(8)}"
     signature = hmac.new(token_key(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}.{signature}"
+    return f"{payload}.{signature}", expires_at
+
+
+def csrf_token(user_id: int) -> str:
+    return hmac.new(
+        token_key(), ("kite-csrf-v1:" + str(user_id)).encode(), hashlib.sha256,
+    ).hexdigest()
+
+
+def cookie_settings(request: Request, remember_me: bool) -> dict[str, Any]:
+    origin = request.headers.get("origin")
+    cross_origin = False
+    if origin:
+        try:
+            from urllib.parse import urlparse
+
+            cross_origin = urlparse(origin).netloc != urlparse(str(request.base_url)).netloc
+        except ValueError:
+            cross_origin = True
+    secure = request.url.scheme == "https" or os.getenv("KITE_COOKIE_SECURE", "").lower() == "true"
+    same_site = "none" if cross_origin else "lax"
+    max_age = REMEMBER_DAYS * 24 * 60 * 60 if remember_me else None
+    if same_site == "none":
+        secure = True
+    return {"httponly": True, "secure": secure, "samesite": same_site, "path": "/", "max_age": max_age}
+
+
+def set_auth_cookies(
+    request: Request,
+    response: Response,
+    db: Session,
+    user: User,
+    access_token: str,
+    refresh_token: str | None,
+    remember_me: bool,
+    expires_at: datetime,
+    session_id: str | None = None,
+) -> str:
+    now = utcnow()
+    duration = timedelta(days=REMEMBER_DAYS) if remember_me else timedelta(hours=SESSION_HOURS)
+    session_id = session_id or secrets.token_hex(24)
+    existing = db.get(AuthSession, session_id)
+    session = existing or AuthSession(
+        id=session_id,
+        user_id=user.id,
+        token_hash=hashlib.sha256(access_token.encode()).hexdigest(),
+        created_at=now,
+        last_seen_at=now,
+        expires_at=now + duration,
+        remember_me=remember_me,
+        user_agent=(request.headers.get("user-agent") or "Browser")[:200],
+    )
+    if existing:
+        session.user_id = user.id
+        session.token_hash = hashlib.sha256(access_token.encode()).hexdigest()
+        session.last_seen_at = now
+        session.expires_at = now + duration
+        session.remember_me = remember_me
+    db.add(session)
+    settings = cookie_settings(request, remember_me)
+    response.set_cookie(AUTH_ACCESS_COOKIE, access_token, **settings)
+    if refresh_token:
+        response.set_cookie(AUTH_REFRESH_COOKIE, refresh_token, **settings)
+    else:
+        response.delete_cookie(AUTH_REFRESH_COOKIE, path="/", secure=settings["secure"],
+                               httponly=True, samesite=settings["samesite"])
+    response.set_cookie(AUTH_SESSION_COOKIE, session_id, **settings)
+    return csrf_token(user.id)
+
+
+def clear_auth_cookies(request: Request, response: Response) -> None:
+    settings = cookie_settings(request, False)
+    for name in (AUTH_ACCESS_COOKIE, AUTH_REFRESH_COOKIE, AUTH_SESSION_COOKIE):
+        response.delete_cookie(
+            name, path="/", secure=settings["secure"], httponly=True,
+            samesite=settings["samesite"],
+        )
+
+
+def credential_token(request: Request, authorization: str | None) -> tuple[str | None, bool]:
+    if authorization and authorization.startswith("Bearer "):
+        return authorization[7:], False
+    cookie = request.cookies.get(AUTH_ACCESS_COOKIE)
+    return (cookie, True) if cookie else (None, False)
+
+
+def validate_csrf(request: Request, user: User, using_cookie: bool) -> None:
+    if not using_cookie or request.method in {"GET", "HEAD", "OPTIONS"}:
+        return
+    supplied = request.headers.get("x-kite-csrf", "")
+    if not hmac.compare_digest(supplied, csrf_token(user.id)):
+        raise HTTPException(status_code=403, detail="This request could not be verified. Refresh the page and try again.")
+
+
+def validate_local_token(value: str, db: Session) -> User:
+    try:
+        parts = value.split(".")
+        if len(parts) == 3:
+            user_s, expiry_s, signature = parts
+            version_s = "0"
+            payload = f"{user_s}.{expiry_s}"
+        elif len(parts) == 4:
+            user_s, expiry_s, version_s, signature = parts
+            payload = f"{user_s}.{expiry_s}.{version_s}"
+        elif len(parts) == 5:
+            user_s, expiry_s, version_s, nonce, signature = parts
+            payload = f"{user_s}.{expiry_s}.{version_s}.{nonce}"
+        else:
+            raise ValueError
+        expected = hmac.new(token_key(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected) or int(expiry_s) <= int(time.time()):
+            raise ValueError
+        user = db.get(User, int(user_s))
+        if user is None or int(version_s) != user.auth_session_version:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
+    token_hash = hashlib.sha256(value.encode()).hexdigest()
+    if db.get(RevokedToken, token_hash):
+        raise HTTPException(status_code=401, detail="Your session has been signed out.")
+    return user
 
 
 def get_db():
@@ -533,43 +721,80 @@ def get_db():
 
 
 def current_user(
+    request: Request,
+    response: Response,
     authorization: Annotated[str | None, Header()] = None,
     db: Session = Depends(get_db),
 ) -> User:
-    if not authorization or not authorization.startswith("Bearer "):
+    credential, using_cookie = credential_token(request, authorization)
+    if not credential:
         raise HTTPException(status_code=401, detail="Sign in to continue.")
+    session = None
+    if using_cookie:
+        session_id = request.cookies.get(AUTH_SESSION_COOKIE, "")
+        session = db.get(AuthSession, session_id) if session_id else None
+        if (
+            session is None or session.revoked_at is not None
+            or ensure_utc(session.expires_at) <= utcnow()
+            or session.token_hash != hashlib.sha256(credential.encode()).hexdigest()
+        ):
+            clear_auth_cookies(request, response)
+            raise HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
     if supabase_configured():
-        auth_user = supabase_request("/user", access_token=authorization[7:])
+        try:
+            auth_user = supabase_request("/user", access_token=credential)
+        except HTTPException as error:
+            refresh_token = request.cookies.get(AUTH_REFRESH_COOKIE) if using_cookie else None
+            if error.status_code != 401 or not refresh_token or session is None:
+                if using_cookie:
+                    clear_auth_cookies(request, response)
+                raise
+            refreshed = supabase_request(
+                "/token?grant_type=refresh_token", method="POST",
+                data={"refresh_token": refresh_token},
+            )
+            credential = refreshed.get("access_token", "")
+            refresh_token = refreshed.get("refresh_token") or refresh_token
+            if not credential:
+                clear_auth_cookies(request, response)
+                raise HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
+            expires_at = utcnow() + timedelta(seconds=int(refreshed.get("expires_in", 3600)))
+            remember = session.remember_me
+            refreshed_user = refreshed.get("user") or {}
+            user = local_user_for_supabase(refreshed_user, db)
+            session.token_hash = hashlib.sha256(credential.encode()).hexdigest()
+            session.last_seen_at = utcnow()
+            set_auth_cookies(
+                request, response, db, user, credential, refresh_token,
+                remember, expires_at, session.id,
+            )
+            auth_user = refreshed_user
         if not auth_user.get("id") or not auth_user.get("email"):
             raise HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
         user = local_user_for_supabase(auth_user, db)
+        if using_cookie and session:
+            session.last_seen_at = utcnow()
         db.commit()
+        validate_csrf(request, user, using_cookie)
         return user
-    try:
-        user_s, expiry_s, signature = authorization[7:].split(".", 2)
-        payload = f"{user_s}.{expiry_s}"
-        expected = hmac.new(token_key(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected) or int(expiry_s) <= int(time.time()):
-            raise ValueError
-        user_id = int(user_s)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
-    token_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
-    if db.get(RevokedToken, token_hash):
-        raise HTTPException(status_code=401, detail="Your session has been signed out.")
-    user = db.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Account not found.")
+    user = validate_local_token(credential, db)
+    if using_cookie:
+        session.last_seen_at = utcnow()
+        db.commit()
+    validate_csrf(request, user, using_cookie)
     return user
 
 
 def optional_user(
+    request: Request,
+    response: Response,
     authorization: Annotated[str | None, Header()] = None,
     db: Session = Depends(get_db),
 ) -> User | None:
-    if not authorization:
+    credential, _ = credential_token(request, authorization)
+    if not credential:
         return None
-    return current_user(authorization, db)
+    return current_user(request, response, authorization, db)
 
 
 def premium_entitled(db: Session, user_id: int) -> bool:
@@ -704,11 +929,13 @@ class RegisterIn(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
+    remember_me: bool = False
 
 
 class LoginIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=128)
+    remember_me: bool = False
 
 
 class ProfileIn(BaseModel):
@@ -772,11 +999,13 @@ class GooglePurchaseIn(BaseModel):
 class GoogleAuthCodeIn(BaseModel):
     code: str = Field(min_length=1, max_length=2048)
     code_verifier: str = Field(min_length=43, max_length=128)
+    remember_me: bool = False
 
 
 class SupabaseSessionIn(BaseModel):
-    access_token: str = Field(min_length=1, max_length=4096)
+    access_token: str | None = Field(default=None, min_length=1, max_length=4096)
     refresh_token: str | None = Field(default=None, max_length=4096)
+    remember_me: bool = False
 
 
 class VerificationResendIn(BaseModel):
@@ -789,8 +1018,9 @@ app.add_middleware(
     allow_origins=[origin.strip() for origin in os.getenv(
         "KITE_CORS_ORIGINS", "http://localhost,https://localhost,capacitor://localhost"
     ).split(",") if origin.strip()],
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Kite-CSRF"],
 )
 app.mount("/assets", StaticFiles(directory=Path(__file__).parent.parent / "web" / "assets"), name="assets")
 
@@ -802,6 +1032,7 @@ def startup() -> None:
     Base.metadata.create_all(engine)
     notification_columns = {column["name"] for column in inspect(engine).get_columns("notifications")}
     quiz_attempt_columns = {column["name"] for column in inspect(engine).get_columns("quiz_attempts")}
+    user_columns = {column["name"] for column in inspect(engine).get_columns("users")}
     with engine.begin() as connection:
         if "event_key" not in notification_columns:
             connection.execute(text("ALTER TABLE notifications ADD COLUMN event_key VARCHAR(160)"))
@@ -813,6 +1044,8 @@ def startup() -> None:
             connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN request_hash VARCHAR(64)"))
         if "result_json" not in quiz_attempt_columns:
             connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"))
+        if "auth_session_version" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN auth_session_version INTEGER NOT NULL DEFAULT 0"))
         connection.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_user_event "
             "ON notifications (user_id, event_key)"
@@ -847,7 +1080,7 @@ def home() -> FileResponse:
 
 
 @app.post("/api/auth/register", status_code=201)
-def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db)):
+def register(payload: RegisterIn, request: Request, response: Response, db: Session = Depends(get_db)):
     email = str(payload.email).strip().lower()
     enforce_auth_rate_limit(request, "register", email, 5, 3600)
     password_error = password_strength_error(payload.password)
@@ -869,9 +1102,13 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
             body="Your learning journey starts here.", category="updates",
             target_route="learn",
         )
+        csrf = set_auth_cookies(
+            request, response, db, user, result["access_token"],
+            result.get("refresh_token"), payload.remember_me,
+            utcnow() + timedelta(seconds=int(result.get("expires_in", 3600))),
+        )
         db.commit()
-        return {"access_token": result["access_token"], "refresh_token": result.get("refresh_token"),
-                "token_type": result.get("token_type", "bearer"), "user": user_payload(user, db)}
+        return {"user": user_payload(user, db), "csrf_token": csrf}
     token_key()
     if db.scalar(select(User.id).where(User.email == email)):
         raise HTTPException(
@@ -886,12 +1123,16 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
         body="Your learning journey starts here.", category="updates",
         target_route="learn",
     )
+    access_token, expires_at = issue_token(user, payload.remember_me)
+    csrf = set_auth_cookies(
+        request, response, db, user, access_token, None, payload.remember_me, expires_at,
+    )
     db.commit()
-    return {"access_token": issue_token(user.id), "token_type": "bearer", "user": user_payload(user, db)}
+    return {"user": user_payload(user, db), "csrf_token": csrf}
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
+def login(payload: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
     email = str(payload.email).strip().lower()
     enforce_auth_rate_limit(request, "login", email, 8, 900)
     if supabase_configured():
@@ -903,15 +1144,23 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
         if not auth_user.get("id"):
             raise HTTPException(status_code=401, detail="Email or password is incorrect.")
         user = local_user_for_supabase(auth_user, db)
+        csrf = set_auth_cookies(
+            request, response, db, user, result["access_token"],
+            result.get("refresh_token"), payload.remember_me,
+            utcnow() + timedelta(seconds=int(result.get("expires_in", 3600))),
+        )
         db.commit()
-        return {"access_token": result["access_token"], "refresh_token": result.get("refresh_token"),
-                "token_type": result.get("token_type", "bearer"), "user": user_payload(user, db)}
+        return {"user": user_payload(user, db), "csrf_token": csrf}
     token_key()
     user = db.scalar(select(User).where(User.email == email))
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+    access_token, expires_at = issue_token(user, payload.remember_me)
+    csrf = set_auth_cookies(
+        request, response, db, user, access_token, None, payload.remember_me, expires_at,
+    )
     db.commit()
-    return {"access_token": issue_token(user.id), "token_type": "bearer", "user": user_payload(user, db)}
+    return {"user": user_payload(user, db), "csrf_token": csrf}
 
 
 @app.get("/api/auth/google/authorize")
@@ -933,7 +1182,9 @@ def google_auth_authorize(
 
 
 @app.post("/api/auth/google/exchange")
-def google_auth_exchange(payload: GoogleAuthCodeIn, request: Request, db: Session = Depends(get_db)):
+def google_auth_exchange(
+    payload: GoogleAuthCodeIn, request: Request, response: Response, db: Session = Depends(get_db),
+):
     enforce_auth_rate_limit(request, "google-exchange", "", 10, 900)
     if not supabase_configured():
         raise HTTPException(status_code=503, detail="Google sign-in requires configured Supabase Auth and Google OAuth credentials.")
@@ -945,25 +1196,64 @@ def google_auth_exchange(payload: GoogleAuthCodeIn, request: Request, db: Sessio
     if not auth_user.get("id") or not result.get("access_token"):
         raise HTTPException(status_code=401, detail="Google sign-in could not verify your account.")
     user = local_user_for_supabase(auth_user, db)
+    csrf = set_auth_cookies(
+        request, response, db, user, result["access_token"], result.get("refresh_token"),
+        payload.remember_me,
+        utcnow() + timedelta(seconds=int(result.get("expires_in", 3600))),
+    )
     db.commit()
-    return {"access_token": result["access_token"], "refresh_token": result.get("refresh_token"),
-            "token_type": result.get("token_type", "bearer"), "user": user_payload(user, db)}
+    return {"user": user_payload(user, db), "csrf_token": csrf}
 
 
 @app.post("/api/auth/session")
-def verify_supabase_session(payload: SupabaseSessionIn, db: Session = Depends(get_db)):
-    if not supabase_configured():
-        raise HTTPException(status_code=503, detail="Provider sign-in is not configured.")
-    auth_user = supabase_request("/user", access_token=payload.access_token)
-    if not auth_user.get("id") or not auth_user.get("email"):
-        raise HTTPException(status_code=401, detail="This verification link is invalid or expired.")
-    user = local_user_for_supabase(auth_user, db)
+def verify_supabase_session(
+    payload: SupabaseSessionIn, request: Request, response: Response, db: Session = Depends(get_db),
+):
+    if supabase_configured():
+        access_token = payload.access_token or ""
+        refresh_token = payload.refresh_token
+        try:
+            auth_user = supabase_request("/user", access_token=access_token)
+        except HTTPException as error:
+            if error.status_code != 401 or not refresh_token:
+                raise
+            refreshed = supabase_request(
+                "/token?grant_type=refresh_token", method="POST",
+                data={"refresh_token": refresh_token},
+            )
+            access_token = refreshed.get("access_token", "")
+            refresh_token = refreshed.get("refresh_token") or refresh_token
+            auth_user = refreshed.get("user") or {}
+        if not auth_user.get("id") or not auth_user.get("email"):
+            raise HTTPException(status_code=401, detail="This verification link is invalid or expired.")
+        user = local_user_for_supabase(auth_user, db)
+        expires_at = utcnow() + timedelta(minutes=60)
+    else:
+        if not payload.access_token:
+            raise HTTPException(status_code=401, detail="This saved session has expired. Sign in again.")
+        access_token = payload.access_token
+        refresh_token = None
+        user = validate_local_token(access_token, db)
+        expires_at = utcnow() + (
+            timedelta(days=REMEMBER_DAYS) if payload.remember_me else timedelta(hours=SESSION_HOURS)
+        )
+    csrf = set_auth_cookies(
+        request, response, db, user, access_token, refresh_token,
+        payload.remember_me, expires_at,
+    )
     db.commit()
+    return {"user": user_payload(user, db), "csrf_token": csrf}
+
+
+@app.get("/api/auth/session")
+def get_auth_session(request: Request, user: User = Depends(current_user),
+                     db: Session = Depends(get_db)):
+    session_id = request.cookies.get(AUTH_SESSION_COOKIE)
+    session = db.get(AuthSession, session_id) if session_id else None
     return {
-        "access_token": payload.access_token,
-        "refresh_token": payload.refresh_token,
-        "token_type": "bearer",
         "user": user_payload(user, db),
+        "csrf_token": csrf_token(user.id),
+        "remember_me": bool(session and session.remember_me),
     }
 
 
@@ -982,37 +1272,92 @@ def resend_verification(payload: VerificationResendIn, request: Request):
 
 
 @app.post("/api/auth/logout")
-def logout(authorization: Annotated[str | None, Header()] = None,
-           _: User = Depends(current_user), db: Session = Depends(get_db)):
-    if supabase_configured() and authorization:
-        supabase_request("/logout", method="POST", access_token=authorization[7:])
-    elif authorization:
-        token = authorization[7:]
-        expiry = int(token.split(".", 2)[1])
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
+def logout(request: Request, response: Response,
+           authorization: Annotated[str | None, Header()] = None,
+           user: User = Depends(current_user), db: Session = Depends(get_db)):
+    credential, using_cookie = credential_token(request, authorization)
+    session_id = request.cookies.get(AUTH_SESSION_COOKIE) if using_cookie else None
+    if session_id:
+        session = db.get(AuthSession, session_id)
+        if session and session.user_id == user.id:
+            session.revoked_at = utcnow()
+    if supabase_configured() and credential:
+        supabase_request("/logout", method="POST", access_token=credential)
+    elif credential:
+        token_hash = hashlib.sha256(credential.encode()).hexdigest()
+        try:
+            expiry_s = credential.split(".", 3)[1]
+            expires_at = datetime.fromtimestamp(int(expiry_s), timezone.utc)
+        except (IndexError, ValueError):
+            expires_at = utcnow() + timedelta(days=1)
         db.query(RevokedToken).filter(RevokedToken.expires_at <= utcnow()).delete(synchronize_session=False)
-        db.add(RevokedToken(
-            token_hash=token_hash,
-            expires_at=datetime.fromtimestamp(expiry, timezone.utc),
-        ))
-        db.commit()
+        if not db.get(RevokedToken, token_hash):
+            db.add(RevokedToken(token_hash=token_hash, expires_at=expires_at))
+    db.commit()
+    if using_cookie:
+        clear_auth_cookies(request, response)
+    return {"ok": True}
+
+
+@app.get("/api/auth/sessions")
+def list_auth_sessions(request: Request, user: User = Depends(current_user),
+                       db: Session = Depends(get_db)):
+    now = utcnow()
+    sessions = db.scalars(select(AuthSession).where(
+        AuthSession.user_id == user.id,
+        AuthSession.revoked_at.is_(None),
+        AuthSession.expires_at > now,
+    ).order_by(AuthSession.created_at.desc()))
+    current_id = request.cookies.get(AUTH_SESSION_COOKIE)
+    return [{
+        "id": session.id,
+        "current": session.id == current_id,
+        "created_at": session.created_at.isoformat(),
+        "last_seen_at": session.last_seen_at.isoformat(),
+        "expires_at": session.expires_at.isoformat(),
+        "remember_me": session.remember_me,
+        "device": session.user_agent,
+    } for session in sessions]
+
+
+@app.post("/api/auth/sessions/{session_id}/revoke")
+def revoke_auth_session(
+    session_id: str, request: Request, response: Response,
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    session = db.get(AuthSession, session_id)
+    if session is None or session.user_id != user.id or session.revoked_at is not None:
+        raise HTTPException(status_code=404, detail="This session could not be found.")
+    session.revoked_at = utcnow()
+    current = request.cookies.get(AUTH_SESSION_COOKIE) == session_id
+    db.commit()
+    if current:
+        clear_auth_cookies(request, response)
+    return {"ok": True, "current": current}
+
+
+@app.post("/api/auth/logout-all")
+def logout_all_sessions(
+    request: Request, response: Response, authorization: Annotated[str | None, Header()] = None,
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    credential, _ = credential_token(request, authorization)
+    for session in db.scalars(select(AuthSession).where(
+        AuthSession.user_id == user.id,
+        AuthSession.revoked_at.is_(None),
+    )):
+        session.revoked_at = utcnow()
+    user.auth_session_version += 1
+    if supabase_configured() and credential:
+        supabase_request("/logout?scope=global", method="POST", access_token=credential)
+    db.commit()
+    clear_auth_cookies(request, response)
     return {"ok": True}
 
 
 @app.post("/api/auth/refresh")
-def refresh_auth(payload: dict[str, str], db: Session = Depends(get_db)):
-    refresh_token = payload.get("refresh_token", "")
-    if not refresh_token:
-        raise HTTPException(status_code=401, detail="Sign in again to continue.")
-    if supabase_configured():
-        result = supabase_request("/token?grant_type=refresh_token", method="POST",
-                                  data={"refresh_token": refresh_token})
-        auth_user = result.get("user") or {}
-        user = local_user_for_supabase(auth_user, db)
-        db.commit()
-        return {"access_token": result["access_token"], "refresh_token": result.get("refresh_token"),
-                "user": user_payload(user, db)}
-    raise HTTPException(status_code=401, detail="Sign in again to continue.")
+def refresh_auth(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return {"user": user_payload(user, db), "csrf_token": csrf_token(user.id)}
 
 
 @app.post("/api/auth/password-reset")
@@ -1060,6 +1405,12 @@ def complete_password_reset(payload: ResetCompleteIn, db: Session = Depends(get_
     if user is None:
         raise HTTPException(status_code=400, detail="This reset link is invalid or expired.")
     user.password_hash = hash_password(payload.password)
+    user.auth_session_version += 1
+    for session in db.scalars(select(AuthSession).where(
+        AuthSession.user_id == user.id,
+        AuthSession.revoked_at.is_(None),
+    )):
+        session.revoked_at = utcnow()
     reset.used = True
     db.commit()
     return {"ok": True}
@@ -1078,16 +1429,18 @@ def update_me(payload: ProfileIn, user: User = Depends(current_user), db: Sessio
 
 
 @app.patch("/api/me/email")
-def update_email(payload: EmailUpdateIn, authorization: Annotated[str | None, Header()] = None,
+def update_email(payload: EmailUpdateIn, request: Request,
+                 authorization: Annotated[str | None, Header()] = None,
                  user: User = Depends(current_user), db: Session = Depends(get_db)):
     email = str(payload.email).strip().lower()
     existing = db.scalar(select(User.id).where(User.email == email, User.id != user.id))
     if existing:
         raise HTTPException(status_code=409, detail="An account with that email already exists.")
     if supabase_configured():
-        if not authorization:
+        credential, _ = credential_token(request, authorization)
+        if not credential:
             raise HTTPException(status_code=401, detail="Sign in to continue.")
-        supabase_request("/user", method="PUT", data={"email": email}, access_token=authorization[7:])
+        supabase_request("/user", method="PUT", data={"email": email}, access_token=credential)
         return {"message": "Check your new email address to confirm the change."}
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
@@ -1097,16 +1450,18 @@ def update_email(payload: EmailUpdateIn, authorization: Annotated[str | None, He
 
 
 @app.patch("/api/me/password")
-def update_password(payload: PasswordUpdateIn, authorization: Annotated[str | None, Header()] = None,
+def update_password(payload: PasswordUpdateIn, request: Request,
+                    authorization: Annotated[str | None, Header()] = None,
                     user: User = Depends(current_user), db: Session = Depends(get_db)):
     password_error = password_strength_error(payload.new_password)
     if password_error:
         raise HTTPException(status_code=422, detail=password_error)
     if supabase_configured():
-        if not authorization:
+        credential, _ = credential_token(request, authorization)
+        if not credential:
             raise HTTPException(status_code=401, detail="Sign in to continue.")
         supabase_request("/user", method="PUT", data={"password": payload.new_password},
-                         access_token=authorization[7:])
+                         access_token=credential)
         return {"ok": True}
     if not verify_password(payload.current_password, user.password_hash):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
@@ -1175,7 +1530,10 @@ def list_modules(user: User | None = Depends(optional_user), db: Session = Depen
             (lesson for lesson in lessons if lesson["module_id"] == module["id"]),
             key=lambda lesson: lesson["module_lesson_order"],
         )
-        quizzes = [item for item in QUIZ_METADATA if item["module_id"] == module["id"]]
+        quizzes = [
+            item for item in QUIZ_METADATA + LESSON_ONLY_QUIZ_METADATA
+            if item["module_id"] == module["id"]
+        ]
         challenges = [item for item in CHALLENGE_METADATA if item["module_id"] == module["id"]]
         locked = bool(module_lessons) and all(lesson["locked"] for lesson in module_lessons)
         available_quizzes = [] if locked else quizzes
@@ -1372,8 +1730,11 @@ def progress(user: User = Depends(current_user), db: Session = Depends(get_db)):
     )))
     activity = list(db.scalars(select(Activity).where(Activity.user_id == user.id).order_by(Activity.created_at.desc()).limit(30)))
     available_quizzes = [
-        item for item in QUIZ_METADATA
+        item for item in QUIZ_METADATA + LESSON_ONLY_QUIZ_METADATA
         if not module_is_locked(item["module_id"], user, db)
+    ]
+    recommendable_quizzes = [
+        item for item in available_quizzes if not item.get("lesson_only")
     ]
     available_quiz_ids = {item["id"] for item in available_quizzes}
     quiz_results = {
@@ -1399,7 +1760,7 @@ def progress(user: User = Depends(current_user), db: Session = Depends(get_db)):
         if best_percentages else None
     )
     quiz_recommendations = []
-    for item in available_quizzes:
+    for item in recommendable_quizzes:
         result = quiz_results.get(item["id"])
         percentage = best_percentages.get(item["id"])
         if percentage is not None and percentage >= item["pass_threshold"]:
@@ -1884,7 +2245,8 @@ async def submit_challenge(challenge_id: str, payload: ChallengeIn, user: User =
 
 
 @app.get("/api/quizzes")
-def list_quizzes(user: User | None = Depends(optional_user), db: Session = Depends(get_db)):
+def list_quizzes(lesson_id: str | None = Query(default=None),
+                 user: User | None = Depends(optional_user), db: Session = Depends(get_db)):
     results = {}
     attempt_counts = {}
     attempts_by_quiz: dict[str, list[QuizAttempt]] = {}
@@ -1909,8 +2271,17 @@ def list_quizzes(user: User | None = Depends(optional_user), db: Session = Depen
             if len(quiz_attempts) < 5:
                 quiz_attempts.append(attempt)
 
+    metadata_items = QUIZ_METADATA
+    if lesson_id is not None:
+        if lesson_id not in LESSON_MODULES:
+            raise HTTPException(status_code=404, detail="Lesson not found.")
+        metadata_items = QUIZ_METADATA + LESSON_ONLY_QUIZ_METADATA
+        metadata_items = [
+            item for item in metadata_items if lesson_id in item["lesson_ids"]
+        ]
+
     catalog = []
-    for item in QUIZ_METADATA:
+    for item in metadata_items:
         result = results.get(item["id"])
         attempts = attempts_by_quiz.get(item["id"], [])
         latest_attempt = attempts[0] if attempts else None
@@ -1941,13 +2312,22 @@ def list_quizzes(user: User | None = Depends(optional_user), db: Session = Depen
     return catalog
 
 
+def validate_quiz_lesson_scope(metadata: dict[str, Any], lesson_id: str | None) -> None:
+    lesson_ids = metadata["lesson_ids"]
+    if metadata.get("lesson_only") and lesson_id not in lesson_ids:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+    if lesson_id is not None and lesson_id not in lesson_ids:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+
+
 @app.get("/api/quizzes/{quiz_id}")
 def get_quiz(quiz_id: str, user: User | None = Depends(optional_user),
-             db: Session = Depends(get_db)):
-    questions = QUIZZES.get(quiz_id)
-    if questions is None:
+             db: Session = Depends(get_db), lesson_id: str | None = Query(default=None)):
+    questions = quiz_questions(quiz_id)
+    metadata = QUIZ_METADATA_BY_ID.get(quiz_id)
+    if questions is None or metadata is None:
         raise HTTPException(status_code=404, detail="Quiz not found.")
-    metadata = QUIZ_METADATA_BY_ID[quiz_id]
+    validate_quiz_lesson_scope(metadata, lesson_id)
     if module_is_locked(metadata["module_id"], user, db):
         raise HTTPException(status_code=402, detail="This quiz is part of Kite Premium.")
     return {
@@ -1974,11 +2354,12 @@ def get_quiz(quiz_id: str, user: User | None = Depends(optional_user),
 
 @app.post("/api/quizzes/{quiz_id}/submit")
 def submit_quiz(quiz_id: str, payload: QuizIn, user: User | None = Depends(optional_user),
-                db: Session = Depends(get_db)):
-    questions = QUIZZES.get(quiz_id)
-    if questions is None:
+                db: Session = Depends(get_db), lesson_id: str | None = Query(default=None)):
+    questions = quiz_questions(quiz_id)
+    metadata = QUIZ_METADATA_BY_ID.get(quiz_id)
+    if questions is None or metadata is None:
         raise HTTPException(status_code=404, detail="Quiz not found.")
-    metadata = QUIZ_METADATA_BY_ID[quiz_id]
+    validate_quiz_lesson_scope(metadata, lesson_id)
     if module_is_locked(metadata["module_id"], user, db):
         raise HTTPException(status_code=402, detail="This quiz is part of Kite Premium.")
     if len(payload.answers) != len(questions):
