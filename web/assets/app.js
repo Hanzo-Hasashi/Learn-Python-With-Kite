@@ -6,6 +6,10 @@
   var pendingPlanKey = "kite.pendingSubscriptionPeriod";
   var mobileMoneyPaymentKey = "kite.mobileMoneyPaymentId";
   var mobileMoneyIdempotencyKey = "kite.mobileMoneyIdempotencyKey";
+  var subscriptionRegistrationIdKey = "kite.subscriptionRegistrationId";
+  var subscriptionRegistrationAccessKey = "kite.subscriptionRegistrationAccessKey";
+  var subscriptionRegistrationIdempotencyKey = "kite.subscriptionRegistrationIdempotencyKey";
+  var subscriptionPaymentIdempotencyKey = "kite.subscriptionPaymentIdempotencyKey";
   var subscriptionReturnKey = "kite.subscriptionReturn";
   var googleVerifierKey = "kite.googleCodeVerifier";
   var authDestinationKey = "kite.authDestination";
@@ -234,12 +238,15 @@
     }).finally(function () { refreshInFlight = null; });
     return refreshInFlight;
   }
-  function api(path, body, method) {
+  function api(path, body, method, extraHeaders) {
     var sessionIndependentAuth = path === "/api/auth/login" ||
       path.indexOf("/api/auth/google/") === 0;
     var authRequestTimeout = sessionIndependentAuth ? 30000 : 0;
     function send(retried) {
       var headers = { "Content-Type": "application/json" };
+      Object.keys(extraHeaders || {}).forEach(function (name) {
+        headers[name] = extraHeaders[name];
+      });
       if (token() && authCsrf && (method || (body ? "POST" : "GET")) !== "GET") {
         headers["X-Kite-CSRF"] = authCsrf;
       }
@@ -293,6 +300,26 @@
     }
     target.textContent = text;
     if (target.classList.contains("err")) target.className = "err" + (isError ? " on" : "");
+  }
+  function showContentUnavailable(doc, target, resource, retry, error) {
+    console.error("Could not load the " + resource + ".", error);
+    if (!target) {
+      tell(doc, "The " + resource + " could not be loaded. Check your connection to Kite and try again.", true);
+      return;
+    }
+    target.textContent = "";
+    var notice = doc.createElement(target.tagName === "OL" || target.tagName === "UL" ? "li" : "section");
+    notice.setAttribute("role", "alert");
+    notice.style.cssText = "margin:16px;padding:16px;border:1px solid var(--line,#dbe4f3);border-radius:14px;background:var(--card,#fff);color:var(--ink,#17233d)";
+    var message = doc.createElement("p");
+    message.textContent = "The " + resource + " could not be loaded. Check your connection to Kite and try again.";
+    var button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = "Retry";
+    button.style.cssText = "min-height:44px;margin-top:8px;padding:8px 14px;border:0;border-radius:10px;background:var(--blue,#1d6bf0);color:#fff;font:inherit;cursor:pointer";
+    button.addEventListener("click", retry);
+    notice.append(message, button);
+    target.appendChild(notice);
   }
   function friendlyAuthMessage(error, flow) {
     var status = error && error.status;
@@ -1214,7 +1241,7 @@
           title: "5. Premium plans and payments",
           paragraphs: [
             "The current advertised Premium prices are K19.99 per month and K99.99 per year. Twelve monthly payments at the advertised rate total K239.88; the annual plan is K139.89 less (approximately 58.3%). The purchase screen and Google Play checkout, when available, show the terms that apply to your transaction.",
-            "Where enabled, Google Play purchases are verified by the Service and are managed through Google Play, including automatic renewal, cancellation, payment method and refund arrangements under its terms and applicable law. Where enabled, Zambian mobile-money payments are processed through PawaPay and the selected mobile-money provider. Each confirmed mobile-money payment is a one-time prepaid purchase for 30 days or 365 days; it does not automatically renew, and a new payment is required to extend access. Never enter a mobile-money PIN in Kite. A Premium entitlement is applied only after the Service verifies a completed payment. Contact Kite support about a payment discrepancy or refund request; mobile-money refunds are not currently available in-app and remain subject to applicable law. Checkout is unavailable unless its payment provider and merchant configuration are enabled."
+            "Where enabled, Google Play purchases are verified by the Service and are managed through Google Play, including automatic renewal, cancellation, payment method and refund arrangements under its terms and applicable law. Zambian mobile-money purchases are prepaid for 30 or 365 days and do not automatically renew. A verified payment is required to activate or extend Premium. A mobile-money registration alone does not charge you or activate Premium. Never enter a mobile-money PIN in Kite. Contact Kite support about a payment discrepancy or refund request; mobile-money refunds are not currently available in-app and remain subject to applicable law. Payment initiation is unavailable unless a provider is configured."
           ]
         },
         {
@@ -1258,7 +1285,7 @@
             "Account information: the name and email address you provide, an account identifier, and authentication information. With local authentication, the server stores a salted password hash rather than the plaintext password. If Supabase authentication is configured, Supabase handles sign-in credentials and the app receives account information needed to provide your Kite account.",
             "Learning and activity information: lesson completion and scores, quiz or challenge activity, XP, streaks, achievement progress and activity timestamps. Quiz answers are processed to calculate a result; the app records each quiz's best score and XP rather than keeping the submitted answer list. Challenge results may be recorded as activity.",
             "Profile and preferences: account name and settings such as theme, language and the notification preference. The browser may also retain display-only profile customizations, such as a nickname or avatar color.",
-            "Subscription information: selected product, verification state, expiry and renewal state. When Google Play verification is configured, the server receives the purchase token for verification and stores a hash and an encrypted copy for subscription checks. When mobile-money checkout is enabled, Kite sends the phone number you enter and payment amount/provider details to PawaPay to request a payment; Kite does not store that phone number or collect your mobile-money PIN. Kite stores the provider transaction reference, selected plan, amount, status and timestamps needed to reconcile the payment and entitlement.",
+            "Subscription information: selected plan, registration and payment status, expiry and renewal state. When Google Play verification is configured, the server receives the purchase token for verification and stores a hash and an encrypted copy for subscription checks. For a mobile-money registration, Kite stores the normalized Zambian phone number encrypted at rest and returns only its last four digits; when a payment provider is connected and a payment is initiated, the number and payment details are sent to that provider. Kite stores the transaction reference, selected plan, amount, status and timestamps needed to reconcile payment and entitlement. Kite never requests or stores a mobile-money PIN.",
             "Code and technical information: code is sent to the configured execution service when you choose Run or submit a coding challenge. The Kite database records challenge results and counts of Playground runs that fail and are later corrected, but not the submitted source code. The hosting or web server may log operational request information such as IP address, requested path, time and response status.",
             "Support information: if you contact us by email or telephone, the details and message you choose to provide are handled by the relevant communications provider. Contact Us does not submit a message to or store one in the Kite app."
           ]
@@ -1287,7 +1314,7 @@
           title: "6. Retention and security",
           paragraphs: [
             "Account, progress, activity and subscription records remain in the configured database while the account is in use and until they are removed by the service operator or a retention requirement applies. The current app has no automatic account-retention schedule and no in-app data-export or account-deletion control. Operational-log retention depends on the hosting provider and deployment.",
-            "Local-auth passwords are stored as salted, one-way hashes, and stored Google Play purchase tokens are encrypted by the app. Other safeguards, including transport security, database backups and provider access controls, depend on deployment configuration. No system can be guaranteed completely secure; use a unique password and do not submit secrets as code."
+            "Local-auth passwords are stored as salted, one-way hashes. Stored Google Play purchase tokens and mobile-money registration numbers are encrypted by the app; phone-number encryption requires a stable server-side KITE_SECRET_KEY of at least 32 characters. Other safeguards, including transport security, database backups and provider access controls, depend on deployment configuration. No system can be guaranteed completely secure; use a unique password and do not submit secrets as code."
           ]
         },
         {
@@ -1380,6 +1407,171 @@
     overlay.classList.add("on");
     close.focus();
   }
+  var subscriptionPlanCache = {};
+
+  function renderSubscriptionPlanFeatures(doc, list, features) {
+    while (list.firstChild) list.removeChild(list.firstChild);
+    (Array.isArray(features) ? features : []).forEach(function (feature) {
+      var item = doc.createElement("li");
+      item.textContent = feature;
+      item.style.cssText = "margin:4px 0;line-height:1.45";
+      list.appendChild(item);
+    });
+  }
+
+  function renderSubscriptionPlans(doc, plans) {
+    var grid = doc.getElementById("kite-plan-options");
+    if (!grid) return;
+    while (grid.firstChild) grid.removeChild(grid.firstChild);
+    Object.keys(subscriptionPlanCache).forEach(function (key) { delete subscriptionPlanCache[key]; });
+    var availablePlans = Array.isArray(plans) ? plans : [];
+    if (!availablePlans.length) {
+      grid.textContent = "No subscription plans are available right now.";
+      return;
+    }
+    availablePlans.forEach(function (plan) {
+      subscriptionPlanCache[plan.id] = plan;
+      var card = doc.createElement("article");
+      card.dataset.planId = plan.id;
+      card.setAttribute("role", "listitem");
+      card.style.cssText = "min-width:0;padding:16px;border:2px solid var(--line,#e3eaf5);border-radius:14px;background:var(--card,#fff);color:var(--ink,inherit);display:flex;flex-direction:column;gap:10px";
+
+      var titleRow = doc.createElement("div");
+      titleRow.style.cssText = "display:flex;align-items:flex-start;justify-content:space-between;gap:8px";
+      var title = doc.createElement("h3");
+      title.textContent = plan.name;
+      title.style.cssText = "margin:0;font-size:17px;line-height:1.3";
+      titleRow.appendChild(title);
+      if (plan.best_value) {
+        var badge = doc.createElement("span");
+        badge.textContent = "Best value";
+        badge.style.cssText = "flex:none;padding:3px 8px;border-radius:999px;background:var(--soft,#e8f0fe);color:var(--blue,#1d6bf0);font-size:12px;font-weight:700";
+        titleRow.appendChild(badge);
+      }
+      card.appendChild(titleRow);
+
+      var price = doc.createElement("p");
+      price.textContent = plan.price + (plan.period ? " / " + plan.period : "");
+      price.style.cssText = "margin:0;font-size:22px;font-weight:750";
+      card.appendChild(price);
+
+      if (plan.best_value && plan.savings) {
+        var savings = doc.createElement("p");
+        savings.textContent = "Save " + plan.savings + (plan.percentage_savings ? " · " + plan.percentage_savings + " less" : "");
+        savings.style.cssText = "margin:-6px 0 0;color:var(--mut,#66758d);font-size:13px";
+        card.appendChild(savings);
+      }
+
+      var summary = doc.createElement("p");
+      summary.textContent = plan.summary;
+      summary.style.cssText = "margin:0;line-height:1.45";
+      card.appendChild(summary);
+
+      var featureHeading = doc.createElement("strong");
+      featureHeading.textContent = "Included";
+      featureHeading.style.fontSize = "13px";
+      card.appendChild(featureHeading);
+      var featureList = doc.createElement("ul");
+      featureList.style.cssText = "margin:0;padding-left:20px;font-size:14px";
+      renderSubscriptionPlanFeatures(doc, featureList, plan.features);
+      card.appendChild(featureList);
+
+      var limitation = doc.createElement("p");
+      limitation.textContent = plan.premium
+        ? "Mobile-money access is prepaid and does not renew automatically."
+        : "Premium lessons, quizzes, and challenges are not included.";
+      limitation.style.cssText = "margin:auto 0 0;padding-top:6px;color:var(--mut,#66758d);font-size:13px;line-height:1.4";
+      card.appendChild(limitation);
+
+      if (plan.premium) {
+        var button = doc.createElement("button");
+        button.type = "button";
+        button.id = plan.id === "premium_monthly" ? "kite-monthly"
+          : plan.id === "premium_annual" ? "kite-annual" : "kite-plan-" + plan.id;
+        button.dataset.planId = plan.id;
+        button.setAttribute("aria-pressed", "false");
+        button.textContent = "Select plan";
+        button.style.cssText = "width:100%;min-height:44px;margin-top:8px;padding:10px 14px;border:1px solid var(--blue,#1d6bf0);border-radius:9px;background:var(--card,#fff);color:var(--blue,#1d6bf0);font:600 15px system-ui;cursor:pointer";
+        card.appendChild(button);
+      } else {
+        var current = doc.createElement("span");
+        current.textContent = "Available now";
+        current.style.cssText = "margin-top:8px;color:var(--mut,#66758d);font-size:13px;font-weight:600";
+        card.appendChild(current);
+      }
+      grid.appendChild(card);
+    });
+  }
+
+  function setSubscriptionPlanSelectionEnabled(doc, enabled) {
+    Array.prototype.forEach.call(doc.querySelectorAll("#kite-plan-options button[data-plan-id]"), function (button) {
+      button.disabled = !enabled;
+      button.style.opacity = enabled ? "1" : "0.65";
+      button.style.cursor = enabled ? "pointer" : "not-allowed";
+    });
+  }
+
+  function selectSubscriptionPlan(doc, plan, registered) {
+    if (!plan || !plan.premium) return false;
+    var group = doc.getElementById("kite-subscription");
+    var review = doc.getElementById("kite-plan-review");
+    var summary = doc.getElementById("kite-selected-plan-summary");
+    var continueButton = doc.getElementById("kite-continue-registration");
+    var panel = doc.getElementById("kite-mobile-money");
+    if (!group || !review || !summary || !continueButton) return false;
+
+    group.dataset.selectedPlanId = plan.id;
+    if (panel) panel.dataset.planId = plan.id;
+    summary.textContent = subscriptionPlanDescription(plan);
+    review.hidden = false;
+    var billing = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.KiteBilling;
+    continueButton.textContent = billing && typeof billing.purchase === "function"
+      ? "Continue to Google Play" : "Continue to mobile-money details";
+    continueButton.hidden = Boolean(registered);
+    continueButton.disabled = false;
+
+    Array.prototype.forEach.call(doc.querySelectorAll("#kite-plan-options article"), function (card) {
+      var selected = card.dataset.planId === plan.id;
+      card.style.borderColor = selected ? "var(--blue,#1d6bf0)" : "var(--line,#e3eaf5)";
+      card.style.boxShadow = selected ? "0 0 0 2px var(--soft,#e8f0fe)" : "none";
+      var button = card.querySelector("button[data-plan-id]");
+      if (button) {
+        button.setAttribute("aria-pressed", String(selected));
+        button.textContent = selected ? "Selected" : "Select plan";
+      }
+    });
+
+    var details = doc.getElementById("kite-mm-plan-details");
+    if (details) details.textContent = subscriptionPlanDescription(plan);
+    return true;
+  }
+
+  function displaySubscriptionStatus(value) {
+    return String(value || "Not available").toLowerCase().replace(/(^| )\w/g, function (match) {
+      return match.toUpperCase();
+    }).replace(/_/g, " ");
+  }
+
+  function clearSubscriptionPlanSelection(doc) {
+    var group = doc.getElementById("kite-subscription");
+    var review = doc.getElementById("kite-plan-review");
+    var continueButton = doc.getElementById("kite-continue-registration");
+    var panel = doc.getElementById("kite-mobile-money");
+    if (group) delete group.dataset.selectedPlanId;
+    if (panel) delete panel.dataset.planId;
+    if (review) review.hidden = true;
+    if (continueButton) continueButton.hidden = true;
+    Array.prototype.forEach.call(doc.querySelectorAll("#kite-plan-options article"), function (card) {
+      card.style.borderColor = "var(--line,#e3eaf5)";
+      card.style.boxShadow = "none";
+      var button = card.querySelector("button[data-plan-id]");
+      if (button) {
+        button.setAttribute("aria-pressed", "false");
+        button.textContent = "Select plan";
+      }
+    });
+  }
+
   function addSubscriptionSection(doc) {
     var main = doc.querySelector(".scroll");
     if (!main || doc.getElementById("kite-subscription")) return;
@@ -1389,24 +1581,60 @@
     group.className = "grp";
     group.id = "kite-subscription";
     group.innerHTML = "<div class=\"row\"><span class=\"l\" id=\"kite-plan-state\">Kite Free</span><span class=\"val\">Current plan</span></div>" +
-      "<button class=\"row\" type=\"button\" id=\"kite-monthly\"><span class=\"l\">Kite Premium · Monthly</span><span class=\"val\">Subscribe</span></button>" +
-      "<button class=\"row\" type=\"button\" id=\"kite-annual\"><span class=\"l\">Kite Premium · Annual <span id=\"kite-best-value\" style=\"display:inline-block;margin-left:6px;padding:2px 7px;border-radius:10px;background:#e8f5ed;color:#267447;font-size:11px;font-weight:600;white-space:nowrap\">Best Value</span><span id=\"kite-annual-savings\" style=\"display:block;margin-top:3px;font-size:12px;font-weight:500\">Save K139.89 annually · 58.3% less</span></span><span class=\"val\">Subscribe</span></button>" +
-      "<p class=\"sub\" style=\"padding:12px 16px 0\">Premium unlocks the full learning path, including premium lessons, topic quizzes, and coding challenges.</p>" +
+      "<h3 style=\"margin:18px 16px 0;font-size:18px\">1. Compare available plans</h3>" +
+      "<p class=\"sub\" style=\"padding:6px 16px 0\">Review each plan’s price, access, and renewal terms before choosing.</p>" +
+      "<div id=\"kite-plan-options\" role=\"list\" aria-label=\"Available subscription plans\" style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;padding:12px 16px\">Loading plans…</div>" +
+      "<section id=\"kite-plan-review\" hidden style=\"margin:8px 16px 16px;padding:16px;border:1px solid var(--line,#e3eaf5);border-radius:12px;background:var(--soft,#e8f0fe)\">" +
+      "<h3 style=\"margin:0 0 8px;font-size:17px\">2. Review your selection</h3>" +
+      "<p id=\"kite-selected-plan-summary\" style=\"margin:0 0 12px;line-height:1.5\"></p>" +
+      "<button class=\"kite-subscription-action kite-subscription-action-primary\" id=\"kite-continue-registration\" type=\"button\" hidden>Continue to mobile-money details</button></section>" +
       "<p class=\"sub\" id=\"kite-plan-summary\" aria-live=\"polite\" style=\"padding:8px 16px 0\">Current plan: Kite Free. No subscription is active.</p>" +
-      "<p class=\"sub\" style=\"padding:8px 16px 0\">Subscription registration uses your Kite account name and email. Zambia mobile-money checkout, when enabled, requires a +260 phone number.</p>" +
-      "<div id=\"kite-mm-preview\" style=\"padding:12px 16px;border-top:1px solid var(--line)\"><label for=\"kite-mm-preview-phone\" style=\"display:block;margin-bottom:5px\">Zambian mobile-money number</label><input id=\"kite-mm-preview-phone\" type=\"tel\" autocomplete=\"tel\" inputmode=\"tel\" placeholder=\"+260XXXXXXXXX\" disabled aria-describedby=\"kite-mm-preview-note\" style=\"box-sizing:border-box;width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--page);color:var(--mut)\"><p class=\"sub\" id=\"kite-mm-preview-note\" style=\"margin:7px 0 0\">Unavailable until a mobile-money provider is configured. No payment will be requested.</p></div>" +
       "<button class=\"row\" type=\"button\" id=\"kite-sign-in\"><span class=\"l\">Sign in to continue</span><span class=\"val\">Sign in</span></button>" +
       "<button class=\"row\" type=\"button\" id=\"kite-manage\"><span class=\"l\">Manage subscription</span><span class=\"val\">Google Play</span></button>" +
       "<div id=\"kite-mobile-money\" hidden style=\"padding:16px;border-top:1px solid #e8e8e8\">" +
-      "<p style=\"margin:0 0 12px\">Pay once with Airtel Money, MTN MoMo, or Zamtel Kwacha. Premium access is prepaid and does not auto-renew.</p>" +
-      "<label for=\"kite-mm-provider\" style=\"display:block;margin:10px 0 5px\">Mobile-money provider</label>" +
-      "<select id=\"kite-mm-provider\" style=\"width:100%;padding:10px;border:1px solid #ccc;border-radius:8px\"><option value=\"\">Choose a provider</option></select>" +
-      "<label for=\"kite-mm-phone\" style=\"display:block;margin:10px 0 5px\">Zambian mobile-money number (e.g. +260…)</label>" +
-      "<input id=\"kite-mm-phone\" type=\"tel\" autocomplete=\"tel\" inputmode=\"tel\" placeholder=\"+260XXXXXXXXX\" style=\"box-sizing:border-box;width:100%;padding:10px;border:1px solid #ccc;border-radius:8px\">" +
-      "<button id=\"kite-mm-pay\" type=\"button\" style=\"margin-top:12px;padding:10px 14px\">Continue to payment</button>" +
-      "<button id=\"kite-mm-check\" type=\"button\" hidden style=\"margin:12px 0 0 8px;padding:10px 14px\">Check payment status</button>" +
+      "<h3 style=\"margin:0 0 8px;font-size:17px\">3. Mobile-money details</h3>" +
+      "<p id=\"kite-mm-plan-details\" style=\"margin:0 0 12px\"></p>" +
+      "<p class=\"sub\" style=\"margin:0 0 12px\">Enter the Zambian mobile-money number to associate with this registration.</p>" +
+      "<h3 id=\"kite-registration-title\" hidden style=\"margin:16px 0 8px\">Registration confirmation</h3>" +
+      "<div id=\"kite-registration-summary\" hidden style=\"margin:8px 0 14px;padding:12px;border:1px solid var(--line,#e3eaf5);border-radius:10px;background:var(--card,#fff)\">" +
+      "<div style=\"display:grid;grid-template-columns:minmax(100px,0.8fr) minmax(0,1.2fr);gap:8px;font-size:14px\">" +
+      "<strong>Plan</strong><span id=\"kite-registration-plan\"></span><strong>Price and term</strong><span id=\"kite-registration-price\"></span>" +
+      "<strong>Mobile number</strong><span id=\"kite-registration-phone\"></span><strong>Registration reference</strong><span id=\"kite-registration-reference\" style=\"overflow-wrap:anywhere\"></span>" +
+      "<strong>Payment reference</strong><span id=\"kite-payment-reference\" style=\"overflow-wrap:anywhere\"></span><strong>Subscription status</strong><span id=\"kite-registration-status\"></span>" +
+      "<strong>Payment status</strong><span id=\"kite-payment-status\"></span><strong>Renewal</strong><span id=\"kite-registration-renewal\"></span>" +
+      "<strong>Access until</strong><span id=\"kite-registration-expiry\"></span></div></div>" +
+      "<label for=\"kite-mm-phone\" style=\"display:block;margin:10px 0 5px\">Zambian mobile-money number</label>" +
+      "<div style=\"display:flex;align-items:center;gap:8px\"><span aria-hidden=\"true\" style=\"padding:10px 12px;border:1px solid #ccc;border-radius:8px;background:var(--page)\">+260</span><input id=\"kite-mm-phone\" type=\"tel\" autocomplete=\"tel-national\" inputmode=\"numeric\" maxlength=\"13\" placeholder=\"97 123 4567\" aria-describedby=\"kite-mm-phone-help\" style=\"box-sizing:border-box;min-width:0;flex:1;padding:10px;border:1px solid #ccc;border-radius:8px\"></div>" +
+      "<p class=\"sub\" id=\"kite-mm-phone-help\" style=\"margin:6px 0 0\">Enter 9 digits. Your number is saved as +260XXXXXXXXX.</p>" +
+      "<div id=\"kite-registration-actions\" style=\"display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px\">" +
+      "<button class=\"kite-subscription-action kite-subscription-action-primary\" id=\"kite-mm-register\" type=\"button\">Register subscription</button>" +
+      "<button class=\"kite-subscription-action kite-subscription-action-secondary\" id=\"kite-registration-back\" type=\"button\">Back to plans</button></div>" +
+      "<label id=\"kite-payment-provider-label\" for=\"kite-payment-provider\" hidden style=\"display:block;margin:10px 0 5px\">Payment provider</label>" +
+      "<select id=\"kite-payment-provider\" hidden style=\"width:100%;min-height:44px;padding:10px;border:1px solid #ccc;border-radius:8px\"><option value=\"\">Choose a provider</option></select>" +
+      "<button id=\"kite-payment-initiate\" type=\"button\" hidden style=\"min-height:44px;margin:12px 0 0;padding:10px 14px\">Start mobile-money payment</button>" +
+      "<label id=\"kite-mm-provider-label\" for=\"kite-mm-provider\" hidden style=\"display:block;margin:10px 0 5px\">Mobile-money provider</label>" +
+      "<select id=\"kite-mm-provider\" hidden style=\"width:100%;min-height:44px;padding:10px;border:1px solid #ccc;border-radius:8px\"><option value=\"\">Choose a provider</option></select>" +
+      "<button id=\"kite-mm-pay\" type=\"button\" hidden style=\"min-height:44px;margin:12px 0 0;padding:10px 14px\">Continue to payment</button>" +
+      "<button id=\"kite-mm-check\" type=\"button\" hidden style=\"min-height:44px;margin:12px 0 0 8px;padding:10px 14px\">Check payment status</button>" +
+      "<button id=\"kite-registration-check\" type=\"button\" hidden style=\"min-height:44px;margin:12px 0 0 8px;padding:10px 14px\">Refresh registration status</button>" +
+      "<button id=\"kite-registration-cancel\" type=\"button\" hidden style=\"min-height:44px;margin:12px 0 0 8px;padding:10px 14px\">Cancel registration</button>" +
+      "<button id=\"kite-registration-new\" type=\"button\" hidden style=\"min-height:44px;margin:12px 0 0 8px;padding:10px 14px\">Register another plan</button>" +
       "<p id=\"kite-mm-status\" role=\"status\" aria-live=\"polite\" style=\"margin:10px 0 0\"></p></div>" +
-      "<p class=\"sub\" id=\"kite-billing-note\" style=\"padding:0 16px 12px\">Purchases are verified by Google Play.</p>";
+      "<p class=\"sub\" id=\"kite-billing-note\" hidden role=\"status\" aria-live=\"polite\" style=\"padding:0 16px 12px\"></p>";
+    var actionStyles = doc.createElement("style");
+    actionStyles.textContent =
+      "#kite-subscription .kite-subscription-action{appearance:none;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:12px 18px;border:1px solid transparent;border-radius:10px;font-family:inherit;font-size:15px;font-weight:650;line-height:1.2;text-align:center;cursor:pointer;transition:background-color .18s ease,border-color .18s ease,box-shadow .18s ease,filter .18s ease,transform .18s ease}" +
+      "#kite-subscription .kite-subscription-action-primary{background:var(--blue,#1d6bf0);border-color:var(--blue,#1d6bf0);color:#fff;box-shadow:0 2px 6px rgba(29,107,240,.18)}" +
+      "#kite-subscription .kite-subscription-action-primary:hover:not(:disabled){filter:brightness(.94);box-shadow:0 4px 10px rgba(29,107,240,.24);transform:translateY(-1px)}" +
+      "#kite-subscription .kite-subscription-action-secondary{background:var(--card,#fff);border-color:var(--line,#dbe4f3);color:var(--blue,#1d6bf0)}" +
+      "#kite-subscription .kite-subscription-action-secondary:hover:not(:disabled){background:var(--soft,#e8f0fe);border-color:var(--blue,#1d6bf0);box-shadow:0 3px 8px rgba(29,107,240,.12);transform:translateY(-1px)}" +
+      "#kite-subscription .kite-subscription-action:focus-visible{outline:3px solid rgba(29,107,240,.35);outline-offset:2px}" +
+      "#kite-subscription .kite-subscription-action:disabled{cursor:wait;opacity:.65;box-shadow:none;transform:none}" +
+      "#kite-subscription #kite-continue-registration{min-width:220px;max-width:100%}" +
+      "#kite-subscription #kite-registration-actions .kite-subscription-action{flex:1 1 180px}" +
+      "@media(max-width:420px){#kite-subscription .kite-subscription-action{min-height:62px}}" +
+      "@media(prefers-reduced-motion:reduce){#kite-subscription .kite-subscription-action{transition:none}#kite-subscription .kite-subscription-action:hover{transform:none}}";
+    group.appendChild(actionStyles);
     var appPreferences = Array.prototype.find.call(main.querySelectorAll("h2"), function (item) { return item.textContent.trim() === "App Preferences"; });
     if (appPreferences) main.insertBefore(heading, appPreferences);
     else main.appendChild(heading);
@@ -1417,22 +1645,10 @@
     if (signIn) signIn.style.display = "none";
     if (manage) manage.style.display = token() ? "flex" : "none";
     api("/api/plans").then(function (result) {
-      ["monthly", "annual"].forEach(function (period) {
-        var plan = result.plans.find(function (item) { return item.id === "premium_" + period; });
-        var button = doc.getElementById("kite-" + period);
-        if (plan && button) button.querySelector(".val").textContent = plan.price + (plan.period ? " / " + plan.period : "");
-        if (period === "annual" && plan) {
-          var bestValue = doc.getElementById("kite-best-value");
-          var savings = doc.getElementById("kite-annual-savings");
-          if (bestValue) bestValue.hidden = !plan.best_value;
-          if (savings) savings.textContent = "Save " + plan.savings + " · " + plan.percentage_savings + " less";
-        }
-      });
+      renderSubscriptionPlans(doc, result.plans);
       var mobileMoney = doc.getElementById("kite-mobile-money");
       if (mobileMoney && result.mobile_money) {
         mobileMoney.dataset.enabled = String(Boolean(result.mobile_money.enabled));
-        var mobileMoneyPreview = doc.getElementById("kite-mm-preview");
-        if (mobileMoneyPreview) mobileMoneyPreview.hidden = Boolean(result.mobile_money.enabled);
         var providerSelect = doc.getElementById("kite-mm-provider");
         (result.mobile_money.providers || []).forEach(function (item) {
           var option = doc.createElement("option");
@@ -1440,28 +1656,43 @@
           option.textContent = item.name;
           providerSelect.appendChild(option);
         });
-        if (result.mobile_money.message) {
-          var note = doc.getElementById("kite-billing-note");
-          if (note && token()) note.textContent = result.mobile_money.message;
-        }
+        var legacyEnabled = Boolean(result.mobile_money.enabled);
+        var legacyProviderLabel = doc.getElementById("kite-mm-provider-label");
+        legacyProviderLabel.hidden = !legacyEnabled;
+        legacyProviderLabel.style.display = legacyEnabled ? "block" : "none";
+        providerSelect.hidden = !legacyEnabled;
+        doc.getElementById("kite-mm-pay").hidden = true;
       }
+      var paymentProviders = result.payment_providers || [];
       var billing = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.KiteBilling;
       var billingAvailable = Boolean(billing && typeof billing.purchase === "function");
       var mobileMoneyAvailable = Boolean(result.mobile_money && result.mobile_money.enabled);
       var note = doc.getElementById("kite-billing-note");
-      if (signIn) signIn.style.display = !token() && (billingAvailable || mobileMoneyAvailable) ? "flex" : "none";
-      if (!billingAvailable && !mobileMoneyAvailable) {
-        if (note) note.textContent = "No payment provider is configured. Choosing a plan will not charge you or activate Premium.";
-      } else if (!token() && note) {
-        note.textContent = "Sign in with your Kite account to register for a plan. Premium starts only after payment is verified.";
+      if (signIn) {
+        signIn.style.display = !token() &&
+          (billingAvailable || mobileMoneyAvailable || paymentProviders.length) ? "flex" : "none";
+      }
+      if (note) note.hidden = true;
+      var savedPlanId = mobileMoney && mobileMoney.dataset.planId;
+      var pendingPeriod = sessionStorage.getItem(pendingPlanKey);
+      if (!savedPlanId && (pendingPeriod === "monthly" || pendingPeriod === "annual")) {
+        savedPlanId = "premium_" + pendingPeriod;
+      }
+      if (savedPlanId && subscriptionPlanCache[savedPlanId]) {
+        selectSubscriptionPlan(doc, subscriptionPlanCache[savedPlanId], Boolean(sessionStorage.getItem(subscriptionRegistrationIdKey)));
       }
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
+      var planOptions = doc.getElementById("kite-plan-options");
+      if (planOptions) planOptions.textContent = "Plans could not be loaded. " + error.message;
       if (/sign in|session has expired/i.test(error.message)) {
         if (signIn) signIn.style.display = "flex";
         if (manage) manage.style.display = "none";
       }
-      if (note) note.textContent = error.message;
+      if (note) {
+        note.textContent = error.message;
+        note.hidden = false;
+      }
     });
     if (token()) api("/api/subscription").then(function (data) {
       var state = doc.getElementById("kite-plan-state");
@@ -1470,7 +1701,10 @@
       if (summary) {
         summary.textContent = data.premium
           ? "Current plan: Kite Premium. " + (data.auto_renew ? "Automatic renewal is enabled." : "This prepaid plan does not auto-renew.")
-          : "Current plan: Kite Free. No subscription is active.";
+          : data.registration && data.registration.subscription_status === "PENDING_PAYMENT"
+            ? "Current plan: Kite Free. Registration saved for " + data.registration.plan.name +
+              "; payment status is " + data.registration.payment.status + ". Premium is not active."
+            : "Current plan: Kite Free. No subscription is active.";
       }
       var manageValue = manage && manage.querySelector(".val");
       if (manageValue && data.billing_provider === "mobile_money") {
@@ -1484,6 +1718,7 @@
           ? "Prepaid, does not auto-renew. Access ends"
           : data.auto_renew ? "Renews" : "Access ends") +
           " " + new Date(data.expires_at).toLocaleDateString();
+        note.hidden = false;
       }
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
@@ -1491,26 +1726,24 @@
     });
     bindSubscriptionButtons(doc);
     if (signIn) signIn.addEventListener("click", function () { requestSubscriptionSignIn(); });
-    var pendingPeriod = sessionStorage.getItem(pendingPlanKey);
-    if (pendingPeriod === "monthly" || pendingPeriod === "annual") {
-      doc.getElementById("kite-" + pendingPeriod).click();
-    }
     bindMobileMoneyCheckout(doc);
+    bindSubscriptionRegistration(doc);
   }
 
-  function openMobileMoneyCheckout(doc, period) {
+  function openMobileMoneyCheckout(doc, plan) {
     var panel = doc.getElementById("kite-mobile-money");
     var status = doc.getElementById("kite-mm-status");
-    if (!panel || panel.dataset.enabled !== "true") return false;
+    if (!panel || !plan || !plan.premium) return false;
     sessionStorage.removeItem(pendingPlanKey);
     panel.hidden = false;
-    panel.dataset.planId = "premium_" + period;
+    panel.dataset.planId = plan.id;
+    var backToPlans = doc.getElementById("kite-registration-back");
+    if (backToPlans) backToPlans.hidden = false;
     if (status) {
-      status.textContent = "Enter the wallet number for " + (period === "annual" ? "annual" : "monthly") +
-        " prepaid access. Approve the payment on your phone; never enter your PIN here.";
+      status.textContent = "Enter your Zambia mobile-money number to register " + plan.name + ".";
     }
-    var provider = doc.getElementById("kite-mm-provider");
-    if (provider) provider.focus();
+    var phone = doc.getElementById("kite-mm-phone");
+    if (phone) phone.focus();
     return true;
   }
 
@@ -1557,8 +1790,11 @@
             (result.expires_at ? " until " + new Date(result.expires_at).toLocaleDateString() : "") +
             ". It will not auto-renew.";
           var billingNote = doc.getElementById("kite-billing-note");
-          if (billingNote) billingNote.textContent = "Prepaid, does not auto-renew. Access ends" +
-            (result.expires_at ? " " + new Date(result.expires_at).toLocaleDateString() : "");
+          if (billingNote) {
+            billingNote.textContent = "Prepaid, does not auto-renew. Access ends" +
+              (result.expires_at ? " " + new Date(result.expires_at).toLocaleDateString() : "");
+            billingNote.hidden = false;
+          }
           check.hidden = true;
           pay.disabled = false;
           paymentId = null;
@@ -1597,8 +1833,10 @@
       var provider = doc.getElementById("kite-mm-provider");
       var phone = doc.getElementById("kite-mm-phone");
       var planId = panel.dataset.planId;
-      if (!planId || !provider || !provider.value || !phone || !phone.value.trim()) {
-        status.textContent = "Choose a provider and enter a Zambian mobile-money number.";
+      var registrationId = panel.dataset.registrationId || sessionStorage.getItem(subscriptionRegistrationIdKey);
+      var registrationKey = sessionStorage.getItem(subscriptionRegistrationAccessKey);
+      if (!planId || !provider || !provider.value || !registrationId || !registrationKey) {
+        status.textContent = "Register your subscription and choose a mobile-money provider first.";
         return;
       }
       var idempotencyKey = sessionStorage.getItem(mobileMoneyIdempotencyKey);
@@ -1616,8 +1854,10 @@
       api("/api/subscription/mobile-money", {
         plan_id: planId,
         provider: provider.value,
-        phone_number: phone.value.trim(),
-        idempotency_key: idempotencyKey
+        phone_number: phone && !phone.disabled && phone.value.trim() ? phone.value.trim() : null,
+        idempotency_key: idempotencyKey,
+        registration_id: registrationId,
+        registration_key: registrationKey
       }).then(function (result) {
         paymentId = result.payment_id;
         sessionStorage.setItem(mobileMoneyPaymentKey, paymentId);
@@ -1649,6 +1889,360 @@
       status.textContent = "Checking your pending mobile-money payment…";
       pollPayment();
     }
+  }
+  function normalizeZambianPhoneInput(value) {
+    var trimmed = String(value || "").trim();
+    if (!/^\+?[0-9\s().-]+$/.test(trimmed) || (trimmed.match(/\+/g) || []).length > 1 ||
+        (trimmed.indexOf("+") > 0)) {
+      throw new Error("Use digits and optional spaces, parentheses, or hyphens.");
+    }
+    var digits = trimmed.replace(/\D/g, "");
+    if (digits.indexOf("00") === 0) digits = digits.slice(2);
+    if (digits.indexOf("260") === 0) digits = digits.slice(3);
+    else if (digits.indexOf("0") === 0) digits = digits.slice(1);
+    if (digits.length !== 9 || !/^[79]/.test(digits)) {
+      throw new Error("Enter a valid 9-digit Zambian mobile number, such as 97 123 4567.");
+    }
+    return "+260" + digits;
+  }
+  function formatZambianPhoneInput(input) {
+    var digits = input.value.replace(/\D/g, "");
+    if (digits.indexOf("00") === 0) digits = digits.slice(2);
+    if (digits.indexOf("260") === 0) digits = digits.slice(3);
+    else if (digits.indexOf("0") === 0) digits = digits.slice(1);
+    digits = digits.slice(0, 9);
+    input.value = digits.length > 5
+      ? digits.slice(0, 2) + " " + digits.slice(2, 5) + " " + digits.slice(5)
+      : digits.length > 2 ? digits.slice(0, 2) + " " + digits.slice(2) : digits;
+  }
+  function createSubscriptionAccessKey(doc) {
+    var cryptoApi = doc.defaultView.crypto;
+    if (!cryptoApi || typeof cryptoApi.getRandomValues !== "function") {
+      throw new Error("Secure subscription registration is unavailable in this browser.");
+    }
+    var bytes = new Uint8Array(32);
+    cryptoApi.getRandomValues(bytes);
+    return Array.prototype.map.call(bytes, function (byte) {
+      return byte.toString(16).padStart(2, "0");
+    }).join("");
+  }
+  function subscriptionPlanDescription(plan) {
+    var description = plan.name || "Selected plan";
+    if (plan.price) description += " · " + plan.price;
+    if (plan.period) description += " / " + plan.period;
+    if (plan.summary) description += ". " + plan.summary;
+    var features = Array.isArray(plan.features) ? plan.features : [];
+    if (features.length) description += " Features: " + features.join("; ") + ".";
+    return description;
+  }
+
+  function bindSubscriptionRegistration(doc) {
+    var panel = doc.getElementById("kite-mobile-money");
+    var phone = doc.getElementById("kite-mm-phone");
+    var register = doc.getElementById("kite-mm-register");
+    var status = doc.getElementById("kite-mm-status");
+    var check = doc.getElementById("kite-registration-check");
+    var cancel = doc.getElementById("kite-registration-cancel");
+    var start = doc.getElementById("kite-payment-initiate");
+    var providerSelect = doc.getElementById("kite-payment-provider");
+    var newRegistration = doc.getElementById("kite-registration-new");
+    var backToPlans = doc.getElementById("kite-registration-back");
+    if (!panel || !phone || !register || !status || !check || !cancel || !start || !providerSelect) return;
+    var registrationId = sessionStorage.getItem(subscriptionRegistrationIdKey);
+    var accessKey = sessionStorage.getItem(subscriptionRegistrationAccessKey);
+    var planCache = {};
+
+    function renderRegistration(result) {
+      registrationId = result.registration_id;
+      panel.dataset.registrationId = registrationId;
+      phone.value = result.phone_number || "";
+      phone.disabled = true;
+      var selectedPlan = result.plan;
+      if (selectedPlan) {
+        panel.dataset.planId = selectedPlan.id;
+        selectSubscriptionPlan(doc, subscriptionPlanCache[selectedPlan.id] || selectedPlan, true);
+      }
+      var payment = result.payment || {};
+      var confirmationTitle = doc.getElementById("kite-registration-title");
+      if (confirmationTitle) {
+        confirmationTitle.hidden = false;
+        confirmationTitle.textContent = result.subscription_status === "ACTIVE"
+          ? "Subscription active" : "Registration confirmation";
+      }
+      var registrationSummary = doc.getElementById("kite-registration-summary");
+      if (registrationSummary) registrationSummary.hidden = false;
+      var planName = doc.getElementById("kite-registration-plan");
+      if (planName) planName.textContent = selectedPlan ? selectedPlan.name : "Premium";
+      var priceAndTerm = doc.getElementById("kite-registration-price");
+      if (priceAndTerm) priceAndTerm.textContent = selectedPlan
+        ? selectedPlan.price + (selectedPlan.period ? " / " + selectedPlan.period : "")
+        : "See selected plan";
+      var registrationPhone = doc.getElementById("kite-registration-phone");
+      if (registrationPhone) registrationPhone.textContent = result.phone_number || "Not available";
+      var registrationReference = doc.getElementById("kite-registration-reference");
+      if (registrationReference) registrationReference.textContent = result.registration_id;
+      var paymentReference = doc.getElementById("kite-payment-reference");
+      if (paymentReference) paymentReference.textContent = payment.reference || "Not issued";
+      var subscriptionStatus = doc.getElementById("kite-registration-status");
+      if (subscriptionStatus) subscriptionStatus.textContent = displaySubscriptionStatus(result.subscription_status);
+      var paymentStatus = doc.getElementById("kite-payment-status");
+      if (paymentStatus) paymentStatus.textContent = displaySubscriptionStatus(payment.status || "NOT_INITIATED");
+      var renewal = doc.getElementById("kite-registration-renewal");
+      if (renewal) renewal.textContent = result.renewal === "manual" ? "Manual; does not auto-renew" : "Not applicable";
+      var expiry = doc.getElementById("kite-registration-expiry");
+      if (expiry) {
+        var expiryDate = result.subscription_expires_at ? new Date(result.subscription_expires_at) : null;
+        expiry.textContent = expiryDate && !isNaN(expiryDate.getTime())
+          ? expiryDate.toLocaleDateString() : "Not active";
+      }
+      status.textContent = result.message +
+        (payment.failure_code ? " Code: " + payment.failure_code : "");
+      if (payment.status === "FAILED" || payment.status === "CANCELLED" || payment.status === "EXPIRED" ||
+          payment.status === "SUCCESSFUL") {
+        sessionStorage.removeItem(subscriptionPaymentIdempotencyKey);
+      }
+      check.hidden = false;
+      cancel.hidden = result.subscription_status !== "PENDING_PAYMENT" ||
+        ["NOT_INITIATED", "FAILED", "CANCELLED", "EXPIRED"].indexOf(payment.status) < 0;
+      register.hidden = true;
+      if (newRegistration) newRegistration.hidden = result.subscription_status === "ACTIVE";
+      if (backToPlans) backToPlans.hidden = true;
+      setSubscriptionPlanSelectionEnabled(doc, false);
+      var canStart = result.subscription_status !== "ACTIVE" &&
+        ["NOT_INITIATED", "FAILED", "CANCELLED", "EXPIRED"].indexOf(payment.status) >= 0;
+      start.hidden = !(providerSelect.options.length > 1 && canStart);
+      var legacyPay = doc.getElementById("kite-mm-pay");
+      if (legacyPay) {
+        var legacyProviderAvailable = panel.dataset.enabled === "true";
+        legacyPay.hidden = !(legacyProviderAvailable && canStart);
+        legacyPay.textContent = legacyPay.hidden ? "Continue to payment" : "Start payment";
+      }
+    }
+
+    function refreshRegistration(verify) {
+      if (!registrationId || !accessKey) return Promise.resolve();
+      check.disabled = true;
+      status.textContent = "Refreshing your registration and payment status…";
+      var path = "/api/subscription/registrations/" + encodeURIComponent(registrationId);
+      var request = verify
+        ? api(path + "/verify", {}, "POST", {"X-Kite-Registration-Key": accessKey})
+        : api(path, null, "GET", {"X-Kite-Registration-Key": accessKey});
+      return request.then(renderRegistration).catch(function (error) {
+        if (error.status === 404) {
+          sessionStorage.removeItem(subscriptionRegistrationIdKey);
+          sessionStorage.removeItem(subscriptionRegistrationAccessKey);
+          sessionStorage.removeItem(subscriptionRegistrationIdempotencyKey);
+          sessionStorage.removeItem(subscriptionPaymentIdempotencyKey);
+          sessionStorage.removeItem(mobileMoneyIdempotencyKey);
+          registrationId = null;
+          accessKey = null;
+          delete panel.dataset.registrationId;
+          phone.value = "";
+          phone.disabled = false;
+          panel.hidden = true;
+          clearSubscriptionPlanSelection(doc);
+          setSubscriptionPlanSelectionEnabled(doc, true);
+          register.hidden = false;
+          register.disabled = false;
+          check.hidden = true;
+          cancel.hidden = true;
+          start.hidden = true;
+          if (newRegistration) newRegistration.hidden = true;
+          var confirmationTitle = doc.getElementById("kite-registration-title");
+          if (confirmationTitle) confirmationTitle.hidden = true;
+          var registrationSummary = doc.getElementById("kite-registration-summary");
+          if (registrationSummary) registrationSummary.hidden = true;
+          if (backToPlans) backToPlans.hidden = true;
+          var planSummary = doc.getElementById("kite-plan-summary");
+          if (planSummary) planSummary.textContent = "Saved registration not found. Choose a plan to register again.";
+          return;
+        }
+        status.textContent = error.message;
+      }).finally(function () { check.disabled = false; });
+    }
+
+    phone.addEventListener("input", function () { formatZambianPhoneInput(phone); });
+    phone.addEventListener("blur", function () {
+      if (!phone.value.trim()) return;
+      try {
+        normalizeZambianPhoneInput(phone.value);
+        phone.setCustomValidity("");
+      } catch (error) {
+        phone.setCustomValidity(error.message);
+      }
+    });
+    if (backToPlans) backToPlans.addEventListener("click", function () {
+      if (registrationId) return;
+      panel.hidden = true;
+      phone.setCustomValidity("");
+      var planSummary = doc.getElementById("kite-plan-summary");
+      if (planSummary) planSummary.textContent = "Review your selected plan before continuing.";
+    });
+    register.addEventListener("click", function () {
+      var planId = panel.dataset.planId;
+      var normalizedPhone;
+      if (!planId) {
+        status.textContent = "Choose a Premium plan before registering.";
+        return;
+      }
+      try {
+        normalizedPhone = normalizeZambianPhoneInput(phone.value);
+      } catch (error) {
+        phone.setCustomValidity(error.message);
+        phone.reportValidity();
+        status.textContent = error.message;
+        return;
+      }
+      phone.setCustomValidity("");
+      try {
+        if (!sessionStorage.getItem(subscriptionRegistrationIdempotencyKey)) {
+          sessionStorage.setItem(subscriptionRegistrationIdempotencyKey, createMobileMoneyIdempotencyKey(doc));
+        }
+        if (!sessionStorage.getItem(subscriptionRegistrationAccessKey)) {
+          sessionStorage.setItem(subscriptionRegistrationAccessKey, createSubscriptionAccessKey(doc));
+        }
+      } catch (error) {
+        status.textContent = error.message;
+        return;
+      }
+      accessKey = sessionStorage.getItem(subscriptionRegistrationAccessKey);
+      register.disabled = true;
+      status.textContent = "Saving your subscription registration…";
+      api("/api/subscription/registrations", {
+        plan_id: planId,
+        phone_number: normalizedPhone,
+        idempotency_key: sessionStorage.getItem(subscriptionRegistrationIdempotencyKey),
+        access_key: accessKey
+      }).then(function (result) {
+        registrationId = result.registration_id;
+        sessionStorage.setItem(subscriptionRegistrationIdKey, registrationId);
+        sessionStorage.removeItem(subscriptionRegistrationIdempotencyKey);
+        phone.value = "";
+        renderRegistration(result);
+      }).catch(function (error) {
+        if (error.status === 422) {
+          sessionStorage.removeItem(subscriptionRegistrationIdempotencyKey);
+          sessionStorage.removeItem(subscriptionRegistrationAccessKey);
+        }
+        status.textContent = error.message;
+        register.disabled = false;
+      });
+    });
+    check.addEventListener("click", function () { refreshRegistration(true); });
+    cancel.addEventListener("click", function () {
+      if (!registrationId || !accessKey) return;
+      cancel.disabled = true;
+      api("/api/subscription/registrations/" + encodeURIComponent(registrationId) + "/cancel", {}, "POST", {
+        "X-Kite-Registration-Key": accessKey
+      }).then(renderRegistration).catch(function (error) {
+        status.textContent = error.message;
+      }).finally(function () { cancel.disabled = false; });
+    });
+    if (newRegistration) newRegistration.addEventListener("click", function () {
+      sessionStorage.removeItem(subscriptionRegistrationIdKey);
+      sessionStorage.removeItem(subscriptionRegistrationAccessKey);
+      sessionStorage.removeItem(subscriptionRegistrationIdempotencyKey);
+      sessionStorage.removeItem(subscriptionPaymentIdempotencyKey);
+      sessionStorage.removeItem(mobileMoneyIdempotencyKey);
+      sessionStorage.removeItem(pendingPlanKey);
+      registrationId = null;
+      accessKey = null;
+      delete panel.dataset.registrationId;
+      phone.value = "";
+      phone.disabled = false;
+      panel.hidden = true;
+      clearSubscriptionPlanSelection(doc);
+      setSubscriptionPlanSelectionEnabled(doc, true);
+      register.hidden = false;
+      register.disabled = false;
+      check.hidden = true;
+      cancel.hidden = true;
+      start.hidden = true;
+      newRegistration.hidden = true;
+      if (backToPlans) backToPlans.hidden = true;
+      var confirmationTitle = doc.getElementById("kite-registration-title");
+      if (confirmationTitle) confirmationTitle.hidden = true;
+      var registrationSummary = doc.getElementById("kite-registration-summary");
+      if (registrationSummary) registrationSummary.hidden = true;
+      var planSummary = doc.getElementById("kite-plan-summary");
+      if (planSummary) planSummary.textContent = "Choose a plan to begin another registration.";
+    });
+    start.addEventListener("click", function () {
+      if (!registrationId || !accessKey || !providerSelect.value) {
+        status.textContent = "Register first and choose an available payment provider.";
+        return;
+      }
+      start.disabled = true;
+      status.textContent = "Requesting payment initiation…";
+      var paymentIdempotencyKey = sessionStorage.getItem(subscriptionPaymentIdempotencyKey);
+      try {
+        if (!paymentIdempotencyKey) {
+          paymentIdempotencyKey = createMobileMoneyIdempotencyKey(doc);
+          sessionStorage.setItem(subscriptionPaymentIdempotencyKey, paymentIdempotencyKey);
+        }
+      } catch (error) {
+        start.disabled = false;
+        status.textContent = error.message;
+        return;
+      }
+      api("/api/subscription/registrations/" + encodeURIComponent(registrationId) + "/payments", {
+        provider_id: providerSelect.value,
+        idempotency_key: paymentIdempotencyKey
+      }, "POST", {"X-Kite-Registration-Key": accessKey}).then(function (result) {
+        renderRegistration(result);
+      }).catch(function (error) {
+        status.textContent = error.message;
+        if (/sign in and link this registration/i.test(error.message)) {
+          var signIn = doc.getElementById("kite-sign-in");
+          if (signIn) signIn.style.display = "flex";
+        }
+      }).finally(function () { start.disabled = false; });
+    });
+    if (registrationId && accessKey) {
+      panel.hidden = false;
+      check.hidden = false;
+      register.hidden = true;
+      if (backToPlans) backToPlans.hidden = true;
+      if (token()) {
+        api("/api/subscription/registrations/" + encodeURIComponent(registrationId) + "/claim", {
+          access_key: accessKey
+        }).then(renderRegistration).catch(function (error) {
+          if (error.status === 404 || error.status === 409) return refreshRegistration(false);
+          status.textContent = error.message;
+        });
+      } else {
+        refreshRegistration(false);
+      }
+    }
+    api("/api/plans").then(function (result) {
+      (result.plans || []).forEach(function (plan) { planCache[plan.id] = plan; });
+      while (providerSelect.options.length > 1) providerSelect.remove(1);
+      (result.payment_providers || []).forEach(function (item) {
+        var option = doc.createElement("option");
+        option.value = item.id;
+        option.textContent = item.name;
+        providerSelect.appendChild(option);
+      });
+      var hasProviders = providerSelect.options.length > 1;
+      var providerLabel = doc.getElementById("kite-payment-provider-label");
+      providerLabel.hidden = !hasProviders;
+      providerLabel.style.display = hasProviders ? "block" : "none";
+      providerSelect.hidden = !hasProviders;
+      start.hidden = !hasProviders || !registrationId;
+      var planId = panel.dataset.planId;
+      var pendingPeriod = sessionStorage.getItem(pendingPlanKey);
+      if (!planId && (pendingPeriod === "monthly" || pendingPeriod === "annual")) {
+        planId = "premium_" + pendingPeriod;
+      }
+      if (planId && planCache[planId]) {
+        var selected = planCache[planId];
+        selectSubscriptionPlan(doc, selected, Boolean(registrationId));
+      }
+      setSubscriptionPlanSelectionEnabled(doc, !registrationId);
+      if (registrationId && accessKey) refreshRegistration(false);
+    }).catch(function (error) {
+      status.textContent = error.message;
+    });
   }
       function setText(doc, selector, text) {
         var node = doc.querySelector(selector);
@@ -1840,7 +2434,11 @@
               list.appendChild(item);
             });
           });
-        }).catch(function (error) { tell(doc, error.message, true); });
+        }).catch(function (error) {
+          showContentUnavailable(doc, doc.getElementById("mods"), "learning path", function () {
+            hydrateLearn(doc);
+          }, error);
+        });
       }
       function parseLessonSections(content) {
         var names = [
@@ -2061,7 +2659,11 @@
             }
             matching.forEach(function (item) { panel.appendChild(renderLessonQuizCard(doc, lesson, item)); });
             restoreLessonQuizPosition(doc, lesson);
-          }).catch(function (error) { tell(doc, error.message, true); });
+          }).catch(function (error) {
+            showContentUnavailable(doc, panel, "lesson assessment", function () {
+              renderLessonTab(doc, lesson, "quiz");
+            }, error);
+          });
           return;
         }
         var heading = doc.createElement("h2");
@@ -2083,6 +2685,8 @@
         api("/api/lessons/" + encodeURIComponent(id)).then(function (lesson) {
           recordGuestLesson(doc, lesson.id, false);
           setText(doc, "header h1", lesson.title);
+          var nextButton = doc.getElementById("next");
+          if (nextButton) nextButton.hidden = false;
           doc.documentElement.kiteLesson = lesson;
           doc.addEventListener("click", function (event) {
             var tab = event.target.closest && event.target.closest("[data-tab]");
@@ -2109,7 +2713,13 @@
           }
           renderLessonTab(doc, lesson, initialTab);
         }).catch(function (error) {
-          tell(doc, error.message, true);
+          setText(doc, "header h1", "Lesson unavailable");
+          doc.documentElement.kiteLesson = null;
+          var nextButton = doc.getElementById("next");
+          if (nextButton) nextButton.hidden = true;
+          showContentUnavailable(doc, doc.getElementById("pn"), "lesson", function () {
+            hydrateLesson(doc);
+          }, error);
           if (error.message.indexOf("Kite Premium") >= 0) navigate("preferences");
         });
       }
@@ -2542,7 +3152,9 @@
           .then(function (data) {
             renderQuizDashboard(doc, data[0], data[1], data[2]);
           }).catch(function (error) {
-            tell(doc, error.message, true);
+            showContentUnavailable(doc, doc.getElementById("sc"), "quiz catalog", function () {
+              hydrateQuizDashboard(doc);
+            }, error);
           });
       }
       function showQuizDashboard(doc) {
@@ -2896,7 +3508,13 @@
             });
           });
         }).catch(function (error) {
-          tell(doc, error.message, true);
+          var picker = doc.getElementById("kite-quiz-select");
+          if (picker && picker.closest(".kite-content-picker")) picker.closest(".kite-content-picker").remove();
+          var footer = doc.getElementById("ft");
+          if (footer) footer.textContent = "";
+          showContentUnavailable(doc, doc.getElementById("sc"), "quiz", function () {
+            hydrateQuiz(doc, selectedId, forceRunner, resetDraft);
+          }, error);
           if (error.message.indexOf("Kite Premium") >= 0) navigate("preferences");
         });
       }
@@ -2931,7 +3549,12 @@
           var hint = doc.getElementById("hl");
           if (hint) hint.textContent = selected.hint;
         }).catch(function (error) {
-          tell(doc, error.message, true);
+          setText(doc, "header h1", "Challenge unavailable");
+          var picker = doc.getElementById("kite-challenge-select");
+          if (picker && picker.closest(".kite-content-picker")) picker.closest(".kite-content-picker").remove();
+          showContentUnavailable(doc, doc.getElementById("sc"), "challenge catalog", function () {
+            doc.defaultView.parent.location.reload();
+          }, error);
           if (error.message.indexOf("Kite Premium") >= 0) navigate("preferences");
         });
       }
@@ -3506,52 +4129,61 @@
         }).catch(function (error) { tell(doc, error.message, true); });
       }
   function bindSubscriptionButtons(doc) {
-    ["monthly", "annual"].forEach(function (period) {
-      doc.getElementById("kite-" + period).addEventListener("click", function () {
-        api("/api/plans").then(function (data) {
-          var billing = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.KiteBilling;
-          var billingAvailable = Boolean(billing && typeof billing.purchase === "function");
-          var mobileMoneyAvailable = Boolean(data.mobile_money && data.mobile_money.enabled);
-          var note = doc.getElementById("kite-billing-note");
-          var summary = doc.getElementById("kite-plan-summary");
-          if (summary) {
-            summary.textContent = "Selected plan: Kite Premium · " +
-              (period === "annual" ? "Annual" : "Monthly") +
-              ". Your current access will not change until a payment is verified.";
-          }
-          if (!billingAvailable && !mobileMoneyAvailable) {
-            if (note) note.textContent = "No payment provider is configured. Choosing a plan will not charge you or activate Premium.";
-            return;
-          }
-          if (!token()) {
-            requestSubscriptionSignIn(period);
-            return;
-          }
-          var plan = data.plans.find(function (item) { return item.id === "premium_" + period; });
-          if (!billingAvailable) {
-            if (mobileMoneyAvailable && openMobileMoneyCheckout(doc, period)) return;
-            throw new Error("Mobile-money checkout is not available for this plan.");
-          }
-          if (!plan || !plan.product_id) {
-            throw new Error("The selected Google Play plan is not configured.");
-          }
-          return billing.purchase({ productId: plan.product_id }).then(function (purchase) {
-            return api("/api/subscription/google/verify", {
-              product_id: plan.product_id,
-              purchase_token: purchase.purchaseToken
-            }).then(function (subscription) {
-              sessionStorage.removeItem(pendingPlanKey);
-              var state = doc.getElementById("kite-plan-state");
-              if (state) state.textContent = subscription.premium ? "Kite Premium" : "Kite Free";
-              tell(doc, "Kite Premium is active.", false);
-            });
-          });
-        }).catch(function (error) {
-          var note = doc.getElementById("kite-billing-note");
-          if (note) note.textContent = error.message;
-          else tell(doc, error.message, true);
+    var grid = doc.getElementById("kite-plan-options");
+    var continueButton = doc.getElementById("kite-continue-registration");
+    if (grid) grid.addEventListener("click", function (event) {
+      var button = event.target && event.target.closest
+        ? event.target.closest("button[data-plan-id]") : null;
+      if (!button || !grid.contains(button) || button.disabled) return;
+      var plan = subscriptionPlanCache[button.dataset.planId];
+      if (plan) selectSubscriptionPlan(doc, plan, false);
+    });
+    if (continueButton) continueButton.addEventListener("click", function () {
+      var group = doc.getElementById("kite-subscription");
+      var planId = group && group.dataset.selectedPlanId;
+      var plan = planId && subscriptionPlanCache[planId];
+      if (!plan || !plan.premium) {
+        var summary = doc.getElementById("kite-plan-summary");
+        if (summary) summary.textContent = "Select a Premium plan before continuing.";
+        return;
+      }
+
+      var billing = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.KiteBilling;
+      if (!billing || typeof billing.purchase !== "function") {
+        openMobileMoneyCheckout(doc, plan);
+        return;
+      }
+      var period = plan.period === "year" ? "annual" : "monthly";
+      if (!token()) {
+        requestSubscriptionSignIn(period);
+        return;
+      }
+      if (!plan.product_id) {
+        var configurationNote = doc.getElementById("kite-billing-note");
+        if (configurationNote) {
+          configurationNote.textContent = "The selected Google Play plan is not configured.";
+          configurationNote.hidden = false;
+        }
+        return;
+      }
+      continueButton.disabled = true;
+      billing.purchase({ productId: plan.product_id }).then(function (purchase) {
+        return api("/api/subscription/google/verify", {
+          product_id: plan.product_id,
+          purchase_token: purchase.purchaseToken
+        }).then(function (subscription) {
+          sessionStorage.removeItem(pendingPlanKey);
+          var state = doc.getElementById("kite-plan-state");
+          if (state) state.textContent = subscription.premium ? "Kite Premium" : "Kite Free";
+          tell(doc, subscription.premium ? "Kite Premium is active." : "Purchase verification is pending.", false);
         });
-      });
+      }).catch(function (error) {
+        var note = doc.getElementById("kite-billing-note");
+        if (note) {
+          note.textContent = error.message;
+          note.hidden = false;
+        } else tell(doc, error.message, true);
+      }).finally(function () { continueButton.disabled = false; });
     });
     doc.getElementById("kite-manage").addEventListener("click", function () {
       api("/api/subscription/refresh", {}, "POST").then(function (data) {
@@ -3560,8 +4192,11 @@
         if (data.cancel_url) parent.open(data.cancel_url, "_blank", "noopener");
         else if (data.premium && data.billing_provider === "mobile_money") {
           var note = doc.getElementById("kite-billing-note");
-          if (note) note.textContent = "Your prepaid mobile-money access does not auto-renew. Renew manually from Settings." +
-            (data.expires_at ? " Access ends " + new Date(data.expires_at).toLocaleDateString() + "." : "");
+          if (note) {
+            note.textContent = "Your prepaid mobile-money access does not auto-renew. Renew manually from Settings." +
+              (data.expires_at ? " Access ends " + new Date(data.expires_at).toLocaleDateString() + "." : "");
+            note.hidden = false;
+          }
         }
         else tell(doc, "You are on the free plan.", false);
       }).catch(function (error) { tell(doc, error.message, true); });

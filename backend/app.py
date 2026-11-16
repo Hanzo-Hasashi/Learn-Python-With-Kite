@@ -24,10 +24,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, func, inspect, select, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, func, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.exc import IntegrityError
 
+from backend.payments import (
+    PaymentStatus,
+    PaymentProviderError,
+    ProviderPaymentResult,
+    get_mobile_money_provider,
+    normalize_zambian_phone,
+)
 from backend.curriculum import (
     ADDITIONAL_LESSONS,
     FOUNDATION_CORE_LESSONS,
@@ -154,6 +161,127 @@ class MobileMoneyPayment(Base):
     status: Mapped[str] = mapped_column(String(40))
     failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class SubscriptionPlan(Base):
+    __tablename__ = "subscription_plans"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    display_price: Mapped[str] = mapped_column(String(40))
+    amount: Mapped[str] = mapped_column(String(20))
+    currency: Mapped[str] = mapped_column(String(3), default="ZMW")
+    period: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    premium: Mapped[bool] = mapped_column(Boolean, default=False)
+    summary: Mapped[str] = mapped_column(String(300))
+    features_json: Mapped[str] = mapped_column(Text, default="[]")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class SubscriptionRegistration(Base):
+    __tablename__ = "subscription_registrations"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_subscription_registration_idempotency"),
+        CheckConstraint(
+            "status IN ('PENDING_PAYMENT', 'ACTIVE', 'EXPIRED', 'CANCELLED', 'FAILED')",
+            name="ck_subscription_registration_status",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("subscription_plans.id"), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(36))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    access_key_hash: Mapped[str] = mapped_column(String(64))
+    phone_ciphertext: Mapped[str] = mapped_column(Text)
+    phone_hash: Mapped[str] = mapped_column(String(64), index=True)
+    phone_last4: Mapped[str] = mapped_column(String(4))
+    status: Mapped[str] = mapped_column(String(32), default="PENDING_PAYMENT", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PaymentTransaction(Base):
+    __tablename__ = "payment_transactions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('NOT_INITIATED', 'PENDING', 'PROCESSING', 'SUCCESSFUL', 'FAILED', 'CANCELLED', 'EXPIRED')",
+            name="ck_payment_transaction_status",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    registration_id: Mapped[str] = mapped_column(
+        ForeignKey("subscription_registrations.id", ondelete="CASCADE"), index=True,
+    )
+    subscription_id: Mapped[int | None] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    reference: Mapped[str] = mapped_column(String(64), unique=True)
+    provider_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    provider_reference: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    amount: Mapped[str] = mapped_column(String(20))
+    currency: Mapped[str] = mapped_column(String(3))
+    status: Mapped[str] = mapped_column(String(24), default=PaymentStatus.NOT_INITIATED.value, index=True)
+    failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PaymentAttempt(Base):
+    __tablename__ = "payment_attempts"
+    __table_args__ = (
+        UniqueConstraint("transaction_id", "attempt_number", name="uq_payment_attempt_number"),
+        UniqueConstraint("idempotency_key", name="uq_payment_attempt_idempotency"),
+        CheckConstraint("attempt_number > 0", name="ck_payment_attempt_number"),
+        CheckConstraint(
+            "status IN ('NOT_INITIATED', 'PENDING', 'PROCESSING', 'SUCCESSFUL', 'FAILED', 'CANCELLED', 'EXPIRED')",
+            name="ck_payment_attempt_status",
+        ),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    transaction_id: Mapped[str] = mapped_column(
+        ForeignKey("payment_transactions.id", ondelete="CASCADE"), index=True,
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer)
+    idempotency_key: Mapped[str] = mapped_column(String(36))
+    provider_id: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(24))
+    failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PaymentStatusHistory(Base):
+    __tablename__ = "payment_status_history"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('NOT_INITIATED', 'PENDING', 'PROCESSING', 'SUCCESSFUL', 'FAILED', 'CANCELLED', 'EXPIRED')",
+            name="ck_payment_status_history_status",
+        ),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    transaction_id: Mapped[str] = mapped_column(
+        ForeignKey("payment_transactions.id", ondelete="CASCADE"), index=True,
+    )
+    previous_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    status: Mapped[str] = mapped_column(String(24))
+    source: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PaymentProviderConfiguration(Base):
+    __tablename__ = "payment_provider_configurations"
+    __table_args__ = (
+        CheckConstraint("environment IN ('sandbox', 'production')", name="ck_payment_provider_environment"),
+    )
+    provider_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    environment: Mapped[str] = mapped_column(String(20), default="sandbox")
+    options_json: Mapped[str] = mapped_column(Text, default="{}")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -432,7 +560,7 @@ def verify_password(password: str, stored: str) -> bool:
 def token_key() -> bytes:
     secret = os.getenv("KITE_SECRET_KEY")
     if not secret:
-        raise HTTPException(status_code=503, detail="Authentication is not configured.")
+        raise HTTPException(status_code=503, detail="KITE_SECRET_KEY is not configured.")
     if len(secret) < 32:
         raise HTTPException(status_code=503, detail="KITE_SECRET_KEY must contain at least 32 characters.")
     return secret.encode()
@@ -440,6 +568,20 @@ def token_key() -> bytes:
 
 def supabase_configured() -> bool:
     return bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_ANON_KEY"))
+
+
+def local_auth_enabled() -> bool:
+    if os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("RENDER"):
+        return False
+    return os.getenv("KITE_ALLOW_LOCAL_AUTH", "").strip().lower() in {"1", "true", "yes"}
+
+
+def require_auth_provider() -> None:
+    if not supabase_configured() and not local_auth_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is not configured. Configure Supabase Auth or enable local auth for development.",
+        )
 
 
 def enforce_auth_rate_limit(
@@ -711,6 +853,8 @@ def validate_csrf(request: Request, user: User, using_cookie: bool) -> None:
 
 
 def validate_local_token(value: str, db: Session) -> User:
+    if not local_auth_enabled():
+        raise HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
     try:
         parts = value.split(".")
         if len(parts) == 3:
@@ -1042,10 +1186,32 @@ class GooglePurchaseIn(BaseModel):
 class MobileMoneyPaymentIn(BaseModel):
     plan_id: str = Field(pattern=r"^premium_(monthly|annual)$")
     provider: str = Field(pattern=r"^(AIRTEL_OAPI_ZMB|MTN_MOMO_ZMB|ZAMTEL_ZMB)$")
-    phone_number: str = Field(pattern=r"^\+?260[0-9]{9}$")
+    phone_number: str | None = Field(default=None, min_length=7, max_length=40)
     idempotency_key: str = Field(
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     )
+    registration_id: str | None = Field(default=None, min_length=36, max_length=36)
+    registration_key: str | None = Field(default=None, min_length=43, max_length=128)
+
+
+class SubscriptionRegistrationIn(BaseModel):
+    plan_id: str = Field(pattern=r"^premium_(monthly|annual)$")
+    phone_number: str = Field(min_length=7, max_length=40)
+    idempotency_key: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    )
+    access_key: str = Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class PaymentInitiationIn(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    idempotency_key: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    )
+
+
+class SubscriptionRegistrationClaimIn(BaseModel):
+    access_key: str = Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class GoogleAuthCodeIn(BaseModel):
@@ -1062,6 +1228,61 @@ class SupabaseSessionIn(BaseModel):
 
 class VerificationResendIn(BaseModel):
     email: EmailStr
+
+
+SUBSCRIPTION_PLAN_DEFINITIONS = (
+    {
+        "id": "free",
+        "name": "Kite Free",
+        "display_price": "Free",
+        "amount": "0.00",
+        "period": None,
+        "premium": False,
+        "summary": "Start learning Python at your own pace.",
+        "features": ["Core learning path", "Guest quizzes and challenges", "Progress saved on this device"],
+        "sort_order": 0,
+    },
+    {
+        "id": "premium_monthly",
+        "name": "Kite Premium · Monthly",
+        "display_price": "K19.99",
+        "amount": "19.99",
+        "period": "month",
+        "premium": True,
+        "summary": "Full access for 30 days, prepaid with no automatic renewal.",
+        "features": ["All 12 learning modules", "Premium lessons, quizzes, and challenges", "30 days of access"],
+        "sort_order": 1,
+    },
+    {
+        "id": "premium_annual",
+        "name": "Kite Premium · Annual",
+        "display_price": "K99.99",
+        "amount": "99.99",
+        "period": "year",
+        "premium": True,
+        "summary": "Full access for 365 days, prepaid with no automatic renewal.",
+        "features": ["All 12 learning modules", "Premium lessons, quizzes, and challenges", "365 days of access"],
+        "sort_order": 2,
+    },
+)
+
+
+def seed_subscription_plans(db: Session) -> None:
+    for definition in SUBSCRIPTION_PLAN_DEFINITIONS:
+        if db.get(SubscriptionPlan, definition["id"]) is None:
+            db.add(SubscriptionPlan(
+                id=definition["id"],
+                name=definition["name"],
+                display_price=definition["display_price"],
+                amount=definition["amount"],
+                currency="ZMW",
+                period=definition["period"],
+                premium=definition["premium"],
+                summary=definition["summary"],
+                features_json=json.dumps(definition["features"]),
+                active=True,
+                sort_order=definition["sort_order"],
+            ))
 
 
 app = FastAPI(title="Kite API", version="1.0.0")
@@ -1106,6 +1327,21 @@ def startup() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_attempts_submission "
             "ON quiz_attempts (user_id, quiz_id, submission_id) WHERE submission_id IS NOT NULL"
         ))
+    if engine.dialect.name == "postgresql":
+        identifier_preparer = engine.dialect.identifier_preparer
+        with engine.begin() as connection:
+            roles = connection.execute(text(
+                "SELECT rolname FROM pg_roles WHERE rolname IN (:anon, :authenticated)"
+            ), {"anon": "anon", "authenticated": "authenticated"}).scalars().all()
+            grantees = ["PUBLIC"] + [identifier_preparer.quote(role) for role in roles]
+            for table in Base.metadata.sorted_tables:
+                table_name = "public." + identifier_preparer.quote(table.name)
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY"
+                )
+                connection.exec_driver_sql(
+                    f"REVOKE ALL PRIVILEGES ON TABLE {table_name} FROM {', '.join(grantees)}"
+                )
     with SessionLocal() as db:
         for row in LESSONS:
             lesson = db.get(Lesson, row[0])
@@ -1116,6 +1352,7 @@ def startup() -> None:
                 lesson.title = row[1]
                 lesson.description = row[2]
                 lesson.content = row[3]
+        seed_subscription_plans(db)
         db.commit()
     if not os.getenv("KITE_SECRET_KEY"):
         log.warning("KITE_SECRET_KEY is unset; authenticated requests will be unavailable.")
@@ -1135,6 +1372,7 @@ def home() -> FileResponse:
 def register(payload: RegisterIn, request: Request, response: Response, db: Session = Depends(get_db)):
     email = str(payload.email).strip().lower()
     enforce_auth_rate_limit(request, "register", email, 5, 3600)
+    require_auth_provider()
     password_error = password_strength_error(payload.password)
     if password_error:
         raise HTTPException(status_code=422, detail=password_error)
@@ -1187,6 +1425,7 @@ def register(payload: RegisterIn, request: Request, response: Response, db: Sess
 def login(payload: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
     email = str(payload.email).strip().lower()
     enforce_auth_rate_limit(request, "login", email, 8, 900)
+    require_auth_provider()
     if supabase_configured():
         result = supabase_request("/token?grant_type=password", method="POST", data={
             "email": email,
@@ -1420,6 +1659,7 @@ def request_password_reset(payload: ResetRequestIn, request: Request, db: Sessio
         redirect = os.getenv("PUBLIC_APP_URL", "http://localhost:8000").rstrip("/") + "/#reset"
         supabase_request("/recover?redirect_to=" + quote(redirect, safe=""), method="POST", data={"email": email})
         return {"message": "If that address has an account, password reset instructions will be sent."}
+    require_auth_provider()
     if not os.getenv("SMTP_HOST"):
         raise HTTPException(status_code=503, detail="Password recovery is not configured. Please try again later.")
     user = db.scalar(select(User).where(User.email == email))
@@ -1446,6 +1686,7 @@ def complete_password_reset(payload: ResetCompleteIn, db: Session = Depends(get_
         result = supabase_request("/user", method="PUT", data={"password": payload.password},
                                   access_token=payload.token)
         return {"ok": bool(result.get("id"))}
+    require_auth_provider()
     token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
     reset = db.scalar(select(PasswordReset).where(PasswordReset.token_hash == token_hash, PasswordReset.used.is_(False)))
     reset_expiry = reset.expires_at if reset else None
@@ -2150,6 +2391,111 @@ def mobile_money_payment_result(payment: MobileMoneyPayment) -> dict[str, Any]:
     }
 
 
+def link_legacy_pawapay_payment(
+    registration: SubscriptionRegistration,
+    payment: MobileMoneyPayment,
+    idempotency_key: str,
+    db: Session,
+) -> None:
+    transaction = latest_payment_transaction(registration.id, db)
+    if transaction is None:
+        raise HTTPException(status_code=409, detail="This registration has no payment record.")
+    if transaction.status in {
+        PaymentStatus.FAILED.value, PaymentStatus.CANCELLED.value, PaymentStatus.EXPIRED.value,
+    }:
+        transaction = PaymentTransaction(
+            id=str(uuid.uuid4()),
+            registration_id=registration.id,
+            reference="KITE-SUB-" + uuid.uuid4().hex[:20].upper(),
+            amount=payment.amount,
+            currency="ZMW",
+            status=PaymentStatus.NOT_INITIATED.value,
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        db.add(transaction)
+        db.flush()
+        db.add(PaymentStatusHistory(
+            transaction_id=transaction.id,
+            previous_status=None,
+            status=PaymentStatus.NOT_INITIATED.value,
+            source="pawapay-retry",
+        ))
+    if transaction.status in {
+        PaymentStatus.PENDING.value, PaymentStatus.PROCESSING.value,
+        PaymentStatus.SUCCESSFUL.value,
+    } and transaction.provider_reference != payment.id:
+        raise HTTPException(status_code=409, detail="Another payment is already in progress for this registration.")
+    existing_attempt = db.scalar(select(PaymentAttempt).where(
+        PaymentAttempt.idempotency_key == idempotency_key,
+    ))
+    if existing_attempt:
+        if existing_attempt.transaction_id != transaction.id:
+            raise HTTPException(status_code=409, detail="This payment request was already used.")
+        return
+    attempt_count = db.scalar(select(func.count(PaymentAttempt.id)).join(
+        PaymentTransaction, PaymentTransaction.id == PaymentAttempt.transaction_id,
+    ).where(PaymentTransaction.registration_id == registration.id)) or 0
+    transaction.provider_id = "pawapay"
+    transaction.provider_reference = payment.id
+    transaction.amount = payment.amount
+    transaction.currency = "ZMW"
+    transaction.expires_at = utcnow() + timedelta(minutes=30)
+    set_payment_status(transaction, PaymentStatus.PROCESSING, "pawapay-initiation", db)
+    db.add(PaymentAttempt(
+        transaction_id=transaction.id,
+        attempt_number=attempt_count + 1,
+        idempotency_key=idempotency_key,
+        provider_id="pawapay",
+        status=PaymentStatus.PROCESSING.value,
+        started_at=utcnow(),
+    ))
+    db.commit()
+    sync_legacy_pawapay_payment(payment, db)
+
+
+def sync_legacy_pawapay_payment(payment: MobileMoneyPayment, db: Session) -> None:
+    transaction = db.scalar(select(PaymentTransaction).where(
+        PaymentTransaction.provider_id == "pawapay",
+        PaymentTransaction.provider_reference == payment.id,
+    ))
+    if transaction is None:
+        return
+    attempt = db.scalar(select(PaymentAttempt).where(
+        PaymentAttempt.transaction_id == transaction.id,
+    ).order_by(PaymentAttempt.attempt_number.desc()).limit(1))
+    if attempt:
+        attempt.completed_at = utcnow()
+        attempt.status = (
+            PaymentStatus.SUCCESSFUL.value if payment.status == "COMPLETED"
+            else PaymentStatus.FAILED.value if payment.status == "FAILED"
+            else PaymentStatus.PROCESSING.value
+        )
+        attempt.failure_code = payment.failure_code
+    registration = db.get(SubscriptionRegistration, transaction.registration_id)
+    if payment.status == "COMPLETED":
+        set_payment_status(transaction, PaymentStatus.SUCCESSFUL, "pawapay-verification", db)
+        transaction.verified_at = utcnow()
+        subscription = db.scalar(select(Subscription).where(
+            Subscription.token_hash == hashlib.sha256(("pawapay:" + payment.id).encode()).hexdigest(),
+        ))
+        if subscription:
+            transaction.subscription_id = subscription.id
+            registration.status = "ACTIVE"
+            registration.updated_at = utcnow()
+    elif payment.status == "FAILED":
+        set_payment_status(
+            transaction, PaymentStatus.FAILED, "pawapay-verification", db,
+            payment.failure_code,
+        )
+    elif payment.status == "REVIEW_REQUIRED":
+        transaction.failure_code = payment.failure_code
+        transaction.updated_at = utcnow()
+    else:
+        set_payment_status(transaction, PaymentStatus.PENDING, "pawapay-response", db)
+    db.commit()
+
+
 def settle_mobile_money_payment(payment: MobileMoneyPayment, details: dict[str, Any], db: Session) -> None:
     payer_details = details.get("payer", {}).get("accountDetails", {})
     try:
@@ -2171,6 +2517,7 @@ def settle_mobile_money_payment(payment: MobileMoneyPayment, details: dict[str, 
         payment.failure_code = "PAYMENT_DETAILS_MISMATCH"
         payment.updated_at = utcnow()
         db.commit()
+        sync_legacy_pawapay_payment(payment, db)
         log.error("PawaPay completion did not match payment intent %s.", payment.id)
         return
 
@@ -2218,6 +2565,7 @@ def settle_mobile_money_payment(payment: MobileMoneyPayment, details: dict[str, 
     payment.failure_code = None
     payment.updated_at = now
     db.commit()
+    sync_legacy_pawapay_payment(payment, db)
 
 
 def refresh_mobile_money_payment(payment: MobileMoneyPayment, db: Session) -> None:
@@ -2236,10 +2584,250 @@ def refresh_mobile_money_payment(payment: MobileMoneyPayment, db: Session) -> No
         payment.failure_code = reason.get("failureCode") if isinstance(reason, dict) else None
         payment.updated_at = utcnow()
         db.commit()
+        sync_legacy_pawapay_payment(payment, db)
+
+
+def encrypt_subscription_phone(value: str) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    context = b"kite-subscription-phone-v1"
+    key = hashlib.sha256(token_key() + context).digest()
+    nonce = secrets.token_bytes(12)
+    encrypted = AESGCM(key).encrypt(nonce, value.encode(), context)
+    return base64.urlsafe_b64encode(nonce + encrypted).decode()
+
+
+def decrypt_subscription_phone(value: str) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    context = b"kite-subscription-phone-v1"
+    key = hashlib.sha256(token_key() + context).digest()
+    raw = base64.urlsafe_b64decode(value.encode())
+    return AESGCM(key).decrypt(raw[:12], raw[12:], context).decode()
+
+
+def latest_payment_transaction(registration_id: str, db: Session) -> PaymentTransaction | None:
+    return db.scalar(
+        select(PaymentTransaction)
+        .where(PaymentTransaction.registration_id == registration_id)
+        .order_by(PaymentTransaction.created_at.desc())
+        .limit(1)
+    )
+
+
+def set_payment_status(
+    payment: PaymentTransaction,
+    status: PaymentStatus,
+    source: str,
+    db: Session,
+    failure_code: str | None = None,
+) -> None:
+    previous = PaymentStatus(payment.status)
+    if previous == status:
+        payment.failure_code = failure_code
+        payment.updated_at = utcnow()
+        return
+    transitions = {
+        PaymentStatus.NOT_INITIATED: {
+            PaymentStatus.PENDING, PaymentStatus.PROCESSING, PaymentStatus.FAILED,
+            PaymentStatus.CANCELLED, PaymentStatus.EXPIRED,
+        },
+        PaymentStatus.PENDING: {
+            PaymentStatus.PROCESSING, PaymentStatus.SUCCESSFUL, PaymentStatus.FAILED,
+            PaymentStatus.CANCELLED, PaymentStatus.EXPIRED,
+        },
+        PaymentStatus.PROCESSING: {
+            PaymentStatus.PENDING, PaymentStatus.SUCCESSFUL, PaymentStatus.FAILED,
+            PaymentStatus.CANCELLED, PaymentStatus.EXPIRED,
+        },
+        PaymentStatus.FAILED: {PaymentStatus.SUCCESSFUL},
+        PaymentStatus.CANCELLED: {PaymentStatus.SUCCESSFUL},
+        PaymentStatus.EXPIRED: {PaymentStatus.SUCCESSFUL},
+        PaymentStatus.SUCCESSFUL: set(),
+    }
+    if status not in transitions[previous]:
+        raise HTTPException(status_code=409, detail="This payment status transition is not allowed.")
+    payment.status = status.value
+    payment.failure_code = failure_code
+    payment.updated_at = utcnow()
+    db.add(PaymentStatusHistory(
+        transaction_id=payment.id,
+        previous_status=previous.value,
+        status=status.value,
+        source=source,
+    ))
+
+
+def payment_transaction_payload(payment: PaymentTransaction, db: Session) -> dict[str, Any]:
+    attempt_count = db.scalar(
+        select(func.count(PaymentAttempt.id)).where(PaymentAttempt.transaction_id == payment.id)
+    ) or 0
+    return {
+        "id": payment.id,
+        "reference": payment.reference,
+        "provider_id": payment.provider_id,
+        "provider_reference": payment.provider_reference,
+        "amount": payment.amount,
+        "currency": payment.currency,
+        "status": payment.status,
+        "failure_code": payment.failure_code,
+        "attempt_count": attempt_count,
+        "expires_at": payment.expires_at.isoformat() if payment.expires_at else None,
+        "verified_at": payment.verified_at.isoformat() if payment.verified_at else None,
+    }
+
+
+def subscription_registration_payload(
+    registration: SubscriptionRegistration, db: Session,
+) -> dict[str, Any]:
+    plan = db.get(SubscriptionPlan, registration.plan_id)
+    payment = latest_payment_transaction(registration.id, db)
+    payment_payload = payment_transaction_payload(payment, db) if payment else None
+    active_subscription = db.get(Subscription, payment.subscription_id) if payment and payment.subscription_id else None
+    expires_at = ensure_utc(active_subscription.expires_at) if active_subscription and active_subscription.expires_at else None
+    if registration.status == "ACTIVE" and expires_at and expires_at <= utcnow():
+        registration.status = "EXPIRED"
+        registration.updated_at = utcnow()
+        db.commit()
+    if registration.status == "ACTIVE":
+        message = "Verified payment received. Your prepaid Kite Premium access is active."
+    elif payment_payload and payment_payload["status"] == PaymentStatus.NOT_INITIATED.value:
+        message = "Registration saved. Payment has not started, and Premium is not active."
+    elif payment_payload and payment_payload["status"] == PaymentStatus.FAILED.value:
+        message = "Registration saved, but the latest payment attempt failed. Premium is not active."
+    elif payment_payload and payment_payload["status"] == PaymentStatus.SUCCESSFUL.value:
+        message = "Payment was verified. Subscription activation is pending account association."
+    else:
+        message = "Registration saved. Premium starts only after payment is verified."
+    return {
+        "registration_id": registration.id,
+        "plan": {
+            "id": plan.id,
+            "name": plan.name,
+            "price": plan.display_price,
+            "amount": plan.amount,
+            "currency": plan.currency,
+            "period": plan.period,
+            "summary": plan.summary,
+            "features": json.loads(plan.features_json or "[]"),
+        } if plan else None,
+        "phone_number": "••••" + registration.phone_last4,
+        "subscription_status": registration.status,
+        "subscription_expires_at": expires_at.isoformat() if expires_at else None,
+        "renewal": "manual",
+        "premium_active": bool(
+            registration.user_id is not None
+            and registration.status == "ACTIVE"
+            and premium_entitled(db, registration.user_id)
+        ),
+        "payment": payment_payload,
+        "message": message,
+        "created_at": registration.created_at.isoformat(),
+    }
+
+
+def authorize_subscription_registration(
+    registration: SubscriptionRegistration,
+    user: User | None,
+    access_key: str | None,
+) -> None:
+    if user is not None and registration.user_id == user.id:
+        return
+    if not access_key or not hmac.compare_digest(
+        registration.access_key_hash, hashlib.sha256(access_key.encode()).hexdigest(),
+    ):
+        raise HTTPException(status_code=404, detail="Subscription registration not found.")
+
+
+def activate_verified_payment(
+    payment: PaymentTransaction, db: Session,
+) -> None:
+    registration = db.get(SubscriptionRegistration, payment.registration_id)
+    if registration is None or registration.user_id is None:
+        log.error("Verified payment %s has no linked account.", payment.reference)
+        return
+    if payment.subscription_id is not None:
+        registration.status = "ACTIVE"
+        registration.updated_at = utcnow()
+        return
+    plan = db.get(SubscriptionPlan, registration.plan_id)
+    if plan is None or not plan.premium:
+        log.error("Verified payment %s references an invalid subscription plan.", payment.reference)
+        return
+    now = utcnow()
+    token_hash = hashlib.sha256(("mobile-money:" + payment.id).encode()).hexdigest()
+    subscription = db.scalar(select(Subscription).where(Subscription.token_hash == token_hash))
+    if subscription is None:
+        active_mobile_expiries = []
+        for existing in db.scalars(select(Subscription).where(
+            Subscription.user_id == registration.user_id,
+        )):
+            expiry = ensure_utc(existing.expires_at) if existing.expires_at else None
+            if (
+                existing.product_id.startswith(("pawapay_", "mobile_money_"))
+                and existing.state in {"SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_CANCELED"}
+                and expiry and expiry > now
+            ):
+                active_mobile_expiries.append(expiry)
+        start = max(active_mobile_expiries, default=now)
+        duration = timedelta(days=30 if plan.period == "month" else 365)
+        subscription = Subscription(
+            user_id=registration.user_id,
+            product_id="mobile_money_" + registration.plan_id,
+            token_hash=token_hash,
+            token_ciphertext=encrypt_purchase_token(payment.id),
+            state="SUBSCRIPTION_STATE_ACTIVE",
+            expires_at=start + duration,
+            auto_renew=False,
+            updated_at=now,
+        )
+        db.add(subscription)
+        db.flush()
+    payment.subscription_id = subscription.id
+    registration.status = "ACTIVE"
+    registration.updated_at = now
+    user = db.get(User, registration.user_id)
+    if user:
+        create_notification(
+            user, db, event_key="mobile-money-verified:" + payment.id,
+            title="Kite Premium subscription confirmed",
+            body="Your prepaid " + ("monthly" if plan.period == "month" else "annual")
+            + " access is active through "
+            + subscription.expires_at.astimezone(timezone.utc).date().isoformat() + ".",
+            category="subscription", target_route="preferences",
+        )
+
+
+def reconcile_payment_result(
+    payment: PaymentTransaction,
+    result: ProviderPaymentResult,
+    source: str,
+    db: Session,
+) -> bool:
+    if (
+        not result.verified
+        or result.transaction_reference != payment.reference
+        or result.amount != payment.amount
+        or result.currency != payment.currency
+    ):
+        log.warning("Rejected unverified or mismatched provider result for %s.", payment.reference)
+        return False
+    if result.provider_reference:
+        payment.provider_reference = result.provider_reference
+    if result.status == PaymentStatus.SUCCESSFUL:
+        set_payment_status(payment, PaymentStatus.SUCCESSFUL, source, db)
+        payment.verified_at = utcnow()
+        activate_verified_payment(payment, db)
+    elif result.status in {
+        PaymentStatus.PENDING, PaymentStatus.PROCESSING, PaymentStatus.FAILED,
+        PaymentStatus.CANCELLED, PaymentStatus.EXPIRED,
+    }:
+        set_payment_status(payment, result.status, source, db, result.failure_code)
+    return True
 
 
 @app.get("/api/plans")
-def plans():
+def plans(db: Session = Depends(get_db)):
     mobile_money_enabled = mobile_money_checkout_available()
     providers = []
     mobile_money_message = None
@@ -2256,15 +2844,50 @@ def plans():
             ]
             if not providers:
                 mobile_money_message = "No Zambia mobile-money providers are currently enabled and operational on this merchant account."
+    configured_payment_providers = []
+    for config in db.scalars(select(PaymentProviderConfiguration).where(
+        PaymentProviderConfiguration.enabled.is_(True),
+    )):
+        provider = get_mobile_money_provider(config.provider_id)
+        if provider:
+            configured_payment_providers.append({
+                "id": provider.provider_id,
+                "name": provider.display_name,
+            })
+    plan_rows = db.scalars(select(SubscriptionPlan).where(
+        SubscriptionPlan.active.is_(True),
+    ).order_by(SubscriptionPlan.sort_order))
+    plan_payloads = []
+    for plan in plan_rows:
+        price = plan.display_price
+        if plan.id == "premium_monthly":
+            price = os.getenv("KITE_MONTHLY_PRICE", price)
+        elif plan.id == "premium_annual":
+            price = os.getenv("KITE_ANNUAL_PRICE", price)
+        item = {
+            "id": plan.id,
+            "name": plan.name,
+            "price": price,
+            "amount": plan.amount,
+            "currency": plan.currency,
+            "period": plan.period,
+            "premium": plan.premium,
+            "summary": plan.summary,
+            "features": json.loads(plan.features_json or "[]"),
+        }
+        if plan.id == "premium_monthly":
+            item["product_id"] = os.getenv("KITE_PLAY_MONTHLY_PRODUCT_ID", "kite_premium_monthly")
+        elif plan.id == "premium_annual":
+            item.update({
+                "product_id": os.getenv("KITE_PLAY_ANNUAL_PRODUCT_ID", "kite_premium_annual"),
+                "savings": "K139.89 annually",
+                "percentage_savings": "58.3%",
+                "best_value": True,
+            })
+        plan_payloads.append(item)
     return {
-        "plans": [
-            {"id": "free", "name": "Kite Free", "price": "Free", "period": None, "premium": False},
-            {"id": "premium_monthly", "name": "Kite Premium", "price": os.getenv("KITE_MONTHLY_PRICE", "K19.99"), "period": "month", "premium": True,
-             "product_id": os.getenv("KITE_PLAY_MONTHLY_PRODUCT_ID", "kite_premium_monthly")},
-            {"id": "premium_annual", "name": "Kite Premium", "price": os.getenv("KITE_ANNUAL_PRICE", "K99.99"), "period": "year", "premium": True,
-             "savings": "K139.89 annually", "percentage_savings": "58.3%", "best_value": True,
-             "product_id": os.getenv("KITE_PLAY_ANNUAL_PRODUCT_ID", "kite_premium_annual")},
-        ],
+        "plans": plan_payloads,
+        "payment_providers": configured_payment_providers,
         "mobile_money": {
             "enabled": mobile_money_enabled and bool(providers),
             "currency": "ZMW",
@@ -2277,16 +2900,353 @@ def plans():
 
 @app.get("/api/subscription")
 def subscription(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    registration = db.scalar(select(SubscriptionRegistration).where(
+        SubscriptionRegistration.user_id == user.id,
+    ).order_by(SubscriptionRegistration.created_at.desc()).limit(1))
+    registration_payload = (
+        subscription_registration_payload(registration, db) if registration else None
+    )
     sub = db.scalar(select(Subscription).where(Subscription.user_id == user.id).order_by(Subscription.updated_at.desc()))
     if not sub:
         return {"plan": "free", "status": "none", "premium": False, "cancel_url": None,
-                "billing_provider": None}
-    mobile_money = sub.product_id.startswith("pawapay_")
+                "billing_provider": None, "registration": registration_payload}
+    mobile_money = sub.product_id.startswith(("pawapay_", "mobile_money_"))
     return {"plan": "premium", "status": sub.state, "premium": premium_entitled(db, user.id),
             "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
             "auto_renew": sub.auto_renew,
             "cancel_url": None if mobile_money else "https://play.google.com/store/account/subscriptions",
-            "billing_provider": "mobile_money" if mobile_money else "google_play"}
+            "billing_provider": "mobile_money" if mobile_money else "google_play",
+            "registration": registration_payload}
+
+
+@app.post("/api/subscription/registrations", status_code=201)
+def create_subscription_registration(
+    payload: SubscriptionRegistrationIn,
+    request: Request,
+    response: Response,
+    user: User | None = Depends(optional_user),
+    db: Session = Depends(get_db),
+):
+    enforce_auth_rate_limit(request, "subscription-registration", "", 10, 3600)
+    try:
+        phone_number = normalize_zambian_phone(payload.phone_number)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    plan = db.get(SubscriptionPlan, payload.plan_id)
+    if plan is None or not plan.active or not plan.premium:
+        raise HTTPException(status_code=422, detail="Choose an available Premium plan.")
+    secret = token_key()
+    request_digest = hmac.new(
+        secret,
+        ((str(user.id) if user else "guest") + "|" + payload.plan_id + "|" + phone_number).encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    phone_digest = hmac.new(
+        secret, b"kite-phone-lookup-v1|" + phone_number.encode(), hashlib.sha256,
+    ).hexdigest()
+    access_key_hash = hashlib.sha256(payload.access_key.encode()).hexdigest()
+    registration = db.scalar(select(SubscriptionRegistration).where(
+        SubscriptionRegistration.idempotency_key == payload.idempotency_key,
+    ))
+    if registration:
+        if (
+            not hmac.compare_digest(registration.request_hash, request_digest)
+            or not hmac.compare_digest(registration.access_key_hash, access_key_hash)
+        ):
+            raise HTTPException(status_code=409, detail="This registration request was already used for different details.")
+        if registration.user_id != (user.id if user else None):
+            raise HTTPException(status_code=409, detail="This registration belongs to a different account.")
+        response.status_code = 200
+        return subscription_registration_payload(registration, db)
+
+    now = utcnow()
+    registration = SubscriptionRegistration(
+        id=str(uuid.uuid4()),
+        user_id=user.id if user else None,
+        plan_id=plan.id,
+        idempotency_key=payload.idempotency_key,
+        request_hash=request_digest,
+        access_key_hash=access_key_hash,
+        phone_ciphertext=encrypt_subscription_phone(phone_number),
+        phone_hash=phone_digest,
+        phone_last4=phone_number[-4:],
+        status="PENDING_PAYMENT",
+        created_at=now,
+        updated_at=now,
+    )
+    payment = PaymentTransaction(
+        id=str(uuid.uuid4()),
+        registration_id=registration.id,
+        reference="KITE-SUB-" + uuid.uuid4().hex[:20].upper(),
+        amount=plan.amount,
+        currency=plan.currency,
+        status=PaymentStatus.NOT_INITIATED.value,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add_all([registration, payment])
+    db.flush()
+    db.add(PaymentStatusHistory(
+        transaction_id=payment.id,
+        previous_status=None,
+        status=PaymentStatus.NOT_INITIATED.value,
+        source="registration",
+    ))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(select(SubscriptionRegistration).where(
+            SubscriptionRegistration.idempotency_key == payload.idempotency_key,
+        ))
+        if (
+            existing is None
+            or not hmac.compare_digest(existing.request_hash, request_digest)
+            or not hmac.compare_digest(existing.access_key_hash, access_key_hash)
+        ):
+            raise HTTPException(status_code=409, detail="This registration could not be created safely.")
+        response.status_code = 200
+        return subscription_registration_payload(existing, db)
+    response.status_code = 201
+    return subscription_registration_payload(registration, db)
+
+
+@app.get("/api/subscription/registrations/{registration_id}")
+def get_subscription_registration(
+    registration_id: str,
+    user: User | None = Depends(optional_user),
+    access_key: Annotated[str | None, Header(alias="X-Kite-Registration-Key")] = None,
+    db: Session = Depends(get_db),
+):
+    registration = db.get(SubscriptionRegistration, registration_id)
+    if registration is None:
+        raise HTTPException(status_code=404, detail="Subscription registration not found.")
+    authorize_subscription_registration(registration, user, access_key)
+    return subscription_registration_payload(registration, db)
+
+
+@app.post("/api/subscription/registrations/{registration_id}/claim")
+def claim_subscription_registration(
+    registration_id: str,
+    payload: SubscriptionRegistrationClaimIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    registration = db.get(SubscriptionRegistration, registration_id)
+    if registration is None or not hmac.compare_digest(
+        registration.access_key_hash, hashlib.sha256(payload.access_key.encode()).hexdigest(),
+    ):
+        raise HTTPException(status_code=404, detail="Subscription registration not found.")
+    if registration.user_id not in {None, user.id}:
+        raise HTTPException(status_code=409, detail="This registration is already associated with another account.")
+    registration.user_id = user.id
+    registration.updated_at = utcnow()
+    db.commit()
+    return subscription_registration_payload(registration, db)
+
+
+@app.post("/api/subscription/registrations/{registration_id}/cancel")
+def cancel_subscription_registration(
+    registration_id: str,
+    user: User | None = Depends(optional_user),
+    access_key: Annotated[str | None, Header(alias="X-Kite-Registration-Key")] = None,
+    db: Session = Depends(get_db),
+):
+    registration = db.get(SubscriptionRegistration, registration_id)
+    if registration is None:
+        raise HTTPException(status_code=404, detail="Subscription registration not found.")
+    authorize_subscription_registration(registration, user, access_key)
+    if registration.status == "ACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail="This prepaid subscription does not auto-renew. Its verified access remains active until expiry.",
+        )
+    payment = latest_payment_transaction(registration.id, db)
+    if payment and payment.status in {
+        PaymentStatus.PENDING.value, PaymentStatus.PROCESSING.value,
+        PaymentStatus.SUCCESSFUL.value,
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="A payment is in progress or already verified. Refresh its status before taking further action.",
+        )
+    if payment and payment.status == PaymentStatus.NOT_INITIATED.value:
+        set_payment_status(payment, PaymentStatus.CANCELLED, "registration-cancelled", db)
+    registration.status = "CANCELLED"
+    registration.updated_at = utcnow()
+    db.commit()
+    return subscription_registration_payload(registration, db)
+
+
+@app.post("/api/subscription/registrations/{registration_id}/payments")
+def initiate_subscription_payment(
+    registration_id: str,
+    payload: PaymentInitiationIn,
+    user: User | None = Depends(optional_user),
+    access_key: Annotated[str | None, Header(alias="X-Kite-Registration-Key")] = None,
+    db: Session = Depends(get_db),
+):
+    registration = db.get(SubscriptionRegistration, registration_id)
+    if registration is None:
+        raise HTTPException(status_code=404, detail="Subscription registration not found.")
+    authorize_subscription_registration(registration, user, access_key)
+
+    duplicate_attempt = db.scalar(select(PaymentAttempt).where(
+        PaymentAttempt.idempotency_key == payload.idempotency_key,
+    ))
+    if duplicate_attempt:
+        payment = db.get(PaymentTransaction, duplicate_attempt.transaction_id)
+        if payment is None or payment.registration_id != registration.id:
+            raise HTTPException(status_code=409, detail="This payment request was already used.")
+        return subscription_registration_payload(registration, db)
+
+    provider_config = db.get(PaymentProviderConfiguration, payload.provider_id)
+    provider = get_mobile_money_provider(payload.provider_id)
+    if not provider_config or not provider_config.enabled or provider is None:
+        return {
+            **subscription_registration_payload(registration, db),
+            "message": "Registration is saved. Payment has not started because a mobile-money provider is not connected.",
+        }
+    if registration.user_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Sign in and link this registration before starting payment so Premium can be associated with your account.",
+        )
+    now = utcnow()
+    existing_subscriptions = db.scalars(select(Subscription).where(
+        Subscription.user_id == registration.user_id,
+    ))
+    for existing in existing_subscriptions:
+        expiry = ensure_utc(existing.expires_at) if existing.expires_at else None
+        if (
+            not existing.product_id.startswith(("pawapay_", "mobile_money_"))
+            and existing.state in {
+                "SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+                "SUBSCRIPTION_STATE_CANCELED",
+            }
+            and expiry and expiry > now
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="An active Google Play subscription already exists. Manage it through Google Play.",
+            )
+    if registration.status == "ACTIVE":
+        raise HTTPException(status_code=409, detail="This subscription registration is already active.")
+
+    payment = latest_payment_transaction(registration.id, db)
+    if payment is None:
+        raise HTTPException(status_code=409, detail="The registration has no payment record.")
+    if payment.status in {
+        PaymentStatus.PENDING.value, PaymentStatus.PROCESSING.value,
+        PaymentStatus.SUCCESSFUL.value,
+    }:
+        raise HTTPException(status_code=409, detail="A payment is already in progress or has been verified.")
+    if payment.status in {
+        PaymentStatus.FAILED.value, PaymentStatus.CANCELLED.value, PaymentStatus.EXPIRED.value,
+    }:
+        now = utcnow()
+        payment = PaymentTransaction(
+            id=str(uuid.uuid4()),
+            registration_id=registration.id,
+            reference="KITE-SUB-" + uuid.uuid4().hex[:20].upper(),
+            amount=payment.amount,
+            currency=payment.currency,
+            status=PaymentStatus.NOT_INITIATED.value,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(payment)
+        db.flush()
+        db.add(PaymentStatusHistory(
+            transaction_id=payment.id,
+            previous_status=None,
+            status=PaymentStatus.NOT_INITIATED.value,
+            source="retry",
+        ))
+    number = decrypt_subscription_phone(registration.phone_ciphertext)
+    now = utcnow()
+    attempt_count = db.scalar(select(func.count(PaymentAttempt.id)).join(
+        PaymentTransaction, PaymentTransaction.id == PaymentAttempt.transaction_id,
+    ).where(PaymentTransaction.registration_id == registration.id)) or 0
+    attempt = PaymentAttempt(
+        transaction_id=payment.id,
+        attempt_number=attempt_count + 1,
+        idempotency_key=payload.idempotency_key,
+        provider_id=provider.provider_id,
+        status=PaymentStatus.PROCESSING.value,
+        started_at=now,
+    )
+    payment.provider_id = provider.provider_id
+    payment.expires_at = now + timedelta(minutes=30)
+    set_payment_status(payment, PaymentStatus.PROCESSING, "initiation", db)
+    db.add(attempt)
+    db.commit()
+
+    try:
+        result = provider.initiate(payment.reference, payment.amount, payment.currency, number)
+    except PaymentProviderError:
+        log.exception("Payment provider initiation failed for reference %s.", payment.reference)
+        result = ProviderPaymentResult(
+            status=PaymentStatus.PENDING,
+            failure_code="PROVIDER_RESPONSE_UNKNOWN",
+        )
+    payment.provider_reference = result.provider_reference or payment.provider_reference
+    attempt.completed_at = utcnow()
+    attempt.status = result.status.value if result.status != PaymentStatus.SUCCESSFUL else PaymentStatus.PROCESSING.value
+    attempt.failure_code = result.failure_code
+    if result.status == PaymentStatus.SUCCESSFUL:
+        set_payment_status(payment, PaymentStatus.PROCESSING, "initiation", db)
+    elif result.status in {
+        PaymentStatus.PENDING, PaymentStatus.PROCESSING, PaymentStatus.FAILED,
+        PaymentStatus.CANCELLED, PaymentStatus.EXPIRED,
+    }:
+        set_payment_status(payment, result.status, "initiation", db, result.failure_code)
+    db.commit()
+    return subscription_registration_payload(registration, db)
+
+
+@app.post("/api/subscription/registrations/{registration_id}/verify")
+def verify_subscription_payment(
+    registration_id: str,
+    user: User | None = Depends(optional_user),
+    access_key: Annotated[str | None, Header(alias="X-Kite-Registration-Key")] = None,
+    db: Session = Depends(get_db),
+):
+    registration = db.get(SubscriptionRegistration, registration_id)
+    if registration is None:
+        raise HTTPException(status_code=404, detail="Subscription registration not found.")
+    authorize_subscription_registration(registration, user, access_key)
+    payment = latest_payment_transaction(registration.id, db)
+    if payment is None or not payment.provider_id:
+        return subscription_registration_payload(registration, db)
+    provider_config = db.get(PaymentProviderConfiguration, payment.provider_id)
+    provider = get_mobile_money_provider(payment.provider_id)
+    if not provider_config or not provider_config.enabled or provider is None:
+        return subscription_registration_payload(registration, db)
+    result = provider.verify(payment.reference, payment.provider_reference)
+    reconcile_payment_result(payment, result, "verification", db)
+    db.commit()
+    return subscription_registration_payload(registration, db)
+
+
+@app.post("/api/payment-webhooks/{provider_id}")
+async def receive_payment_webhook(provider_id: str, request: Request, db: Session = Depends(get_db)):
+    provider_config = db.get(PaymentProviderConfiguration, provider_id)
+    provider = get_mobile_money_provider(provider_id)
+    if not provider_config or not provider_config.enabled or provider is None:
+        raise HTTPException(status_code=404, detail="Payment provider webhook is not configured.")
+    result = provider.verify_webhook(await request.body(), request.headers)
+    if not result.verified or not result.transaction_reference:
+        raise HTTPException(status_code=400, detail="Payment webhook signature or transaction is invalid.")
+    payment = db.scalar(select(PaymentTransaction).where(
+        PaymentTransaction.reference == result.transaction_reference,
+        PaymentTransaction.provider_id == provider_id,
+    ))
+    if payment is None:
+        raise HTTPException(status_code=404, detail="Payment transaction not found.")
+    reconcile_payment_result(payment, result, "webhook", db)
+    db.commit()
+    return {"received": True, "status": payment.status}
 
 
 @app.post("/api/subscription/mobile-money")
@@ -2298,10 +3258,38 @@ def create_mobile_money_payment(
     if not mobile_money_checkout_available():
         raise HTTPException(status_code=503, detail="Mobile-money checkout is not configured.")
     amount = pawapay_amount(payload.plan_id)
-    phone_number = payload.phone_number.lstrip("+")
+    registration = None
+    if payload.registration_id:
+        registration = db.get(SubscriptionRegistration, payload.registration_id)
+        if registration is None:
+            raise HTTPException(status_code=404, detail="Subscription registration not found.")
+        authorize_subscription_registration(registration, user, payload.registration_key)
+        if registration.user_id not in {None, user.id}:
+            raise HTTPException(status_code=409, detail="This registration belongs to another account.")
+        if registration.plan_id != payload.plan_id:
+            raise HTTPException(status_code=409, detail="The selected plan does not match this registration.")
+        phone_number = decrypt_subscription_phone(registration.phone_ciphertext)
+        if payload.phone_number:
+            try:
+                supplied_phone = normalize_zambian_phone(payload.phone_number)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            if not hmac.compare_digest(supplied_phone, phone_number):
+                raise HTTPException(status_code=409, detail="The mobile number does not match this registration.")
+        registration.user_id = user.id
+        registration.updated_at = utcnow()
+    else:
+        if not payload.phone_number:
+            raise HTTPException(status_code=422, detail="Enter a Zambian mobile-money number.")
+        try:
+            phone_number = normalize_zambian_phone(payload.phone_number)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    phone_number = phone_number.lstrip("+")
     request_digest = hmac.new(
         token_key(),
-        (payload.plan_id + "|" + payload.provider + "|" + phone_number).encode(),
+        (payload.plan_id + "|" + payload.provider + "|" + phone_number + "|" +
+         (registration.id if registration else "")).encode(),
         hashlib.sha256,
     ).hexdigest()
     payment = db.scalar(select(MobileMoneyPayment).where(
@@ -2311,6 +3299,8 @@ def create_mobile_money_payment(
     if payment and not hmac.compare_digest(payment.request_hash, request_digest):
         raise HTTPException(status_code=409, detail="This payment request was already used for different details.")
     if payment and payment.status in {"COMPLETED", "FAILED", "REVIEW_REQUIRED"}:
+        if registration:
+            link_legacy_pawapay_payment(registration, payment, payload.idempotency_key, db)
         return mobile_money_payment_result(payment)
 
     if payment is None:
@@ -2353,8 +3343,12 @@ def create_mobile_money_payment(
             if payment is None or not hmac.compare_digest(payment.request_hash, request_digest):
                 raise HTTPException(status_code=409, detail="This payment request could not be created safely.")
             if payment.status in {"COMPLETED", "FAILED", "REVIEW_REQUIRED"}:
+                if registration:
+                    link_legacy_pawapay_payment(registration, payment, payload.idempotency_key, db)
                 return mobile_money_payment_result(payment)
 
+    if registration:
+        link_legacy_pawapay_payment(registration, payment, payload.idempotency_key, db)
     pawapay_provider_config(payment.provider, payment.amount)
     try:
         result = pawapay_request("POST", "/v2/deposits", {
@@ -2373,6 +3367,8 @@ def create_mobile_money_payment(
         payment.status = "PENDING"
         payment.updated_at = utcnow()
         db.commit()
+        if registration:
+            link_legacy_pawapay_payment(registration, payment, payload.idempotency_key, db)
         return {
             **mobile_money_payment_result(payment),
             "message": "Payment submission is unconfirmed. Check its status before trying again.",
@@ -2394,6 +3390,8 @@ def create_mobile_money_payment(
         payment.failure_code = None
     payment.updated_at = utcnow()
     db.commit()
+    if registration:
+        sync_legacy_pawapay_payment(payment, db)
     return mobile_money_payment_result(payment)
 
 

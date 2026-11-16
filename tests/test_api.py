@@ -3,6 +3,7 @@ import hashlib
 import io
 import logging
 import os
+import secrets
 import tempfile
 import unittest
 import uuid
@@ -14,16 +15,22 @@ DB_DIR = tempfile.TemporaryDirectory()
 logging.disable(logging.CRITICAL)
 os.environ["DATABASE_URL"] = "sqlite:///" + Path(DB_DIR.name, "test.db").as_posix()
 os.environ["KITE_SECRET_KEY"] = "test-only-secret-key-with-at-least-32-characters"
+os.environ["KITE_ALLOW_LOCAL_AUTH"] = "true"
+os.environ["SUPABASE_URL"] = ""
+os.environ["SUPABASE_ANON_KEY"] = ""
 os.environ["RUNNER_SHARED_SECRET"] = "test-runner-secret"
 
 from fastapi.testclient import TestClient
 
 from backend.app import (
     Activity, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, LessonProgress,
-    MobileMoneyPayment, PlaygroundError, PlaygroundExecution, MODULES, QUIZZES,
-    QUIZ_METADATA, QuizAttempt, SessionLocal, User, app, engine, issue_token,
+    MobileMoneyPayment, PaymentAttempt, PaymentProviderConfiguration, PaymentStatusHistory,
+    PaymentTransaction, PlaygroundError, PlaygroundExecution, MODULES, QUIZZES,
+    QUIZ_METADATA, QuizAttempt, SessionLocal, SubscriptionRegistration, User, app, engine, issue_token,
+    decrypt_subscription_phone,
 )
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
+from backend.payments import PaymentStatus, ProviderPaymentResult, normalize_zambian_phone
 
 
 class KiteApiTests(unittest.TestCase):
@@ -68,6 +75,55 @@ class KiteApiTests(unittest.TestCase):
         })
         self.assertEqual(login.status_code, 200)
         self.assertEqual(login.json()["user"]["email"], self.email)
+
+    def test_local_auth_requires_explicit_opt_in_and_is_disabled_on_vercel(self):
+        registration_email = f"disabled-{uuid.uuid4().hex}@example.com"
+        disabled_auth = {
+            "KITE_ALLOW_LOCAL_AUTH": "false",
+            "SUPABASE_URL": "",
+            "SUPABASE_ANON_KEY": "",
+        }
+        with patch.dict(os.environ, disabled_auth):
+            registration = self.client.post("/api/auth/register", json={
+                "name": "Unverified Learner",
+                "email": registration_email,
+                "password": "secure-example-password",
+            })
+            self.assertEqual(registration.status_code, 503)
+            login = self.client.post("/api/auth/login", json={
+                "email": self.email,
+                "password": "secure-example-password",
+            })
+            self.assertEqual(login.status_code, 503)
+            self.assertEqual(self.client.get("/api/me", headers=self.headers).status_code, 401)
+            with SessionLocal() as db:
+                self.assertIsNone(db.query(User.id).filter_by(email=registration_email).first())
+
+        with patch.dict(os.environ, {
+            **disabled_auth,
+            "KITE_ALLOW_LOCAL_AUTH": "true",
+            "VERCEL": "1",
+        }):
+            hosted_registration = self.client.post("/api/auth/register", json={
+                "name": "Unverified Learner",
+                "email": registration_email,
+                "password": "secure-example-password",
+            })
+            self.assertEqual(hosted_registration.status_code, 503)
+
+    def test_local_password_recovery_requires_auth_provider_or_local_opt_in(self):
+        with patch.dict(os.environ, {
+            "KITE_ALLOW_LOCAL_AUTH": "false",
+            "SUPABASE_URL": "",
+            "SUPABASE_ANON_KEY": "",
+        }):
+            requested = self.client.post("/api/auth/password-reset", json={"email": self.email})
+            completed = self.client.post("/api/auth/password-reset/complete", json={
+                "token": "not-a-valid-reset-token",
+                "password": "another-secure-password",
+            })
+        self.assertEqual(requested.status_code, 503)
+        self.assertEqual(completed.status_code, 503)
 
     def test_incorrect_login_credentials_do_not_create_a_session(self):
         response = self.client.post("/api/auth/login", json={
@@ -1041,6 +1097,232 @@ class KiteApiTests(unittest.TestCase):
         self.assertEqual(plans["premium_annual"]["percentage_savings"], "58.3%")
         self.assertTrue(plans["premium_annual"]["best_value"])
 
+    def test_zambian_mobile_number_normalization_and_validation(self):
+        for supplied in ("+260 97 123 4567", "097-123-4567", "00260971234567"):
+            with self.subTest(supplied=supplied):
+                self.assertEqual(normalize_zambian_phone(supplied), "+260971234567")
+        for supplied in ("+260 97 123", "+260 12 123 4567", "+260 97abc1234567"):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(ValueError):
+                    normalize_zambian_phone(supplied)
+
+    def test_guest_subscription_registration_persists_encrypted_phone_and_is_idempotent(self):
+        payload = {
+            "plan_id": "premium_monthly",
+            "phone_number": "097 123 4567",
+            "idempotency_key": str(uuid.uuid4()),
+            "access_key": secrets.token_urlsafe(32),
+        }
+        created = self.client.post("/api/subscription/registrations", json=payload)
+        self.assertEqual(created.status_code, 201, created.text)
+        body = created.json()
+        self.assertEqual(body["subscription_status"], "PENDING_PAYMENT")
+        self.assertEqual(body["payment"]["status"], "NOT_INITIATED")
+        self.assertEqual(body["payment"]["amount"], "19.99")
+        self.assertFalse(body["premium_active"])
+        self.assertEqual(body["phone_number"], "••••4567")
+        self.assertIn("not active", body["message"])
+
+        repeated = self.client.post("/api/subscription/registrations", json=payload)
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json()["registration_id"], body["registration_id"])
+        mismatched = {**payload, "phone_number": "+260 96 765 4321"}
+        self.assertEqual(
+            self.client.post("/api/subscription/registrations", json=mismatched).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.get("/api/subscription/registrations/" + body["registration_id"]).status_code,
+            404,
+        )
+        fetched = self.client.get(
+            "/api/subscription/registrations/" + body["registration_id"],
+            headers={"X-Kite-Registration-Key": payload["access_key"]},
+        )
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(fetched.json()["payment"]["status"], "NOT_INITIATED")
+
+        with SessionLocal() as db:
+            registration = db.get(SubscriptionRegistration, body["registration_id"])
+            self.assertEqual(decrypt_subscription_phone(registration.phone_ciphertext), "+260971234567")
+            self.assertNotIn("+260971234567", registration.phone_ciphertext)
+            self.assertEqual(
+                db.query(PaymentTransaction).filter_by(registration_id=registration.id).count(),
+                1,
+            )
+            transaction = db.query(PaymentTransaction).filter_by(registration_id=registration.id).one()
+            self.assertEqual(transaction.status, "NOT_INITIATED")
+            self.assertEqual(db.query(PaymentAttempt).filter_by(transaction_id=transaction.id).count(), 0)
+
+    def test_subscription_registration_rejects_invalid_numbers_without_writing(self):
+        with SessionLocal() as db:
+            registration_count = db.query(SubscriptionRegistration).count()
+        for phone in ("+260 97 123", "+260 12 123 4567", "+260 97abc1234567"):
+            with self.subTest(phone=phone):
+                response = self.client.post("/api/subscription/registrations", json={
+                    "plan_id": "premium_monthly",
+                    "phone_number": phone,
+                    "idempotency_key": str(uuid.uuid4()),
+                    "access_key": secrets.token_urlsafe(32),
+                })
+                self.assertEqual(response.status_code, 422, response.text)
+        with SessionLocal() as db:
+            self.assertEqual(db.query(SubscriptionRegistration).count(), registration_count)
+
+    def test_guest_registration_reports_missing_secure_storage_key(self):
+        payload = {
+            "plan_id": "premium_monthly",
+            "phone_number": "097 123 4567",
+            "idempotency_key": str(uuid.uuid4()),
+            "access_key": secrets.token_urlsafe(32),
+        }
+        with patch.dict(os.environ, {"KITE_SECRET_KEY": ""}):
+            response = self.client.post("/api/subscription/registrations", json=payload)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "KITE_SECRET_KEY is not configured.")
+
+    def test_registration_cancel_and_unconfigured_provider_do_not_activate_premium(self):
+        registration_key = secrets.token_urlsafe(32)
+        registration = self.client.post("/api/subscription/registrations", json={
+            "plan_id": "premium_annual",
+            "phone_number": "0971234567",
+            "idempotency_key": str(uuid.uuid4()),
+            "access_key": registration_key,
+        })
+        self.assertEqual(registration.status_code, 201, registration.text)
+        registration_id = registration.json()["registration_id"]
+        headers = {"X-Kite-Registration-Key": registration_key}
+        initiation = self.client.post(
+            "/api/subscription/registrations/" + registration_id + "/payments",
+            headers=headers,
+            json={"provider_id": "not-configured", "idempotency_key": str(uuid.uuid4())},
+        )
+        self.assertEqual(initiation.status_code, 200, initiation.text)
+        self.assertEqual(initiation.json()["payment"]["status"], "NOT_INITIATED")
+        cancelled = self.client.post(
+            "/api/subscription/registrations/" + registration_id + "/cancel",
+            headers=headers,
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["subscription_status"], "CANCELLED")
+        self.assertEqual(cancelled.json()["payment"]["status"], "CANCELLED")
+        self.assertFalse(cancelled.json()["premium_active"])
+
+    def test_verified_provider_webhook_activates_linked_subscription_once(self):
+        registration_key = secrets.token_urlsafe(32)
+        registered = self.client.post(
+            "/api/subscription/registrations",
+            json={
+                "plan_id": "premium_monthly",
+                "phone_number": "+260 97 123 4567",
+                "idempotency_key": str(uuid.uuid4()),
+                "access_key": registration_key,
+            },
+        )
+        self.assertEqual(registered.status_code, 201, registered.text)
+        registration = registered.json()
+        claimed = self.client.post(
+            "/api/subscription/registrations/" + registration["registration_id"] + "/claim",
+            headers=self.headers,
+            json={"access_key": registration_key},
+        )
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        with SessionLocal() as db:
+            db.add(PaymentProviderConfiguration(
+                provider_id="test-wallet",
+                enabled=True,
+                environment="sandbox",
+                options_json="{}",
+            ))
+            db.commit()
+
+        class MockProvider:
+            provider_id = "test-wallet"
+            display_name = "Test wallet"
+
+            def initiate(self, reference, amount, currency, phone_number):
+                self.initiated = (reference, amount, currency, phone_number)
+                return ProviderPaymentResult(
+                    status=PaymentStatus.SUCCESSFUL,
+                    verified=True,
+                    transaction_reference=reference,
+                    provider_reference="sandbox-payment-1",
+                    amount=amount,
+                    currency=currency,
+                )
+
+            def verify(self, reference, provider_reference):
+                return ProviderPaymentResult(
+                    status=PaymentStatus.SUCCESSFUL,
+                    verified=False,
+                    transaction_reference=reference,
+                    provider_reference=provider_reference,
+                    amount="19.99",
+                    currency="ZMW",
+                )
+
+            def verify_webhook(self, body, headers):
+                self.webhook_body = body
+                return ProviderPaymentResult(
+                    status=PaymentStatus.SUCCESSFUL,
+                    verified=True,
+                    transaction_reference=self.initiated[0],
+                    provider_reference="sandbox-payment-1",
+                    amount="19.99",
+                    currency="ZMW",
+                )
+
+        provider = MockProvider()
+        with patch("backend.app.get_mobile_money_provider", return_value=provider):
+            initiation = self.client.post(
+                "/api/subscription/registrations/" + registration["registration_id"] + "/payments",
+                headers=self.headers,
+                json={"provider_id": "test-wallet", "idempotency_key": str(uuid.uuid4())},
+            )
+            self.assertEqual(initiation.status_code, 200, initiation.text)
+            self.assertEqual(initiation.json()["payment"]["status"], "PROCESSING")
+            self.assertEqual(provider.initiated[3], "+260971234567")
+            self.assertEqual(
+                self.client.get("/api/subscription", headers=self.headers).json()["premium"],
+                False,
+            )
+
+            unverified = self.client.post(
+                "/api/subscription/registrations/" + registration["registration_id"] + "/verify",
+                headers=self.headers,
+            )
+            self.assertEqual(unverified.json()["payment"]["status"], "PROCESSING")
+            self.assertFalse(self.client.get("/api/subscription", headers=self.headers).json()["premium"])
+
+            webhook = self.client.post("/api/payment-webhooks/test-wallet", content=b"signed mock event")
+            self.assertEqual(webhook.status_code, 200, webhook.text)
+            self.assertEqual(webhook.json()["status"], "SUCCESSFUL")
+            repeated_webhook = self.client.post(
+                "/api/payment-webhooks/test-wallet", content=b"signed duplicate mock event",
+            )
+            self.assertEqual(repeated_webhook.status_code, 200, repeated_webhook.text)
+
+        status = self.client.get(
+            "/api/subscription/registrations/" + registration["registration_id"],
+            headers=self.headers,
+        )
+        self.assertEqual(status.json()["subscription_status"], "ACTIVE")
+        self.assertTrue(self.client.get("/api/subscription", headers=self.headers).json()["premium"])
+        with SessionLocal() as db:
+            transaction = db.query(PaymentTransaction).filter_by(
+                registration_id=registration["registration_id"],
+            ).one()
+            self.assertEqual(transaction.status, "SUCCESSFUL")
+            self.assertIsNotNone(transaction.subscription_id)
+            self.assertEqual(
+                db.query(PaymentAttempt).filter_by(transaction_id=transaction.id).count(), 1,
+            )
+            history = db.query(PaymentStatusHistory).filter_by(transaction_id=transaction.id).all()
+            self.assertEqual(
+                [item.status for item in history],
+                ["NOT_INITIATED", "PROCESSING", "SUCCESSFUL"],
+            )
+
     def test_mobile_money_checkout_is_disabled_without_provider_credentials(self):
         with patch.dict(os.environ, {
             "KITE_PAWAPAY_ENABLED": "false",
@@ -1119,11 +1401,25 @@ class KiteApiTests(unittest.TestCase):
             "KITE_PAWAPAY_ENV": "sandbox",
             "KITE_PAWAPAY_API_TOKEN": "sandbox-test-token",
         }
+        registration_key = secrets.token_urlsafe(32)
+        registration = self.client.post(
+            "/api/subscription/registrations",
+            headers=self.headers,
+            json={
+                "plan_id": "premium_monthly",
+                "phone_number": "+260 76 345 6789",
+                "idempotency_key": str(uuid.uuid4()),
+                "access_key": registration_key,
+            },
+        )
+        self.assertEqual(registration.status_code, 201, registration.text)
         payload = {
             "plan_id": "premium_monthly",
             "provider": "MTN_MOMO_ZMB",
             "phone_number": "+260763456789",
             "idempotency_key": payment_idempotency_key,
+            "registration_id": registration.json()["registration_id"],
+            "registration_key": registration_key,
         }
         with patch.dict(os.environ, pawa_env), patch(
             "backend.app.pawapay_request", side_effect=provider_request,
@@ -1165,6 +1461,13 @@ class KiteApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.get("/api/lessons/python-loops", headers=self.headers).status_code, 200,
         )
+        linked_registration = self.client.get(
+            "/api/subscription/registrations/" + registration.json()["registration_id"],
+            headers={"X-Kite-Registration-Key": registration_key},
+        )
+        self.assertEqual(linked_registration.status_code, 200, linked_registration.text)
+        self.assertEqual(linked_registration.json()["subscription_status"], "ACTIVE")
+        self.assertEqual(linked_registration.json()["payment"]["status"], "SUCCESSFUL")
         subscription = self.client.get("/api/subscription", headers=self.headers).json()
         self.assertTrue(subscription["premium"])
         self.assertFalse(subscription["auto_renew"])
