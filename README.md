@@ -5,12 +5,13 @@ Kite is built around the supplied HTML prototype. `web/index.html` is the protot
 ## What is included
 
 - The original Kite screens and navigation, served from the prototype.
-- A FastAPI backend with Supabase Auth integration (plus a local-only password-auth fallback), password reset, profiles, preferences, lessons, progress, XP, streaks, quiz/challenge endpoints, leaderboard and notifications.
+- A FastAPI backend with Supabase Auth integration (plus a local-only password-auth fallback), password reset, profiles, preferences, lessons, progress, XP, streaks, quiz/challenge endpoints, leaderboard and notifications. Guests can browse the leaderboard and their device-local profile/progress, and can submit free quizzes and challenges; guest results are evaluated but are not saved to an account or awarded XP. Personal leaderboard rank and account changes remain sign-in features.
 - A 12-module Python learning path. The six existing lesson entries retain their IDs and content; six new advanced, Premium-gated modules add 48 lessons, 12 quizzes, and 60 server-evaluated coding challenges. The 25 topic quizzes are organized by module, use the same entitlement checks as lessons, connect to the existing coding challenges, and provide explanations and revision links. Every lesson has a context-specific assessment in its Quiz tab, using the existing assessment runner; the Home Assessment Centre catalog remains unchanged. Signed-in attempts and best scores are stored per account; guest attempt history is stored on the current device.
 - SQLite persistence for local development; SQLAlchemy can use Supabase PostgreSQL through `DATABASE_URL`.
 - Premium lesson entitlement checks and Google Play purchase verification through the Android Publisher API. Purchase tokens are encrypted at rest.
+- An opt-in PawaPay mobile-money checkout for prepaid Zambia Premium access. It reuses the existing subscription entitlement checks and records payment attempts separately; it is disabled by default.
 - An independent Python runner service, reachable only on a private internal Docker network. The trusted service runs with narrowly scoped container capabilities; every learner program runs under a separate unprivileged UID with syscall, CPU, memory, process, filesystem and output restrictions. The runner has no network route.
-- The existing Playground editor keeps syntax highlighting and multiline editing, updates line numbers, supports indentation and Run/Save keyboard shortcuts, and provides Run, Stop, Reset, Copy, Save, Clear Console and context-aware Exit controls. Unsaved code/output is retained for the browser session; explicitly saved code is stored on the current device and is not synchronized to the account.
+- The existing Playground editor keeps syntax highlighting and multiline editing, updates line numbers, supports indentation and Run/Save keyboard shortcuts, and provides Run, Stop, Reset, Copy, Save, Clear Console and context-aware Exit controls. Guest and signed-in users can submit code without an authentication redirect; guest cancellation uses a short-lived per-run capability token. Unsaved code/output is retained for the browser session; explicitly saved code is stored on the current device and is not synchronized to the account.
 - A Capacitor Android shell configuration.
 
 Signed-in sessions use HTTP-only, same-site cookies and a per-user CSRF header; access and refresh tokens are not exposed to browser JavaScript or stored in browser storage. Sessions last up to eight hours by default, or 30 days when the learner selects “Keep me signed in on this device.” The server remains the source of truth for account, subscription and authenticated learning data. Guest lesson activity and quiz attempts are device-local and are not synchronized to an account automatically. The prototype itself continues to use browser storage for its original cosmetic theme and demo-only values; server-backed settings are also synchronized through the API.
@@ -31,19 +32,11 @@ Use Python 3.12+, create and activate a virtual environment, then run:
 
 ```powershell
 python -m pip install -r requirements.txt
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-# Edit .env: replace KITE_SECRET_KEY with a unique secret and set DATABASE_URL=sqlite:///./kite.db
-$secretLine = Get-Content .env | Where-Object { $_ -match '^KITE_SECRET_KEY=' } | Select-Object -First 1
-$databaseLine = Get-Content .env | Where-Object { $_ -match '^DATABASE_URL=' } | Select-Object -First 1
-if (-not $secretLine -or -not $databaseLine) { throw "Set KITE_SECRET_KEY and DATABASE_URL in .env." }
-$env:KITE_SECRET_KEY = $secretLine -replace '^KITE_SECRET_KEY=', ''
-$env:DATABASE_URL = $databaseLine -replace '^DATABASE_URL=', ''
-python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
 Keep the same `.env` and `KITE_SECRET_KEY` across server restarts; `.env` is ignored by Git and changing the key invalidates locally issued sign-in tokens.
 
-In this mode authentication, learning and settings endpoints run, but code execution and Stop intentionally report runner-unavailable errors unless a separately isolated runner is configured. Do not execute learner code inside the API process.
+In this mode authentication, learning and settings endpoints run, but code execution and Stop intentionally report runner-unavailable errors unless a separately isolated runner is configured. The Playground does not run its prototype JavaScript interpreter as a Python fallback. Do not execute learner code inside the API process.
 
 ## Google Play subscriptions
 
@@ -55,6 +48,29 @@ In this mode authentication, learning and settings endpoints run, but code execu
 5. Before release, test purchases, pending transactions, restore purchases, grace periods, account hold, expiration, refunds, and cancellation in Play license testing. The Settings screen links to Google Play subscription management and refreshes the authoritative state from the Play API.
 
 Google Play credentials, Play Console products, signing keys, OAuth settings, and production Supabase credentials are deployment-specific and are not included. The `KITE_MONTHLY_PRICE` and `KITE_ANNUAL_PRICE` values control displayed plan text only; Google Play Console controls actual checkout amounts. Keep the storefront product prices and these display values in sync, and do not enable billing until the product prices and native billing bridge are configured and verified. Google Billing purchases and restoration have not been tested because this repository has no native billing bridge or Android project.
+
+## Zambia mobile-money checkout
+
+The optional PawaPay adapter supports the documented Zambia providers `AIRTEL_OAPI_ZMB` (Airtel Money), `MTN_MOMO_ZMB` (MTN MoMo), and `ZAMTEL_ZMB` (Zamtel Kwacha), in ZMW. The backend checks the merchant account's live active configuration, provider availability, amount precision, and transaction limits before starting each deposit. Provider status is then checked server-to-server; the browser cannot grant Premium. The phone number is sent to PawaPay to initiate the wallet payment but is not stored by Kite. Kite never requests or stores a mobile-money PIN.
+
+To configure the integration:
+
+1. Create a PawaPay sandbox merchant account, obtain a sandbox API token, and verify that the account's active configuration enables ZMB deposits for each provider you intend to offer. PawaPay provider availability is merchant-account-specific.
+2. Set `KITE_PAWAPAY_API_TOKEN`, `KITE_PAWAPAY_ENV=sandbox`, and `KITE_PAWAPAY_ENABLED=true`. Set `KITE_PAWAPAY_MONTHLY_AMOUNT` and `KITE_PAWAPAY_ANNUAL_AMOUNT` to the exact numeric ZMW amounts you intend to charge; keep them aligned with `KITE_MONTHLY_PRICE` and `KITE_ANNUAL_PRICE`. Kite rejects prices with more than two decimal places, and the backend checks each provider's current configured limits.
+3. Test accepted, completed, failed, duplicate, unavailable-provider, and delayed/reconciliation outcomes with PawaPay's sandbox test numbers. Kite polls PawaPay's authenticated deposit-status API when the user checks or returns to the checkout; no unauthenticated payment callback is trusted or required. Configure PawaPay not to send callbacks if the account requires an explicit callback preference.
+4. Before enabling production, complete PawaPay merchant onboarding and production-provider activation, use the production API token, set `KITE_PAWAPAY_ENV=production`, and review the current prices, provider fees, settlement arrangement, customer disclosures, applicable Zambian requirements, and refund/support process. Keep `KITE_PAWAPAY_ENABLED=false` until operational and legal review is complete.
+
+Mobile-money purchases are **prepaid**, not automatically renewing: a confirmed monthly payment grants 30 days and a confirmed annual payment grants 365 days. Users must make a new payment to renew. Additional mobile-money purchases extend an unexpired mobile-money term; a user with an active Google Play subscription is directed to manage it in Google Play instead. Kite grants access only after a provider status response confirms the expected deposit ID, completed status, Zambian country, ZMW amount, and selected provider. Unknown or mismatched outcomes remain unentitled for reconciliation. The app does not currently initiate mobile-money refunds; payment disputes or refund requests require the configured support process and remain subject to applicable law.
+
+Provider capability and implementation status:
+
+| Provider | Official PawaPay Zambia listing | Kite integration | Sandbox / production status |
+| --- | --- | --- | --- |
+| Airtel Money (`AIRTEL_OAPI_ZMB`) | ZMB / ZMW; two decimal places | Implemented behind the disabled-by-default PawaPay configuration gate; account active-configuration checks apply | No merchant credentials are available here, so neither a live sandbox transaction nor production checkout has been exercised |
+| MTN MoMo (`MTN_MOMO_ZMB`) | ZMB / ZMW; two decimal places | Implemented behind the disabled-by-default PawaPay configuration gate; account active-configuration checks apply | No merchant credentials are available here, so neither a live sandbox transaction nor production checkout has been exercised |
+| Zamtel Kwacha (`ZAMTEL_ZMB`) | ZMB / ZMW; two decimal places | Implemented behind the disabled-by-default PawaPay configuration gate; account active-configuration checks apply | No merchant credentials are available here, so neither a live sandbox transaction nor production checkout has been exercised |
+
+These listings are based on PawaPay's [official Zambia provider documentation](https://docs.pawapay.io/v2/docs/providers.md), [active configuration API](https://docs.pawapay.io/v2/api-reference/toolkit/active-configuration.md), [deposit guide](https://docs.pawapay.io/v2/docs/deposits.md), [deposit status API](https://docs.pawapay.io/v2/api-reference/deposits/check-deposit-status.md), [sandbox guidance](https://docs.pawapay.io/v2/docs/how_to_start.md), and [go-live checklist](https://docs.pawapay.io/v2/docs/going_live.md), accessed 2026-11-15. Documentation coverage does not guarantee that any provider is enabled on Kite's merchant account or that the service is approved for production.
 
 ## Password reset and auth providers
 
@@ -85,7 +101,7 @@ Install `requirements.txt`, then run:
 python -m unittest discover -s tests -v
 ```
 
-The API tests cover email registration/login and logout revocation, one-time password-reset tokens, provider verification and identity linking, rate limiting, profile/email/password/settings changes, persisted progress and XP idempotency, module/lesson catalogs, quiz scoring and best-score retries, challenge scoring, notification actions, leaderboard periods, Python Pro/Top 10/Bug Hunter achievement tracking, premium access, mocked Google purchase verification/expiry, and ownership-checked Playground cancellation. Runner API tests cover authentication, input bounds, cancellation signaling and fail-closed behavior outside Linux. Browser verification covers editor indentation, syntax highlighting, line-number updates, local save/restore, console clearing and contextual navigation. For release, test real execution and process cleanup in the Linux Docker container and the Play Billing lifecycle against Play test products.
+The API tests cover email registration/login and logout revocation, one-time password-reset tokens, provider verification and identity linking, rate limiting, profile/email/password/settings changes, persisted progress and XP idempotency, module/lesson catalogs, quiz scoring and best-score retries, challenge scoring, notification actions, authenticated and guest leaderboard access, Python Pro/Top 10/Bug Hunter achievement tracking, premium access, mocked Google purchase verification/expiry, and ownership-checked Playground cancellation. Runner API tests cover authentication, input bounds, cancellation signaling and fail-closed behavior outside Linux. Browser verification covers editor indentation, syntax highlighting, line-number updates, local save/restore, console clearing and contextual navigation. For release, test real execution and process cleanup in the Linux Docker container and the Play Billing lifecycle against Play test products.
 
 ## Important release boundary
 

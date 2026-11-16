@@ -9,8 +9,10 @@ import secrets
 import smtplib
 import time
 import base64
+import uuid
 from threading import Lock
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Annotated, Any
@@ -137,6 +139,24 @@ class Subscription(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class MobileMoneyPayment(Base):
+    __tablename__ = "mobile_money_payments"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_mobile_money_user_idempotency"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(36))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    plan_id: Mapped[str] = mapped_column(String(40))
+    amount: Mapped[str] = mapped_column(String(20))
+    provider: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(40))
+    failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class Activity(Base):
     __tablename__ = "activity"
     __table_args__ = (UniqueConstraint("user_id", "kind", "item_id", name="uq_activity_user_kind_item"),)
@@ -161,6 +181,13 @@ class PlaygroundExecution(Base):
     execution_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class GuestPlaygroundExecution(Base):
+    __tablename__ = "guest_playground_executions"
+    execution_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class QuizResult(Base):
@@ -797,6 +824,20 @@ def optional_user(
     return current_user(request, response, authorization, db)
 
 
+def playground_user(
+    request: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+    db: Session = Depends(get_db),
+) -> User | None:
+    try:
+        return optional_user(request, response, authorization, db)
+    except HTTPException as error:
+        if error.status_code == 401:
+            return None
+        raise
+
+
 def premium_entitled(db: Session, user_id: int) -> bool:
     now = utcnow()
     subscriptions = db.scalars(select(Subscription).where(
@@ -969,10 +1010,12 @@ class ResetCompleteIn(BaseModel):
 class RunIn(BaseModel):
     code: str = Field(min_length=1, max_length=20_000)
     execution_id: str | None = Field(default=None, min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    guest_token: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
 
 
 class CancelRunIn(BaseModel):
     execution_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    guest_token: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
 
 
 class ChallengeIn(BaseModel):
@@ -994,6 +1037,15 @@ class GuestProgressImportIn(BaseModel):
 class GooglePurchaseIn(BaseModel):
     product_id: str = Field(min_length=1, max_length=120)
     purchase_token: str = Field(min_length=10, max_length=4096)
+
+
+class MobileMoneyPaymentIn(BaseModel):
+    plan_id: str = Field(pattern=r"^premium_(monthly|annual)$")
+    provider: str = Field(pattern=r"^(AIRTEL_OAPI_ZMB|MTN_MOMO_ZMB|ZAMTEL_ZMB)$")
+    phone_number: str = Field(pattern=r"^\+?260[0-9]{9}$")
+    idempotency_key: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    )
 
 
 class GoogleAuthCodeIn(BaseModel):
@@ -1892,18 +1944,22 @@ def import_guest_progress(payload: GuestProgressImportIn, user: User = Depends(c
 
 
 @app.get("/api/leaderboard")
-def leaderboard(period: str = "all", user: User = Depends(current_user), db: Session = Depends(get_db)):
+def leaderboard(
+    period: str = "all",
+    user: User | None = Depends(optional_user),
+    db: Session = Depends(get_db),
+):
     if period not in {"week", "month", "all"}:
         raise HTTPException(status_code=400, detail="Choose week, month or all.")
     users = list(db.scalars(select(User)))
     scores = leaderboard_scores(period, users, db)
     ranked = sorted(users, key=lambda u: (-scores.get(u.id, 0), u.created_at, u.id))
-    current_rank = next((i for i, u in enumerate(ranked, 1) if u.id == user.id), None)
+    current_rank = next((i for i, u in enumerate(ranked, 1) if u.id == user.id), None) if user else None
     return {
         "period": period,
         "leaders": [{"rank": i, "name": u.name.split()[0], "xp": scores.get(u.id, 0)}
                     for i, u in enumerate(ranked[:10], 1)],
-        "current": {"rank": current_rank, "xp": scores.get(user.id, 0)},
+        "current": {"rank": current_rank, "xp": scores.get(user.id, 0)} if user else None,
     }
 
 
@@ -1949,8 +2005,257 @@ def clear_notifications(user: User = Depends(current_user), db: Session = Depend
     return {"ok": True}
 
 
+PAWAPAY_PROVIDERS = {
+    "AIRTEL_OAPI_ZMB": "Airtel Money",
+    "MTN_MOMO_ZMB": "MTN MoMo",
+    "ZAMTEL_ZMB": "Zamtel Kwacha",
+}
+
+
+def pawapay_enabled() -> bool:
+    return (
+        os.getenv("KITE_PAWAPAY_ENABLED", "").lower() == "true"
+        and bool(os.getenv("KITE_PAWAPAY_API_TOKEN"))
+        and os.getenv("KITE_PAWAPAY_ENV", "sandbox") in {"sandbox", "production"}
+    )
+
+
+def mobile_money_checkout_available() -> bool:
+    if not pawapay_enabled():
+        return False
+    try:
+        pawapay_amount("premium_monthly")
+        pawapay_amount("premium_annual")
+    except HTTPException:
+        return False
+    return True
+
+
+def pawapay_amount(plan_id: str) -> str:
+    env_name = (
+        "KITE_PAWAPAY_MONTHLY_AMOUNT" if plan_id == "premium_monthly"
+        else "KITE_PAWAPAY_ANNUAL_AMOUNT"
+    )
+    default = "19.99" if plan_id == "premium_monthly" else "99.99"
+    try:
+        amount = Decimal(os.getenv(env_name, default))
+    except InvalidOperation as exc:
+        raise HTTPException(status_code=503, detail="Mobile-money pricing is not configured correctly.") from exc
+    if not amount.is_finite() or amount <= 0 or amount != amount.quantize(Decimal("0.01")):
+        raise HTTPException(status_code=503, detail="Mobile-money pricing must be positive and use at most two decimal places.")
+    return format(amount, ".2f")
+
+
+def pawapay_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not pawapay_enabled():
+        raise HTTPException(status_code=503, detail="Mobile-money checkout is not configured.")
+    base_url = (
+        "https://api.pawapay.io" if os.getenv("KITE_PAWAPAY_ENV") == "production"
+        else "https://api.sandbox.pawapay.io"
+    )
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.request(
+                method,
+                base_url + path,
+                headers={"Authorization": "Bearer " + os.environ["KITE_PAWAPAY_API_TOKEN"]},
+                json=payload,
+            )
+    except httpx.HTTPError:
+        log.exception("PawaPay request failed")
+        raise HTTPException(status_code=503, detail="Mobile-money status could not be confirmed. Please check again.")
+    if response.status_code < 200 or response.status_code >= 300:
+        failure = {}
+        try:
+            failure = response.json().get("failureReason", {})
+        except (ValueError, AttributeError):
+            pass
+        log.warning("PawaPay returned HTTP %s, failure code %s", response.status_code, failure.get("failureCode"))
+        raise HTTPException(status_code=503, detail="Mobile-money status could not be confirmed. Please check again.")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        log.warning("PawaPay returned a non-JSON response.")
+        raise HTTPException(status_code=503, detail="Mobile-money status could not be confirmed. Please check again.") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=503, detail="Mobile-money status could not be confirmed. Please check again.")
+    return data
+
+
+def pawapay_deposit_operation(configuration: dict[str, Any], provider: str) -> dict[str, Any] | None:
+    countries = configuration.get("countries")
+    if not isinstance(countries, list):
+        return None
+    country = next(
+        (item for item in countries if isinstance(item, dict) and item.get("country") == "ZMB"),
+        None,
+    )
+    providers = country.get("providers") if isinstance(country, dict) else None
+    if not isinstance(providers, list):
+        return None
+    gateway = next(
+        (item for item in providers if isinstance(item, dict) and item.get("provider") == provider),
+        None,
+    )
+    currencies = gateway.get("currencies") if isinstance(gateway, dict) else None
+    if not isinstance(currencies, list):
+        return None
+    currency = next(
+        (item for item in currencies if isinstance(item, dict) and item.get("currency") == "ZMW"),
+        None,
+    )
+    operations = currency.get("operationTypes") if isinstance(currency, dict) else None
+    operation = operations.get("DEPOSIT") if isinstance(operations, dict) else None
+    return operation if isinstance(operation, dict) else None
+
+
+def pawapay_active_provider_ids() -> list[str]:
+    configuration = pawapay_request(
+        "GET", "/v2/active-conf?country=ZMB&operationType=DEPOSIT",
+    )
+    return [
+        provider for provider in PAWAPAY_PROVIDERS
+        if (operation := pawapay_deposit_operation(configuration, provider))
+        and operation.get("status") == "OPERATIONAL"
+    ]
+
+
+def pawapay_provider_config(provider: str, amount: str) -> None:
+    configuration = pawapay_request(
+        "GET", "/v2/active-conf?country=ZMB&operationType=DEPOSIT",
+    )
+    operation = pawapay_deposit_operation(configuration, provider)
+    if not operation or operation.get("status") != "OPERATIONAL":
+        raise HTTPException(status_code=503, detail="This mobile-money provider is not available for checkout right now.")
+    payment_amount = Decimal(amount)
+    if operation.get("decimalsInAmount") == "NONE" and payment_amount != payment_amount.to_integral_value():
+        raise HTTPException(status_code=503, detail="This mobile-money provider does not accept decimal amounts.")
+    try:
+        minimum = Decimal(operation["minAmount"]) if operation.get("minAmount") is not None else None
+        maximum = Decimal(operation["maxAmount"]) if operation.get("maxAmount") is not None else None
+    except InvalidOperation as exc:
+        raise HTTPException(status_code=503, detail="Mobile-money provider limits could not be verified.") from exc
+    if (minimum is not None and payment_amount < minimum) or (maximum is not None and payment_amount > maximum):
+        raise HTTPException(status_code=503, detail="This plan price is outside the provider's current transaction limits.")
+
+
+def mobile_money_payment_result(payment: MobileMoneyPayment) -> dict[str, Any]:
+    return {
+        "payment_id": payment.id,
+        "plan_id": payment.plan_id,
+        "status": payment.status,
+        "failure_code": payment.failure_code,
+        "currency": "ZMW",
+        "amount": payment.amount,
+    }
+
+
+def settle_mobile_money_payment(payment: MobileMoneyPayment, details: dict[str, Any], db: Session) -> None:
+    payer_details = details.get("payer", {}).get("accountDetails", {})
+    try:
+        details_amount = Decimal(str(details.get("amount")))
+        expected_amount = Decimal(payment.amount)
+    except (InvalidOperation, TypeError):
+        details_amount = Decimal("-1")
+        expected_amount = Decimal(payment.amount)
+    verified = (
+        details.get("depositId") == payment.id
+        and details.get("country") == "ZMB"
+        and details.get("currency") == "ZMW"
+        and details.get("status") == "COMPLETED"
+        and details_amount == expected_amount
+        and payer_details.get("provider") == payment.provider
+    )
+    if not verified:
+        payment.status = "REVIEW_REQUIRED"
+        payment.failure_code = "PAYMENT_DETAILS_MISMATCH"
+        payment.updated_at = utcnow()
+        db.commit()
+        log.error("PawaPay completion did not match payment intent %s.", payment.id)
+        return
+
+    now = utcnow()
+    token_hash = hashlib.sha256(("pawapay:" + payment.id).encode()).hexdigest()
+    subscription = db.scalar(select(Subscription).where(Subscription.token_hash == token_hash))
+    if subscription is None:
+        existing_subscriptions = db.scalars(
+            select(Subscription).where(Subscription.user_id == payment.user_id)
+        )
+        active_mobile_expiries = []
+        for item in existing_subscriptions:
+            expiry = item.expires_at
+            if expiry and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if (
+                item.product_id.startswith("pawapay_")
+                and item.state in {"SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_CANCELED"}
+                and expiry and expiry > now
+            ):
+                active_mobile_expiries.append(expiry)
+        start = max(active_mobile_expiries, default=now)
+        duration = timedelta(days=30 if payment.plan_id == "premium_monthly" else 365)
+        subscription = Subscription(
+            user_id=payment.user_id,
+            product_id="pawapay_" + payment.plan_id,
+            token_hash=token_hash,
+            token_ciphertext=encrypt_purchase_token(payment.id),
+            state="SUBSCRIPTION_STATE_ACTIVE",
+            expires_at=start + duration,
+            auto_renew=False,
+            updated_at=now,
+        )
+        db.add(subscription)
+        period_name = "monthly" if payment.plan_id == "premium_monthly" else "annual"
+        create_notification(
+            db.get(User, payment.user_id), db,
+            event_key="mobile-money-subscription:" + payment.id,
+            title="Kite Premium subscription confirmed",
+            body="Your " + period_name + " prepaid access is active through "
+            + subscription.expires_at.astimezone(timezone.utc).date().isoformat() + ".",
+            category="subscription", target_route="preferences",
+        )
+    payment.status = "COMPLETED"
+    payment.failure_code = None
+    payment.updated_at = now
+    db.commit()
+
+
+def refresh_mobile_money_payment(payment: MobileMoneyPayment, db: Session) -> None:
+    result = pawapay_request("GET", "/v2/deposits/" + quote(payment.id, safe=""))
+    if result.get("status") != "FOUND":
+        return
+    details = result.get("data")
+    if not isinstance(details, dict):
+        return
+    remote_status = details.get("status")
+    if remote_status == "COMPLETED":
+        settle_mobile_money_payment(payment, details, db)
+    elif remote_status == "FAILED":
+        payment.status = "FAILED"
+        reason = details.get("failureReason")
+        payment.failure_code = reason.get("failureCode") if isinstance(reason, dict) else None
+        payment.updated_at = utcnow()
+        db.commit()
+
+
 @app.get("/api/plans")
 def plans():
+    mobile_money_enabled = mobile_money_checkout_available()
+    providers = []
+    mobile_money_message = None
+    if mobile_money_enabled:
+        try:
+            active_providers = pawapay_active_provider_ids()
+        except HTTPException:
+            log.warning("PawaPay provider availability could not be loaded.")
+            mobile_money_message = "Mobile-money provider availability could not be checked. Try again later."
+        else:
+            providers = [
+                {"id": provider, "name": PAWAPAY_PROVIDERS[provider]}
+                for provider in active_providers
+            ]
+            if not providers:
+                mobile_money_message = "No Zambia mobile-money providers are currently enabled and operational on this merchant account."
     return {
         "plans": [
             {"id": "free", "name": "Kite Free", "price": "Free", "period": None, "premium": False},
@@ -1959,7 +2264,14 @@ def plans():
             {"id": "premium_annual", "name": "Kite Premium", "price": os.getenv("KITE_ANNUAL_PRICE", "K99.99"), "period": "year", "premium": True,
              "savings": "K139.89 annually", "percentage_savings": "58.3%", "best_value": True,
              "product_id": os.getenv("KITE_PLAY_ANNUAL_PRODUCT_ID", "kite_premium_annual")},
-        ]
+        ],
+        "mobile_money": {
+            "enabled": mobile_money_enabled and bool(providers),
+            "currency": "ZMW",
+            "renewal": "manual",
+            "providers": providers,
+            "message": mobile_money_message,
+        },
     }
 
 
@@ -1967,11 +2279,143 @@ def plans():
 def subscription(user: User = Depends(current_user), db: Session = Depends(get_db)):
     sub = db.scalar(select(Subscription).where(Subscription.user_id == user.id).order_by(Subscription.updated_at.desc()))
     if not sub:
-        return {"plan": "free", "status": "none", "premium": False, "cancel_url": None}
+        return {"plan": "free", "status": "none", "premium": False, "cancel_url": None,
+                "billing_provider": None}
+    mobile_money = sub.product_id.startswith("pawapay_")
     return {"plan": "premium", "status": sub.state, "premium": premium_entitled(db, user.id),
             "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
             "auto_renew": sub.auto_renew,
-            "cancel_url": "https://play.google.com/store/account/subscriptions"}
+            "cancel_url": None if mobile_money else "https://play.google.com/store/account/subscriptions",
+            "billing_provider": "mobile_money" if mobile_money else "google_play"}
+
+
+@app.post("/api/subscription/mobile-money")
+def create_mobile_money_payment(
+    payload: MobileMoneyPaymentIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    if not mobile_money_checkout_available():
+        raise HTTPException(status_code=503, detail="Mobile-money checkout is not configured.")
+    amount = pawapay_amount(payload.plan_id)
+    phone_number = payload.phone_number.lstrip("+")
+    request_digest = hmac.new(
+        token_key(),
+        (payload.plan_id + "|" + payload.provider + "|" + phone_number).encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    payment = db.scalar(select(MobileMoneyPayment).where(
+        MobileMoneyPayment.user_id == user.id,
+        MobileMoneyPayment.idempotency_key == payload.idempotency_key,
+    ))
+    if payment and not hmac.compare_digest(payment.request_hash, request_digest):
+        raise HTTPException(status_code=409, detail="This payment request was already used for different details.")
+    if payment and payment.status in {"COMPLETED", "FAILED", "REVIEW_REQUIRED"}:
+        return mobile_money_payment_result(payment)
+
+    if payment is None:
+        subscriptions = db.scalars(select(Subscription).where(Subscription.user_id == user.id))
+        now = utcnow()
+        for item in subscriptions:
+            expiry = item.expires_at
+            if expiry and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if (
+                not item.product_id.startswith("pawapay_")
+                and item.state in {"SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD", "SUBSCRIPTION_STATE_CANCELED"}
+                and expiry and expiry > now
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="A Google Play subscription is already active. Manage it through Google Play.",
+                )
+        payment = MobileMoneyPayment(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            idempotency_key=payload.idempotency_key,
+            request_hash=request_digest,
+            plan_id=payload.plan_id,
+            amount=amount,
+            provider=payload.provider,
+            status="INITIATING",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(payment)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            payment = db.scalar(select(MobileMoneyPayment).where(
+                MobileMoneyPayment.user_id == user.id,
+                MobileMoneyPayment.idempotency_key == payload.idempotency_key,
+            ))
+            if payment is None or not hmac.compare_digest(payment.request_hash, request_digest):
+                raise HTTPException(status_code=409, detail="This payment request could not be created safely.")
+            if payment.status in {"COMPLETED", "FAILED", "REVIEW_REQUIRED"}:
+                return mobile_money_payment_result(payment)
+
+    pawapay_provider_config(payment.provider, payment.amount)
+    try:
+        result = pawapay_request("POST", "/v2/deposits", {
+            "depositId": payment.id,
+            "amount": payment.amount,
+            "currency": "ZMW",
+            "payer": {
+                "type": "MMO",
+                "accountDetails": {
+                    "phoneNumber": phone_number,
+                    "provider": payment.provider,
+                },
+            },
+        })
+    except HTTPException:
+        payment.status = "PENDING"
+        payment.updated_at = utcnow()
+        db.commit()
+        return {
+            **mobile_money_payment_result(payment),
+            "message": "Payment submission is unconfirmed. Check its status before trying again.",
+        }
+
+    status = result.get("status")
+    if result.get("depositId") not in {None, payment.id}:
+        payment.status = "REVIEW_REQUIRED"
+        payment.failure_code = "PAYMENT_REFERENCE_MISMATCH"
+    elif status == "REJECTED":
+        payment.status = "FAILED"
+        reason = result.get("failureReason")
+        payment.failure_code = reason.get("failureCode") if isinstance(reason, dict) else None
+    elif status in {"ACCEPTED", "DUPLICATE_IGNORED"}:
+        payment.status = "PENDING"
+        payment.failure_code = None
+    else:
+        payment.status = "PENDING"
+        payment.failure_code = None
+    payment.updated_at = utcnow()
+    db.commit()
+    return mobile_money_payment_result(payment)
+
+
+@app.get("/api/subscription/mobile-money/{payment_id}")
+def get_mobile_money_payment(
+    payment_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    payment = db.get(MobileMoneyPayment, payment_id)
+    if payment is None or payment.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    if payment.status in {"INITIATING", "PENDING"}:
+        refresh_mobile_money_payment(payment, db)
+    result = mobile_money_payment_result(payment)
+    result["premium"] = premium_entitled(db, user.id)
+    if payment.status == "COMPLETED":
+        subscription = db.scalar(select(Subscription).where(
+            Subscription.token_hash == hashlib.sha256(("pawapay:" + payment.id).encode()).hexdigest(),
+        ))
+        result["expires_at"] = subscription.expires_at.isoformat() if subscription and subscription.expires_at else None
+    return result
 
 
 def fetch_google_purchase(product_id: str, purchase_token: str) -> dict[str, Any]:
@@ -2066,6 +2510,30 @@ def refresh_subscription(user: User = Depends(current_user), db: Session = Depen
     sub = db.scalar(select(Subscription).where(Subscription.user_id == user.id).order_by(Subscription.updated_at.desc()))
     if not sub:
         return {"plan": "free", "premium": False, "status": "none"}
+    if sub.product_id.startswith("pawapay_"):
+        expiry = ensure_utc(sub.expires_at) if sub.expires_at else None
+        was_active = premium_entitled(db, user.id)
+        if expiry and expiry <= utcnow() and sub.state == "SUBSCRIPTION_STATE_ACTIVE":
+            sub.state = "SUBSCRIPTION_STATE_EXPIRED"
+            sub.updated_at = utcnow()
+            if was_active:
+                create_notification(
+                    user, db,
+                    event_key="mobile-money-expired:" + str(sub.id),
+                    title="Kite Premium has expired",
+                    body="Your prepaid Premium access has ended. Renew from Settings whenever you are ready.",
+                    category="subscription", target_route="preferences",
+                )
+            db.commit()
+        return {
+            "plan": "premium" if premium_entitled(db, user.id) else "free",
+            "premium": premium_entitled(db, user.id),
+            "status": sub.state,
+            "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
+            "auto_renew": False,
+            "cancel_url": None,
+            "billing_provider": "mobile_money",
+        }
     try:
         purchase_token = decrypt_purchase_token(sub.token_ciphertext)
     except Exception:
@@ -2118,9 +2586,25 @@ async def call_runner(code: str, challenge_id: str | None = None,
     except httpx.HTTPError:
         log.exception("Isolated runner request failed")
         raise HTTPException(status_code=503, detail="The isolated Python runner is unavailable.")
+    if response.status_code == 503:
+        raise HTTPException(status_code=503, detail="Python execution is temporarily unavailable.")
     if response.status_code != 200:
+        log.error("Isolated Python runner returned HTTP %s", response.status_code)
         raise HTTPException(status_code=502, detail="The isolated Python runner returned an error.")
-    return response.json()
+    try:
+        result = response.json()
+    except ValueError as exc:
+        log.error("Isolated Python runner returned invalid JSON")
+        raise HTTPException(status_code=502, detail="The isolated Python runner returned an invalid response.") from exc
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("stdout"), str)
+        or not isinstance(result.get("stderr"), str)
+        or not (result.get("error") is None or isinstance(result.get("error"), str))
+    ):
+        log.error("Isolated Python runner returned an invalid response shape")
+        raise HTTPException(status_code=502, detail="The isolated Python runner returned an invalid response.")
+    return result
 
 
 async def cancel_runner_execution(execution_id: str) -> dict[str, bool]:
@@ -2143,13 +2627,32 @@ async def cancel_runner_execution(execution_id: str) -> dict[str, bool]:
 
 
 @app.post("/api/execution/run")
-async def run_code(payload: RunIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def run_code(payload: RunIn, user: User | None = Depends(playground_user), db: Session = Depends(get_db)):
     execution = None
-    if payload.execution_id:
+    guest_execution = None
+    if user and payload.execution_id:
         if db.get(PlaygroundExecution, payload.execution_id):
             raise HTTPException(status_code=409, detail="Execution ID is already in use.")
         execution = PlaygroundExecution(execution_id=payload.execution_id, user_id=user.id)
         db.add(execution)
+        db.commit()
+    elif user is None:
+        if not payload.execution_id or not payload.guest_token:
+            raise HTTPException(status_code=422, detail="A guest execution ID and token are required.")
+        db.query(GuestPlaygroundExecution).filter(
+            GuestPlaygroundExecution.expires_at <= utcnow(),
+        ).delete(synchronize_session=False)
+        db.commit()
+        if db.get(PlaygroundExecution, payload.execution_id) or db.get(
+            GuestPlaygroundExecution, payload.execution_id,
+        ):
+            raise HTTPException(status_code=409, detail="Execution ID is already in use.")
+        guest_execution = GuestPlaygroundExecution(
+            execution_id=payload.execution_id,
+            token_hash=hashlib.sha256(payload.guest_token.encode()).hexdigest(),
+            expires_at=utcnow() + timedelta(seconds=30),
+        )
+        db.add(guest_execution)
         db.commit()
     try:
         result = await call_runner(payload.code, execution_id=payload.execution_id)
@@ -2157,23 +2660,38 @@ async def run_code(payload: RunIn, user: User = Depends(current_user), db: Sessi
         if execution:
             db.delete(execution)
             db.commit()
-    if result.get("error") and result["error"] != "Execution cancelled.":
-        db.add(PlaygroundError(user_id=user.id))
-        db.commit()
-    elif not result.get("error"):
-        pending_error = db.scalar(select(PlaygroundError).where(
-            PlaygroundError.user_id == user.id, PlaygroundError.fixed_at.is_(None)
-        ).order_by(PlaygroundError.created_at, PlaygroundError.id).limit(1))
-        if pending_error:
-            pending_error.fixed_at = utcnow()
+        if guest_execution:
+            db.delete(guest_execution)
             db.commit()
+    if result.get("error") and result["error"] != "Execution cancelled.":
+        if user:
+            db.add(PlaygroundError(user_id=user.id))
+            db.commit()
+    elif not result.get("error"):
+        if user:
+            pending_error = db.scalar(select(PlaygroundError).where(
+                PlaygroundError.user_id == user.id, PlaygroundError.fixed_at.is_(None)
+            ).order_by(PlaygroundError.created_at, PlaygroundError.id).limit(1))
+            if pending_error:
+                pending_error.fixed_at = utcnow()
+                db.commit()
     return result
 
 
 @app.post("/api/execution/cancel")
-async def cancel_code(payload: CancelRunIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def cancel_code(payload: CancelRunIn, user: User | None = Depends(playground_user), db: Session = Depends(get_db)):
     execution = db.get(PlaygroundExecution, payload.execution_id)
-    if execution is None or execution.user_id != user.id:
+    if execution is not None:
+        if user is None or execution.user_id != user.id:
+            raise HTTPException(status_code=404, detail="Active execution not found.")
+        return await cancel_runner_execution(payload.execution_id)
+    guest_execution = db.get(GuestPlaygroundExecution, payload.execution_id)
+    supplied_hash = hashlib.sha256((payload.guest_token or "").encode()).hexdigest()
+    if (
+        guest_execution is None
+        or ensure_utc(guest_execution.expires_at) <= utcnow()
+        or not hmac.compare_digest(guest_execution.token_hash, supplied_hash)
+    ):
         raise HTTPException(status_code=404, detail="Active execution not found.")
     return await cancel_runner_execution(payload.execution_id)
 
@@ -2200,7 +2718,7 @@ def list_challenges(user: User | None = Depends(optional_user), db: Session = De
 
 
 @app.post("/api/challenges/{challenge_id}/submit")
-async def submit_challenge(challenge_id: str, payload: ChallengeIn, user: User = Depends(current_user),
+async def submit_challenge(challenge_id: str, payload: ChallengeIn, user: User | None = Depends(optional_user),
                            db: Session = Depends(get_db)):
     challenge = CHALLENGES.get(challenge_id)
     if challenge is None:
@@ -2220,28 +2738,35 @@ async def submit_challenge(challenge_id: str, payload: ChallengeIn, user: User =
         })
     passed = all(result["passed"] for result in results)
     awarded = 0
-    challenge_done = db.scalar(select(Activity.id).where(
-        Activity.user_id == user.id,
-        Activity.kind == "challenge",
-        Activity.item_id == challenge_id,
-    )) is not None
-    if passed and not challenge_done:
-        earned_before = {
-            item["id"] for item in achievement_catalog(user, db) if item["earned"]
-        }
-        awarded = challenge["xp"]
-        user.xp += awarded
-        update_streak(user, db)
-        db.add(Activity(user_id=user.id, kind="challenge", item_id=challenge_id, xp=awarded))
-        create_notification(
-            user, db, event_key="challenge-completed:" + challenge_id,
-            title="Challenge completed",
-            body="You passed every test and earned " + str(awarded) + " XP.",
-            category="learning", target_route="challenge",
-        )
-        notify_new_achievements(user, db, earned_before)
-        db.commit()
-    return {"passed": passed, "results": results, "xp_awarded": awarded, "total_xp": user.xp}
+    if user:
+        challenge_done = db.scalar(select(Activity.id).where(
+            Activity.user_id == user.id,
+            Activity.kind == "challenge",
+            Activity.item_id == challenge_id,
+        )) is not None
+        if passed and not challenge_done:
+            earned_before = {
+                item["id"] for item in achievement_catalog(user, db) if item["earned"]
+            }
+            awarded = challenge["xp"]
+            user.xp += awarded
+            update_streak(user, db)
+            db.add(Activity(user_id=user.id, kind="challenge", item_id=challenge_id, xp=awarded))
+            create_notification(
+                user, db, event_key="challenge-completed:" + challenge_id,
+                title="Challenge completed",
+                body="You passed every test and earned " + str(awarded) + " XP.",
+                category="learning", target_route="challenge",
+            )
+            notify_new_achievements(user, db, earned_before)
+            db.commit()
+    return {
+        "passed": passed,
+        "results": results,
+        "guest": user is None,
+        "xp_awarded": awarded,
+        "total_xp": user.xp if user else None,
+    }
 
 
 @app.get("/api/quizzes")

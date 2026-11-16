@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import logging
 import os
@@ -18,8 +19,9 @@ os.environ["RUNNER_SHARED_SECRET"] = "test-runner-secret"
 from fastapi.testclient import TestClient
 
 from backend.app import (
-    Activity, Base, CHALLENGES, LESSONS, LessonProgress, PlaygroundError, PlaygroundExecution,
-    MODULES, QUIZZES, QUIZ_METADATA, QuizAttempt, SessionLocal, User, app, engine, issue_token,
+    Activity, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, LessonProgress,
+    MobileMoneyPayment, PlaygroundError, PlaygroundExecution, MODULES, QUIZZES,
+    QUIZ_METADATA, QuizAttempt, SessionLocal, User, app, engine, issue_token,
 )
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
 
@@ -66,6 +68,17 @@ class KiteApiTests(unittest.TestCase):
         })
         self.assertEqual(login.status_code, 200)
         self.assertEqual(login.json()["user"]["email"], self.email)
+
+    def test_incorrect_login_credentials_do_not_create_a_session(self):
+        response = self.client.post("/api/auth/login", json={
+            "email": self.email,
+            "password": "incorrect-example-password",
+        })
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(response.json()["detail"], "Email or password is incorrect.")
+        self.assertFalse(any(
+            value.startswith("kite_access=") for value in response.headers.get_list("set-cookie")
+        ))
 
     def test_cookie_session_is_http_only_csrf_protected_and_restorable(self):
         email = f"remembered-{uuid.uuid4().hex}@example.com"
@@ -584,6 +597,13 @@ class KiteApiTests(unittest.TestCase):
         invalid = self.client.get("/api/leaderboard?period=year", headers=self.headers)
         self.assertEqual(invalid.status_code, 400)
 
+    def test_guest_can_view_leaderboard_without_personal_rank(self):
+        response = self.client.get("/api/leaderboard?period=week")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["period"], "week")
+        self.assertIsNone(response.json()["current"])
+        self.assertIsInstance(response.json()["leaders"], list)
+
     def test_python_pro_and_top_ten_achievements_use_saved_activity(self):
         with SessionLocal() as db:
             user = db.query(User).filter(User.email == self.email).one()
@@ -872,6 +892,75 @@ class KiteApiTests(unittest.TestCase):
         response = self.client.post("/api/execution/run", headers=self.headers, json={"code": "print('hi')"})
         self.assertEqual(response.status_code, 503)
 
+    def test_empty_playground_code_is_rejected(self):
+        response = self.client.post(
+            "/api/execution/run", headers=self.headers, json={"code": ""},
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_guest_can_run_code_without_an_account(self):
+        code = 'for number in range(1, 4):\n    print(number)'
+        execution_id = uuid.uuid4().hex
+        guest_token = uuid.uuid4().hex + uuid.uuid4().hex
+        with patch("backend.app.call_runner", new_callable=AsyncMock) as run:
+            run.return_value = {"stdout": "1\n2\n3\n", "stderr": "", "error": None}
+            response = self.client.post("/api/execution/run", json={
+                "code": code,
+                "execution_id": execution_id,
+                "guest_token": guest_token,
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"stdout": "1\n2\n3\n", "stderr": "", "error": None})
+        run.assert_awaited_once_with(code, execution_id=execution_id)
+        with SessionLocal() as db:
+            self.assertIsNone(db.get(GuestPlaygroundExecution, execution_id))
+
+    def test_invalid_session_is_treated_as_guest_for_playground_execution(self):
+        execution_id = uuid.uuid4().hex
+        guest_token = uuid.uuid4().hex + uuid.uuid4().hex
+        with patch("backend.app.call_runner", new_callable=AsyncMock) as run:
+            run.return_value = {"stdout": "guest output\n", "stderr": "", "error": None}
+            response = self.client.post(
+                "/api/execution/run",
+                headers={"Authorization": "Bearer expired-or-invalid"},
+                json={
+                    "code": 'print("guest output")',
+                    "execution_id": execution_id,
+                    "guest_token": guest_token,
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["stdout"], "guest output\n")
+        run.assert_awaited_once_with('print("guest output")', execution_id=execution_id)
+
+    def test_guest_execution_cancellation_requires_its_capability_token(self):
+        execution_id = uuid.uuid4().hex
+        guest_token = uuid.uuid4().hex + uuid.uuid4().hex
+        with SessionLocal() as db:
+            db.add(GuestPlaygroundExecution(
+                execution_id=execution_id,
+                token_hash=hashlib.sha256(guest_token.encode()).hexdigest(),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            ))
+            db.commit()
+        with patch("backend.app.cancel_runner_execution", new_callable=AsyncMock) as cancel:
+            cancel.return_value = {"cancelled": True}
+            rejected = self.client.post("/api/execution/cancel", json={
+                "execution_id": execution_id,
+                "guest_token": uuid.uuid4().hex + uuid.uuid4().hex,
+            })
+            accepted = self.client.post("/api/execution/cancel", json={
+                "execution_id": execution_id,
+                "guest_token": guest_token,
+            })
+        self.assertEqual(rejected.status_code, 404)
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertTrue(accepted.json()["cancelled"])
+        cancel.assert_awaited_once_with(execution_id)
+        with SessionLocal() as db:
+            db.delete(db.get(GuestPlaygroundExecution, execution_id))
+            db.commit()
+
     def test_execution_cancellation_is_limited_to_the_owning_user(self):
         other_email = f"other-{uuid.uuid4().hex}@example.com"
         other = self.client.post("/api/auth/register", json={
@@ -951,6 +1040,201 @@ class KiteApiTests(unittest.TestCase):
         self.assertEqual(plans["premium_annual"]["savings"], "K139.89 annually")
         self.assertEqual(plans["premium_annual"]["percentage_savings"], "58.3%")
         self.assertTrue(plans["premium_annual"]["best_value"])
+
+    def test_mobile_money_checkout_is_disabled_without_provider_credentials(self):
+        with patch.dict(os.environ, {
+            "KITE_PAWAPAY_ENABLED": "false",
+            "KITE_PAWAPAY_ENV": "sandbox",
+            "KITE_PAWAPAY_API_TOKEN": "",
+        }):
+            plans = self.client.get("/api/plans")
+            checkout = self.client.post(
+                "/api/subscription/mobile-money",
+                headers=self.headers,
+                json={
+                    "plan_id": "premium_monthly",
+                    "provider": "ZAMTEL_ZMB",
+                    "phone_number": "+260763456789",
+                    "idempotency_key": str(uuid.uuid4()),
+                },
+            )
+        self.assertFalse(plans.json()["mobile_money"]["enabled"])
+        self.assertEqual(plans.json()["mobile_money"]["providers"], [])
+        self.assertEqual(checkout.status_code, 503)
+
+    def test_mobile_money_only_grants_entitlement_after_verified_completion(self):
+        payment_idempotency_key = str(uuid.uuid4())
+        provider_configuration = {
+            "countries": [{
+                "country": "ZMB",
+                "providers": [{
+                    "provider": "MTN_MOMO_ZMB",
+                    "currencies": [{
+                        "currency": "ZMW",
+                        "operationTypes": {
+                            "DEPOSIT": {
+                                "status": "OPERATIONAL",
+                                "minAmount": "1",
+                                "maxAmount": "20000",
+                                "decimalsInAmount": "TWO_PLACES",
+                            },
+                        },
+                    }],
+                }],
+            }],
+        }
+        accepted = {"depositId": None, "status": "ACCEPTED"}
+        duplicate = {"depositId": None, "status": "DUPLICATE_IGNORED"}
+
+        def provider_request(method, path, payload=None):
+            if method == "GET" and path.endswith("active-conf?country=ZMB&operationType=DEPOSIT"):
+                return provider_configuration
+            if method == "POST" and path == "/v2/deposits":
+                response = dict(accepted if provider_request.calls == 0 else duplicate)
+                response["depositId"] = payload["depositId"]
+                provider_request.deposit_id = payload["depositId"]
+                provider_request.calls += 1
+                return response
+            if method == "GET" and path == "/v2/deposits/" + provider_request.deposit_id:
+                return {
+                    "status": "FOUND",
+                    "data": {
+                        "depositId": provider_request.deposit_id,
+                        "status": "COMPLETED",
+                        "amount": "19.99",
+                        "currency": "ZMW",
+                        "country": "ZMB",
+                        "payer": {
+                            "type": "MMO",
+                            "accountDetails": {"provider": "MTN_MOMO_ZMB"},
+                        },
+                    },
+                }
+            raise AssertionError("Unexpected provider request: " + method + " " + path)
+
+        provider_request.calls = 0
+        provider_request.deposit_id = ""
+        pawa_env = {
+            "KITE_PAWAPAY_ENABLED": "true",
+            "KITE_PAWAPAY_ENV": "sandbox",
+            "KITE_PAWAPAY_API_TOKEN": "sandbox-test-token",
+        }
+        payload = {
+            "plan_id": "premium_monthly",
+            "provider": "MTN_MOMO_ZMB",
+            "phone_number": "+260763456789",
+            "idempotency_key": payment_idempotency_key,
+        }
+        with patch.dict(os.environ, pawa_env), patch(
+            "backend.app.pawapay_request", side_effect=provider_request,
+        ) as request:
+            plan_response = self.client.get("/api/plans")
+            self.assertTrue(plan_response.json()["mobile_money"]["enabled"])
+            self.assertEqual(
+                plan_response.json()["mobile_money"]["providers"],
+                [{"id": "MTN_MOMO_ZMB", "name": "MTN MoMo"}],
+            )
+            started = self.client.post(
+                "/api/subscription/mobile-money", headers=self.headers, json=payload,
+            )
+            self.assertEqual(started.status_code, 200, started.text)
+            self.assertEqual(started.json()["status"], "PENDING")
+            self.assertEqual(
+                self.client.get("/api/lessons/python-loops", headers=self.headers).status_code, 402,
+            )
+
+            repeated = self.client.post(
+                "/api/subscription/mobile-money", headers=self.headers, json=payload,
+            )
+            self.assertEqual(repeated.status_code, 200, repeated.text)
+            self.assertEqual(repeated.json()["payment_id"], started.json()["payment_id"])
+            self.assertEqual(provider_request.calls, 2)
+
+            confirmed = self.client.get(
+                "/api/subscription/mobile-money/" + started.json()["payment_id"],
+                headers=self.headers,
+            )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(confirmed.json()["status"], "COMPLETED")
+        self.assertTrue(confirmed.json()["premium"])
+        expires_at = datetime.fromisoformat(confirmed.json()["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        self.assertGreater(expires_at, datetime.now(timezone.utc) + timedelta(days=29))
+        self.assertLess(expires_at, datetime.now(timezone.utc) + timedelta(days=31))
+        self.assertEqual(
+            self.client.get("/api/lessons/python-loops", headers=self.headers).status_code, 200,
+        )
+        subscription = self.client.get("/api/subscription", headers=self.headers).json()
+        self.assertTrue(subscription["premium"])
+        self.assertFalse(subscription["auto_renew"])
+        self.assertIsNone(subscription["cancel_url"])
+        self.assertEqual(subscription["billing_provider"], "mobile_money")
+        with SessionLocal() as db:
+            payment = db.get(MobileMoneyPayment, started.json()["payment_id"])
+            self.assertEqual(payment.status, "COMPLETED")
+            self.assertFalse(hasattr(payment, "phone_number"))
+        self.assertEqual(request.call_count, 6)
+
+    def test_mobile_money_does_not_grant_on_mismatched_completed_deposit(self):
+        provider_configuration = {
+            "countries": [{
+                "country": "ZMB",
+                "providers": [{
+                    "provider": "ZAMTEL_ZMB",
+                    "currencies": [{
+                        "currency": "ZMW",
+                        "operationTypes": {"DEPOSIT": {
+                            "status": "OPERATIONAL",
+                            "minAmount": "1",
+                            "maxAmount": "20000",
+                            "decimalsInAmount": "TWO_PLACES",
+                        }},
+                    }],
+                }],
+            }],
+        }
+        def provider_request(method, path, payload=None):
+            if method == "GET" and path.endswith("active-conf?country=ZMB&operationType=DEPOSIT"):
+                return provider_configuration
+            if method == "POST":
+                provider_request.deposit_id = payload["depositId"]
+                return {"depositId": payload["depositId"], "status": "ACCEPTED"}
+            return {
+                "status": "FOUND",
+                "data": {
+                    "depositId": provider_request.deposit_id,
+                    "status": "COMPLETED",
+                    "amount": "9.99",
+                    "currency": "ZMW",
+                    "country": "ZMB",
+                    "payer": {"accountDetails": {"provider": "ZAMTEL_ZMB"}},
+                },
+            }
+
+        provider_request.deposit_id = ""
+        pawa_env = {
+            "KITE_PAWAPAY_ENABLED": "true",
+            "KITE_PAWAPAY_ENV": "sandbox",
+            "KITE_PAWAPAY_API_TOKEN": "sandbox-test-token",
+        }
+        with patch.dict(os.environ, pawa_env), patch(
+            "backend.app.pawapay_request", side_effect=provider_request,
+        ):
+            started = self.client.post("/api/subscription/mobile-money", headers=self.headers, json={
+                "plan_id": "premium_monthly",
+                "provider": "ZAMTEL_ZMB",
+                "phone_number": "260763456789",
+                "idempotency_key": str(uuid.uuid4()),
+            })
+            confirmed = self.client.get(
+                "/api/subscription/mobile-money/" + started.json()["payment_id"],
+                headers=self.headers,
+            )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(confirmed.json()["status"], "REVIEW_REQUIRED")
+        self.assertFalse(confirmed.json()["premium"])
+        self.assertEqual(self.client.get("/api/subscription", headers=self.headers).json()["plan"], "free")
 
     def test_google_sign_in_requires_supabase_configuration(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -1043,6 +1327,25 @@ class KiteApiTests(unittest.TestCase):
         self.assertTrue(first.json()["passed"])
         self.assertEqual(first.json()["xp_awarded"], 100)
         self.assertEqual(second.json()["xp_awarded"], 0)
+
+    def test_guest_can_submit_free_challenge_without_saved_xp(self):
+        with patch("backend.app.call_runner", new_callable=AsyncMock) as run:
+            run.return_value = {"stdout": "Hello, World!\n", "stderr": "", "error": None}
+            response = self.client.post(
+                "/api/challenges/hello-world/submit",
+                json={"code": 'print("Hello, World!")'},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["passed"])
+        self.assertTrue(response.json()["guest"])
+        self.assertEqual(response.json()["xp_awarded"], 0)
+        self.assertIsNone(response.json()["total_xp"])
+        with SessionLocal() as db:
+            user = db.query(User).filter_by(email=self.email).one()
+            self.assertEqual(db.query(Activity).filter_by(
+                user_id=user.id, kind="challenge", item_id="hello-world",
+            ).count(), 0)
 
 
 if __name__ == "__main__":

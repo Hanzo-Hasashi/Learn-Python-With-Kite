@@ -4,6 +4,8 @@
   var tokenKey = "kite.accessToken";
   var refreshKey = "kite.refreshToken";
   var pendingPlanKey = "kite.pendingSubscriptionPeriod";
+  var mobileMoneyPaymentKey = "kite.mobileMoneyPaymentId";
+  var mobileMoneyIdempotencyKey = "kite.mobileMoneyIdempotencyKey";
   var subscriptionReturnKey = "kite.subscriptionReturn";
   var googleVerifierKey = "kite.googleCodeVerifier";
   var authDestinationKey = "kite.authDestination";
@@ -26,14 +28,12 @@
   var completedQuizResultKey = "kite.completedQuizResult";
   var guestQuizAttemptsKey = "kite.guestQuizAttempts.v1";
   var quizDraftsKey = "kite.quizDrafts.v1";
-  var protectedRoutes = {
-    leaderboard: true,
-    profile: true
-  };
+  var launchViews = ["sign-up", "log-in", "reset", "welcome"];
   var knownRoutes = ["about", "challenge", "home", "launch", "leaderboard", "learn", "lesson",
     "notifications", "playground", "preferences", "profile", "progress", "quiz"];
   var refreshInFlight = null;
   var authRestoration = null;
+  var authStateVersion = 0;
   var authUser = null;
   var authCsrf = "";
   var busy = false;
@@ -41,6 +41,12 @@
   var activePlaygroundRun = null;
   var routeUser = null;
   var shellUserRequest = null;
+
+  function routeKeyFromHash(hashValue) {
+    var raw = (hashValue || "").replace(/^#/, "");
+    var queryIndex = raw.indexOf("?");
+    return queryIndex >= 0 ? raw.slice(0, queryIndex) : raw;
+  }
 
   function token() {
     return authUser ? "cookie-session" : null;
@@ -92,6 +98,10 @@
     });
   }
   function navigate(route, replace) {
+    if (launchViews.indexOf(route) >= 0) {
+      if (window.location.hash !== "#" + route) window.location.hash = "#" + route;
+      return;
+    }
     var preservingLessonQuiz = route === "playground" && sessionStorage.getItem(lessonQuizContextKey);
     if (route !== "quiz" && route !== "challenge" && route !== "lesson" && !preservingLessonQuiz) {
       sessionStorage.removeItem(quizEntryModeKey);
@@ -100,6 +110,7 @@
     else window.location.hash = "#" + route;
   }
   function clearAuthTokens() {
+    authStateVersion += 1;
     sessionStorage.removeItem(tokenKey);
     sessionStorage.removeItem(refreshKey);
     sessionStorage.removeItem(rememberMeKey);
@@ -121,7 +132,8 @@
     }
     return Boolean(checkbox && checkbox.checked);
   }
-  function acceptAuthSession(data) {
+  function acceptAuthSession(data, expectedVersion) {
+    if (expectedVersion !== undefined && expectedVersion !== authStateVersion) return authUser;
     authUser = data && data.user ? data.user : null;
     authCsrf = data && data.csrf_token ? data.csrf_token : "";
     setMoreMenuAuthState(Boolean(authUser));
@@ -129,11 +141,15 @@
   }
   function restoreAuthentication() {
     if (authRestoration) return authRestoration;
+    var restorationVersion = authStateVersion;
     function fetchCurrentSession() {
+      if (restorationVersion !== authStateVersion) return Promise.resolve(authUser);
       return fetch((window.KITE_API_BASE || "") + "/api/auth/session", {
         method: "GET",
         credentials: "include"
-      }).then(responseData).then(acceptAuthSession);
+      }).then(responseData).then(function (data) {
+        return acceptAuthSession(data, restorationVersion);
+      });
     }
     var legacyAccessToken = sessionStorage.getItem(tokenKey);
     var legacyRefreshToken = sessionStorage.getItem(refreshKey);
@@ -154,7 +170,7 @@
         })
       }).then(responseData).then(function (data) {
         clearLegacyTokens();
-        return acceptAuthSession(data);
+        return acceptAuthSession(data, restorationVersion);
       }).catch(function (error) {
         if (error.status !== 401) throw error;
         clearLegacyTokens();
@@ -163,6 +179,7 @@
       authRestoration = migration.then(function (restored) {
         return restored || fetchCurrentSession();
       }).catch(function (error) {
+        if (restorationVersion !== authStateVersion) return authUser;
         if (error.status === 401) {
           clearAuthTokens();
           return null;
@@ -172,6 +189,7 @@
       });
     } else {
       authRestoration = fetchCurrentSession().catch(function (error) {
+        if (restorationVersion !== authStateVersion) return authUser;
         if (error.status === 401) {
           clearAuthTokens();
           return null;
@@ -185,7 +203,7 @@
   function signInForRoute(route) {
     if (knownRoutes.indexOf(route) >= 0) sessionStorage.setItem(authDestinationKey, route);
     sessionStorage.setItem(authModeKey, "login");
-    navigate("launch", true);
+    navigate("log-in");
   }
   function responseData(response) {
     return response.json().catch(function () { return {}; }).then(function (data) {
@@ -217,17 +235,36 @@
     return refreshInFlight;
   }
   function api(path, body, method) {
+    var sessionIndependentAuth = path === "/api/auth/login" ||
+      path.indexOf("/api/auth/google/") === 0;
+    var authRequestTimeout = sessionIndependentAuth ? 30000 : 0;
     function send(retried) {
       var headers = { "Content-Type": "application/json" };
       if (token() && authCsrf && (method || (body ? "POST" : "GET")) !== "GET") {
         headers["X-Kite-CSRF"] = authCsrf;
       }
-      return fetch((window.KITE_API_BASE || "") + path, {
+      var controller = authRequestTimeout && typeof AbortController !== "undefined"
+        ? new AbortController() : null;
+      var request = fetch((window.KITE_API_BASE || "") + path, {
         method: method || (body ? "POST" : "GET"),
         credentials: "include",
         headers: headers,
-        body: body ? JSON.stringify(body) : undefined
-      })
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller ? controller.signal : undefined
+      });
+      var timeoutId;
+      if (authRequestTimeout) {
+        var timedOut = new Promise(function (resolve, reject) {
+          timeoutId = setTimeout(function () {
+            if (controller) controller.abort();
+            reject(new Error("Sign-in request timed out. Check your connection and try again."));
+          }, authRequestTimeout);
+        });
+        request = Promise.race([request, timedOut]).finally(function () {
+          clearTimeout(timeoutId);
+        });
+      }
+      return request
         .then(function (response) {
           var isAuthRequest = path.indexOf("/api/auth/") === 0;
           if (response.status === 401 && !retried && token() && !isAuthRequest) {
@@ -239,7 +276,8 @@
           return responseData(response);
         });
     }
-    return (authRestoration || Promise.resolve()).catch(function () { return null; })
+    var ready = sessionIndependentAuth ? Promise.resolve() : (authRestoration || Promise.resolve());
+    return ready.catch(function () { return null; })
       .then(function () { return send(false); });
   }
   function tell(doc, text, isError) {
@@ -444,12 +482,6 @@
       );
     }
   }
-  function recordGuestPlaygroundRun(doc) {
-    if (token()) return;
-    var progress = readGuestProgress(doc);
-    progress.playground_runs = Math.min(progress.playground_runs + 1, 10000);
-    writeGuestProgress(doc, progress);
-  }
   function addGuestProgressPrompt(doc, container, isHome) {
     if (!token() || !container || container.querySelector(".kite-guest-progress")) return;
     var progress = readGuestProgress(doc);
@@ -527,6 +559,7 @@
     addGuestProgressPrompt(doc, body, false);
   }
   function completeAuthentication(doc, data, destination) {
+    authStateVersion += 1;
     authUser = data.user || null;
     authCsrf = data.csrf_token || "";
     authRestoration = Promise.resolve(authUser);
@@ -557,9 +590,9 @@
         .forEach(function (key) { sessionStorage.removeItem(key); });
       clearAuthTokens();
       if (doc && doc.getElementById("sbody")) {
-        doc.defaultView.location.hash = "#welcome";
+        navigate("welcome");
         if (error) setTimeout(function () { tell(doc, "Signed out on this device, but server session revocation failed.", true); }, 0);
-      } else navigate("launch");
+      } else navigate("welcome");
     }
     if (!token()) {
       finish();
@@ -585,7 +618,7 @@
       sessionStorage.removeItem(googleVerifierKey);
       cleanAuthCallbackUrl();
       if (type === "recovery") {
-        doc.defaultView.location.hash = "#reset";
+        navigate("reset");
         setTimeout(function () {
           tell(doc, "This password-reset link is invalid or expired. Request a new one and try again.", true);
         }, 0);
@@ -643,7 +676,7 @@
     if (period) sessionStorage.setItem(pendingPlanKey, period);
     sessionStorage.setItem(subscriptionReturnKey, "preferences");
     sessionStorage.setItem(authModeKey, "login");
-    navigate("launch");
+    navigate("log-in");
   }
   function base64UrlEncode(value) {
     var bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
@@ -655,7 +688,7 @@
     if (!window.crypto || !window.crypto.subtle) {
       return Promise.reject(new Error("Secure Google sign-in is unavailable in this browser."));
     }
-    if (doc.defaultView.location.hash === "#sign-up" && !sessionStorage.getItem(authDestinationKey)) {
+    if (routeKeyFromHash(doc.defaultView.location.hash) === "sign-up" && !sessionStorage.getItem(authDestinationKey)) {
       sessionStorage.setItem(authDestinationKey, "home");
     }
     sessionStorage.setItem(rememberMeKey, String(rememberChoice(doc, form)));
@@ -838,7 +871,7 @@
         body.querySelector("[data-kite-login]").addEventListener("click", function () {
           window.history.replaceState(null, "", window.location.pathname);
           sessionStorage.setItem(authModeKey, "login");
-          navigate("launch");
+          navigate("log-in");
         });
       }).catch(function (error) { tell(doc, friendlyAuthMessage(error, "reset"), true); })
         .finally(function () {
@@ -900,11 +933,11 @@
       addToHeading("header h1");
     }
   }
-  function createPlaygroundExecutionId(win) {
+  function createPlaygroundExecutionId(win, byteLength) {
     if (!win.crypto || typeof win.crypto.getRandomValues !== "function") {
       throw new Error("Secure random IDs are unavailable in this browser.");
     }
-    var bytes = new Uint8Array(16);
+    var bytes = new Uint8Array(byteLength || 16);
     win.crypto.getRandomValues(bytes);
     return Array.prototype.map.call(bytes, function (value) {
       return value.toString(16).padStart(2, "0");
@@ -1123,7 +1156,10 @@
       if (!active || active.doc !== doc) return;
       stop.disabled = true;
       stop.textContent = "Stopping…";
-      api("/api/execution/cancel", { execution_id: active.id }).then(function (result) {
+      api("/api/execution/cancel", {
+        execution_id: active.id,
+        guest_token: active.guestToken
+      }).then(function (result) {
         if (!result.cancelled) {
           stop.disabled = false;
           stop.textContent = "Stop";
@@ -1178,7 +1214,7 @@
           title: "5. Premium plans and payments",
           paragraphs: [
             "The current advertised Premium prices are K19.99 per month and K99.99 per year. Twelve monthly payments at the advertised rate total K239.88; the annual plan is K139.89 less (approximately 58.3%). The purchase screen and Google Play checkout, when available, show the terms that apply to your transaction.",
-            "Purchases are processed through Google Play, not by Kite collecting your card details. A Premium entitlement is applied only after the purchase has been verified by the Service. Renewal, cancellation, payment method and refund arrangements are handled through Google Play and are subject to its purchase terms and applicable law. The app may be unable to offer checkout where its Google Play billing or product configuration is unavailable."
+            "Where enabled, Google Play purchases are verified by the Service and are managed through Google Play, including automatic renewal, cancellation, payment method and refund arrangements under its terms and applicable law. Where enabled, Zambian mobile-money payments are processed through PawaPay and the selected mobile-money provider. Each confirmed mobile-money payment is a one-time prepaid purchase for 30 days or 365 days; it does not automatically renew, and a new payment is required to extend access. Never enter a mobile-money PIN in Kite. A Premium entitlement is applied only after the Service verifies a completed payment. Contact Kite support about a payment discrepancy or refund request; mobile-money refunds are not currently available in-app and remain subject to applicable law. Checkout is unavailable unless its payment provider and merchant configuration are enabled."
           ]
         },
         {
@@ -1222,7 +1258,7 @@
             "Account information: the name and email address you provide, an account identifier, and authentication information. With local authentication, the server stores a salted password hash rather than the plaintext password. If Supabase authentication is configured, Supabase handles sign-in credentials and the app receives account information needed to provide your Kite account.",
             "Learning and activity information: lesson completion and scores, quiz or challenge activity, XP, streaks, achievement progress and activity timestamps. Quiz answers are processed to calculate a result; the app records each quiz's best score and XP rather than keeping the submitted answer list. Challenge results may be recorded as activity.",
             "Profile and preferences: account name and settings such as theme, language and the notification preference. The browser may also retain display-only profile customizations, such as a nickname or avatar color.",
-            "Subscription information: selected product, verification state, expiry and renewal state. When Google Play verification is configured, the server receives the purchase token for verification and stores a hash and an encrypted copy for subscription checks. Kite does not receive or store your Google Play payment-card number.",
+            "Subscription information: selected product, verification state, expiry and renewal state. When Google Play verification is configured, the server receives the purchase token for verification and stores a hash and an encrypted copy for subscription checks. When mobile-money checkout is enabled, Kite sends the phone number you enter and payment amount/provider details to PawaPay to request a payment; Kite does not store that phone number or collect your mobile-money PIN. Kite stores the provider transaction reference, selected plan, amount, status and timestamps needed to reconcile the payment and entitlement.",
             "Code and technical information: code is sent to the configured execution service when you choose Run or submit a coding challenge. The Kite database records challenge results and counts of Playground runs that fail and are later corrected, but not the submitted source code. The hosting or web server may log operational request information such as IP address, requested path, time and response status.",
             "Support information: if you contact us by email or telephone, the details and message you choose to provide are handled by the relevant communications provider. Contact Us does not submit a message to or store one in the Kite app."
           ]
@@ -1242,7 +1278,7 @@
         {
           title: "5. Storage and service providers",
           paragraphs: [
-            "Account and learning records are stored in the database configured for the deployment. Local development defaults to SQLite; a deployment may use a configured PostgreSQL database. The app can also use Supabase for authentication, Google for OAuth sign-in when enabled, Google Play for purchase verification, an SMTP provider for password-reset email, and a separate runner for code execution. The app also requests fonts from Google Fonts; that request can expose ordinary connection details such as your IP address to Google.",
+            "Account and learning records are stored in the database configured for the deployment. Local development defaults to SQLite; a deployment may use a configured PostgreSQL database. The app can also use Supabase for authentication, Google for OAuth sign-in when enabled, Google Play for purchase verification, PawaPay and the selected mobile-money provider for payments when enabled, an SMTP provider for password-reset email, and a separate runner for code execution. The app also requests fonts from Google Fonts; that request can expose ordinary connection details such as your IP address to Google.",
             "Authentication tokens and short-lived sign-in/navigation state are kept in browser session storage. Some interface preferences and profile customizations are kept in browser local storage. These are browser storage mechanisms, not a Kite account export or backup. Other providers may use their own cookies or storage under their own policies.",
             "These providers receive information only as needed for the feature they provide, or where disclosure is required by law. Their processing, security practices and data locations are governed by their own terms and configuration. The current app code contains no advertising or analytics integration and does not sell personal information."
           ]
@@ -1355,8 +1391,21 @@
     group.innerHTML = "<div class=\"row\"><span class=\"l\" id=\"kite-plan-state\">Kite Free</span><span class=\"val\">Current plan</span></div>" +
       "<button class=\"row\" type=\"button\" id=\"kite-monthly\"><span class=\"l\">Kite Premium · Monthly</span><span class=\"val\">Subscribe</span></button>" +
       "<button class=\"row\" type=\"button\" id=\"kite-annual\"><span class=\"l\">Kite Premium · Annual <span id=\"kite-best-value\" style=\"display:inline-block;margin-left:6px;padding:2px 7px;border-radius:10px;background:#e8f5ed;color:#267447;font-size:11px;font-weight:600;white-space:nowrap\">Best Value</span><span id=\"kite-annual-savings\" style=\"display:block;margin-top:3px;font-size:12px;font-weight:500\">Save K139.89 annually · 58.3% less</span></span><span class=\"val\">Subscribe</span></button>" +
+      "<p class=\"sub\" style=\"padding:12px 16px 0\">Premium unlocks the full learning path, including premium lessons, topic quizzes, and coding challenges.</p>" +
+      "<p class=\"sub\" id=\"kite-plan-summary\" aria-live=\"polite\" style=\"padding:8px 16px 0\">Current plan: Kite Free. No subscription is active.</p>" +
+      "<p class=\"sub\" style=\"padding:8px 16px 0\">Subscription registration uses your Kite account name and email. Zambia mobile-money checkout, when enabled, requires a +260 phone number.</p>" +
+      "<div id=\"kite-mm-preview\" style=\"padding:12px 16px;border-top:1px solid var(--line)\"><label for=\"kite-mm-preview-phone\" style=\"display:block;margin-bottom:5px\">Zambian mobile-money number</label><input id=\"kite-mm-preview-phone\" type=\"tel\" autocomplete=\"tel\" inputmode=\"tel\" placeholder=\"+260XXXXXXXXX\" disabled aria-describedby=\"kite-mm-preview-note\" style=\"box-sizing:border-box;width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--page);color:var(--mut)\"><p class=\"sub\" id=\"kite-mm-preview-note\" style=\"margin:7px 0 0\">Unavailable until a mobile-money provider is configured. No payment will be requested.</p></div>" +
       "<button class=\"row\" type=\"button\" id=\"kite-sign-in\"><span class=\"l\">Sign in to continue</span><span class=\"val\">Sign in</span></button>" +
       "<button class=\"row\" type=\"button\" id=\"kite-manage\"><span class=\"l\">Manage subscription</span><span class=\"val\">Google Play</span></button>" +
+      "<div id=\"kite-mobile-money\" hidden style=\"padding:16px;border-top:1px solid #e8e8e8\">" +
+      "<p style=\"margin:0 0 12px\">Pay once with Airtel Money, MTN MoMo, or Zamtel Kwacha. Premium access is prepaid and does not auto-renew.</p>" +
+      "<label for=\"kite-mm-provider\" style=\"display:block;margin:10px 0 5px\">Mobile-money provider</label>" +
+      "<select id=\"kite-mm-provider\" style=\"width:100%;padding:10px;border:1px solid #ccc;border-radius:8px\"><option value=\"\">Choose a provider</option></select>" +
+      "<label for=\"kite-mm-phone\" style=\"display:block;margin:10px 0 5px\">Zambian mobile-money number (e.g. +260…)</label>" +
+      "<input id=\"kite-mm-phone\" type=\"tel\" autocomplete=\"tel\" inputmode=\"tel\" placeholder=\"+260XXXXXXXXX\" style=\"box-sizing:border-box;width:100%;padding:10px;border:1px solid #ccc;border-radius:8px\">" +
+      "<button id=\"kite-mm-pay\" type=\"button\" style=\"margin-top:12px;padding:10px 14px\">Continue to payment</button>" +
+      "<button id=\"kite-mm-check\" type=\"button\" hidden style=\"margin:12px 0 0 8px;padding:10px 14px\">Check payment status</button>" +
+      "<p id=\"kite-mm-status\" role=\"status\" aria-live=\"polite\" style=\"margin:10px 0 0\"></p></div>" +
       "<p class=\"sub\" id=\"kite-billing-note\" style=\"padding:0 16px 12px\">Purchases are verified by Google Play.</p>";
     var appPreferences = Array.prototype.find.call(main.querySelectorAll("h2"), function (item) { return item.textContent.trim() === "App Preferences"; });
     if (appPreferences) main.insertBefore(heading, appPreferences);
@@ -1365,7 +1414,7 @@
     else main.appendChild(group);
     var signIn = doc.getElementById("kite-sign-in");
     var manage = doc.getElementById("kite-manage");
-    if (signIn) signIn.style.display = token() ? "none" : "flex";
+    if (signIn) signIn.style.display = "none";
     if (manage) manage.style.display = token() ? "flex" : "none";
     api("/api/plans").then(function (result) {
       ["monthly", "annual"].forEach(function (period) {
@@ -1379,6 +1428,33 @@
           if (savings) savings.textContent = "Save " + plan.savings + " · " + plan.percentage_savings + " less";
         }
       });
+      var mobileMoney = doc.getElementById("kite-mobile-money");
+      if (mobileMoney && result.mobile_money) {
+        mobileMoney.dataset.enabled = String(Boolean(result.mobile_money.enabled));
+        var mobileMoneyPreview = doc.getElementById("kite-mm-preview");
+        if (mobileMoneyPreview) mobileMoneyPreview.hidden = Boolean(result.mobile_money.enabled);
+        var providerSelect = doc.getElementById("kite-mm-provider");
+        (result.mobile_money.providers || []).forEach(function (item) {
+          var option = doc.createElement("option");
+          option.value = item.id;
+          option.textContent = item.name;
+          providerSelect.appendChild(option);
+        });
+        if (result.mobile_money.message) {
+          var note = doc.getElementById("kite-billing-note");
+          if (note && token()) note.textContent = result.mobile_money.message;
+        }
+      }
+      var billing = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.KiteBilling;
+      var billingAvailable = Boolean(billing && typeof billing.purchase === "function");
+      var mobileMoneyAvailable = Boolean(result.mobile_money && result.mobile_money.enabled);
+      var note = doc.getElementById("kite-billing-note");
+      if (signIn) signIn.style.display = !token() && (billingAvailable || mobileMoneyAvailable) ? "flex" : "none";
+      if (!billingAvailable && !mobileMoneyAvailable) {
+        if (note) note.textContent = "No payment provider is configured. Choosing a plan will not charge you or activate Premium.";
+      } else if (!token() && note) {
+        note.textContent = "Sign in with your Kite account to register for a plan. Premium starts only after payment is verified.";
+      }
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
       if (/sign in|session has expired/i.test(error.message)) {
@@ -1387,15 +1463,27 @@
       }
       if (note) note.textContent = error.message;
     });
-    if (!token()) {
-      var note = doc.getElementById("kite-billing-note");
-      if (note) note.textContent = "Sign in to subscribe. Purchases are verified by Google Play.";
-    } else api("/api/subscription").then(function (data) {
+    if (token()) api("/api/subscription").then(function (data) {
       var state = doc.getElementById("kite-plan-state");
       if (state) state.textContent = data.premium ? "Kite Premium" : "Kite Free";
+      var summary = doc.getElementById("kite-plan-summary");
+      if (summary) {
+        summary.textContent = data.premium
+          ? "Current plan: Kite Premium. " + (data.auto_renew ? "Automatic renewal is enabled." : "This prepaid plan does not auto-renew.")
+          : "Current plan: Kite Free. No subscription is active.";
+      }
+      var manageValue = manage && manage.querySelector(".val");
+      if (manageValue && data.billing_provider === "mobile_money") {
+        manageValue.textContent = "Manual renewal";
+      } else if (manageValue && data.billing_provider === "google_play") {
+        manageValue.textContent = "Google Play";
+      }
       if (data.expires_at) {
         var note = doc.getElementById("kite-billing-note");
-        note.textContent = (data.auto_renew ? "Renews" : "Access ends") + " " + new Date(data.expires_at).toLocaleDateString();
+        note.textContent = (data.billing_provider === "mobile_money"
+          ? "Prepaid, does not auto-renew. Access ends"
+          : data.auto_renew ? "Renews" : "Access ends") +
+          " " + new Date(data.expires_at).toLocaleDateString();
       }
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
@@ -1406,6 +1494,160 @@
     var pendingPeriod = sessionStorage.getItem(pendingPlanKey);
     if (pendingPeriod === "monthly" || pendingPeriod === "annual") {
       doc.getElementById("kite-" + pendingPeriod).click();
+    }
+    bindMobileMoneyCheckout(doc);
+  }
+
+  function openMobileMoneyCheckout(doc, period) {
+    var panel = doc.getElementById("kite-mobile-money");
+    var status = doc.getElementById("kite-mm-status");
+    if (!panel || panel.dataset.enabled !== "true") return false;
+    sessionStorage.removeItem(pendingPlanKey);
+    panel.hidden = false;
+    panel.dataset.planId = "premium_" + period;
+    if (status) {
+      status.textContent = "Enter the wallet number for " + (period === "annual" ? "annual" : "monthly") +
+        " prepaid access. Approve the payment on your phone; never enter your PIN here.";
+    }
+    var provider = doc.getElementById("kite-mm-provider");
+    if (provider) provider.focus();
+    return true;
+  }
+
+  function createMobileMoneyIdempotencyKey(doc) {
+    var cryptoApi = doc.defaultView.crypto;
+    if (!cryptoApi || typeof cryptoApi.getRandomValues !== "function") {
+      throw new Error("Secure mobile-money checkout is unavailable in this browser.");
+    }
+    if (typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID();
+    var bytes = new Uint8Array(16);
+    cryptoApi.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    var hex = Array.prototype.map.call(bytes, function (byte) {
+      return byte.toString(16).padStart(2, "0");
+    }).join("");
+    return hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) +
+      "-" + hex.slice(16, 20) + "-" + hex.slice(20);
+  }
+
+  function bindMobileMoneyCheckout(doc) {
+    var panel = doc.getElementById("kite-mobile-money");
+    var pay = doc.getElementById("kite-mm-pay");
+    var check = doc.getElementById("kite-mm-check");
+    var status = doc.getElementById("kite-mm-status");
+    if (!panel || !pay || !check || !status) return;
+    var paymentId = sessionStorage.getItem(mobileMoneyPaymentKey);
+    var pollCount = 0;
+    var pollTimer = null;
+
+    function pollPayment() {
+      if (!paymentId) return;
+      check.hidden = false;
+      check.disabled = true;
+      status.textContent = "Checking payment status…";
+      api("/api/subscription/mobile-money/" + encodeURIComponent(paymentId)).then(function (result) {
+        check.disabled = false;
+        if (result.status === "COMPLETED" && result.premium) {
+          sessionStorage.removeItem(mobileMoneyPaymentKey);
+          sessionStorage.removeItem(mobileMoneyIdempotencyKey);
+          var planState = doc.getElementById("kite-plan-state");
+          if (planState) planState.textContent = "Kite Premium";
+          status.textContent = "Payment confirmed. Prepaid Premium access is active" +
+            (result.expires_at ? " until " + new Date(result.expires_at).toLocaleDateString() : "") +
+            ". It will not auto-renew.";
+          var billingNote = doc.getElementById("kite-billing-note");
+          if (billingNote) billingNote.textContent = "Prepaid, does not auto-renew. Access ends" +
+            (result.expires_at ? " " + new Date(result.expires_at).toLocaleDateString() : "");
+          check.hidden = true;
+          pay.disabled = false;
+          paymentId = null;
+          return;
+        }
+        if (result.status === "FAILED") {
+          sessionStorage.removeItem(mobileMoneyPaymentKey);
+          sessionStorage.removeItem(mobileMoneyIdempotencyKey);
+          status.textContent = "The payment was not completed. You can try again." +
+            (result.failure_code ? " (" + result.failure_code + ")" : "");
+          check.hidden = true;
+          pay.disabled = false;
+          paymentId = null;
+          return;
+        }
+        if (result.status === "REVIEW_REQUIRED") {
+          sessionStorage.removeItem(mobileMoneyPaymentKey);
+          sessionStorage.removeItem(mobileMoneyIdempotencyKey);
+          status.textContent = "The provider reported a payment that Kite could not verify. Premium access was not granted; contact support.";
+          check.hidden = true;
+          pay.disabled = true;
+          paymentId = null;
+          return;
+        }
+        status.textContent = "Payment is still processing. Approve it on your phone; Kite will enable Premium only after confirmation.";
+        pollCount += 1;
+        if (pollCount < 15) pollTimer = setTimeout(pollPayment, 4000);
+        else status.textContent += " Use Check payment status to check again.";
+      }).catch(function (error) {
+        check.disabled = false;
+        status.textContent = error.message + " You can safely check again.";
+      });
+    }
+
+    pay.addEventListener("click", function () {
+      var provider = doc.getElementById("kite-mm-provider");
+      var phone = doc.getElementById("kite-mm-phone");
+      var planId = panel.dataset.planId;
+      if (!planId || !provider || !provider.value || !phone || !phone.value.trim()) {
+        status.textContent = "Choose a provider and enter a Zambian mobile-money number.";
+        return;
+      }
+      var idempotencyKey = sessionStorage.getItem(mobileMoneyIdempotencyKey);
+      try {
+        if (!idempotencyKey) {
+          idempotencyKey = createMobileMoneyIdempotencyKey(doc);
+          sessionStorage.setItem(mobileMoneyIdempotencyKey, idempotencyKey);
+        }
+      } catch (error) {
+        status.textContent = error.message;
+        return;
+      }
+      pay.disabled = true;
+      status.textContent = "Submitting payment request…";
+      api("/api/subscription/mobile-money", {
+        plan_id: planId,
+        provider: provider.value,
+        phone_number: phone.value.trim(),
+        idempotency_key: idempotencyKey
+      }).then(function (result) {
+        paymentId = result.payment_id;
+        sessionStorage.setItem(mobileMoneyPaymentKey, paymentId);
+        pollCount = 0;
+        if (result.status === "FAILED") {
+          sessionStorage.removeItem(mobileMoneyPaymentKey);
+          sessionStorage.removeItem(mobileMoneyIdempotencyKey);
+          pay.disabled = false;
+          status.textContent = "The provider could not start this payment." +
+            (result.failure_code ? " (" + result.failure_code + ")" : "");
+          return;
+        }
+        if (pollTimer) clearTimeout(pollTimer);
+        pollPayment();
+      }).catch(function (error) {
+        pay.disabled = false;
+        status.textContent = error.message;
+      });
+    });
+    check.addEventListener("click", function () {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollCount = 0;
+      pollPayment();
+    });
+
+    if (paymentId) {
+      panel.hidden = false;
+      pay.disabled = true;
+      status.textContent = "Checking your pending mobile-money payment…";
+      pollPayment();
     }
   }
       function setText(doc, selector, text) {
@@ -2990,8 +3232,16 @@
             row.append(rank, avatar, name, xp);
             list.appendChild(row);
           });
+          if (!data.leaders.length) {
+            var empty = doc.createElement("li");
+            empty.className = "empty";
+            empty.textContent = "No leaderboard activity yet.";
+            list.appendChild(empty);
+          }
           var current = doc.getElementById("you");
-          if (current) current.textContent = "You · Rank " + data.current.rank + " · " + data.current.xp.toLocaleString() + " XP";
+          if (current) current.textContent = data.current
+            ? "You · Rank " + data.current.rank + " · " + data.current.xp.toLocaleString() + " XP"
+            : "Sign in to see your personal rank.";
         }).catch(function (error) { tell(doc, error.message, true); });
       }
       function renderNotificationItems(doc, items, category, unread, guest) {
@@ -3140,7 +3390,19 @@
         } catch (error) { console.error("Could not save Kite notification preferences locally.", error); }
       }
       function hydrateProfilePanel(doc, panelType) {
-        api("/api/progress").then(function (data) {
+        var progressRequest = token()
+          ? api("/api/progress")
+          : api("/api/modules").then(function (modules) {
+            var data = guestProgressSnapshot(doc, modules);
+            var local = readGuestProgress(doc);
+            data.activities = local.completed_lessons.map(function (id) {
+              return { kind: "lesson", item_id: id, at: null, xp: 0 };
+            }).concat(local.started_lessons.map(function (id) {
+              return { kind: "lesson-started", item_id: id, at: null, xp: 0 };
+            }));
+            return data;
+          });
+        progressRequest.then(function (data) {
           var sheet = doc.getElementById("sh");
           if (!sheet) return;
           if (panelType === "achievements") {
@@ -3173,7 +3435,12 @@
             "sum-variables": "Sum of two numbers",
             "count-to-five": "Count to five"
           };
-          var descriptions = { lesson: "Completed lesson", quiz: "Completed quiz", challenge: "Solved challenge" };
+          var descriptions = {
+            lesson: "Completed lesson",
+            "lesson-started": "Started lesson",
+            quiz: "Completed quiz",
+            challenge: "Solved challenge"
+          };
           list.textContent = "";
           if (!data.activities.length) {
             var empty = doc.createElement("li");
@@ -3192,28 +3459,81 @@
             title.textContent = (descriptions[activity.kind] || "Learning activity") + " " +
               (titles[activity.item_id] || activity.item_id);
             var date = doc.createElement("small");
-            date.textContent = new Date(activity.at).toLocaleDateString();
+            date.textContent = activity.at
+              ? new Date(activity.at).toLocaleDateString()
+              : "Saved on this device";
             details.append(title, date);
             var xp = doc.createElement("span");
             xp.className = "xp";
-            xp.textContent = "+" + activity.xp + " XP";
+            xp.textContent = activity.xp > 0 ? "+" + activity.xp + " XP" : "Guest activity";
             item.append(icon, details, xp);
             list.appendChild(item);
+          });
+        }).catch(function (error) { tell(doc, error.message, true); });
+      }
+      function hydrateProfile(doc, me) {
+        var name = me ? me.name : "Guest";
+        setText(doc, "#nm", name);
+        var description = doc.querySelector(".who p");
+        if (description) description.textContent = me
+          ? me.email
+          : "Progress is stored on this device";
+        var avatar = doc.getElementById("av");
+        if (avatar) avatar.textContent = me ? name.trim().charAt(0).toUpperCase() : "G";
+        doc.documentElement.dataset.kiteName = name;
+        var progressRequest = me
+          ? api("/api/progress")
+          : api("/api/modules").then(function (modules) {
+            return guestProgressSnapshot(doc, modules);
+          });
+        progressRequest.then(function (data) {
+          var stats = doc.querySelector(".stats");
+          if (!stats) return;
+          Array.prototype.forEach.call(stats.children, function (tile) {
+            var label = tile.querySelector("small");
+            var value = tile.querySelector("b");
+            if (!label || !value) return;
+            var key = label.textContent.trim();
+            if (key === "Level" || key === "Lessons") {
+              label.textContent = "Lessons";
+              value.textContent = data.completed_lessons.length + " / " + data.total_lessons;
+            } else if (key === "XP") {
+              value.textContent = Number(data.xp).toLocaleString();
+            } else if (key === "Streak") {
+              value.textContent = me ? String(data.streak) : "Not tracked";
+            }
           });
         }).catch(function (error) { tell(doc, error.message, true); });
       }
   function bindSubscriptionButtons(doc) {
     ["monthly", "annual"].forEach(function (period) {
       doc.getElementById("kite-" + period).addEventListener("click", function () {
-        if (!token()) {
-          requestSubscriptionSignIn(period);
-          return;
-        }
         api("/api/plans").then(function (data) {
-          var plan = data.plans.find(function (item) { return item.id === "premium_" + period; });
           var billing = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.KiteBilling;
-          if (!billing || typeof billing.purchase !== "function" || !plan.product_id) {
-            throw new Error("Google Play Billing must be configured in the Android build before you can subscribe.");
+          var billingAvailable = Boolean(billing && typeof billing.purchase === "function");
+          var mobileMoneyAvailable = Boolean(data.mobile_money && data.mobile_money.enabled);
+          var note = doc.getElementById("kite-billing-note");
+          var summary = doc.getElementById("kite-plan-summary");
+          if (summary) {
+            summary.textContent = "Selected plan: Kite Premium · " +
+              (period === "annual" ? "Annual" : "Monthly") +
+              ". Your current access will not change until a payment is verified.";
+          }
+          if (!billingAvailable && !mobileMoneyAvailable) {
+            if (note) note.textContent = "No payment provider is configured. Choosing a plan will not charge you or activate Premium.";
+            return;
+          }
+          if (!token()) {
+            requestSubscriptionSignIn(period);
+            return;
+          }
+          var plan = data.plans.find(function (item) { return item.id === "premium_" + period; });
+          if (!billingAvailable) {
+            if (mobileMoneyAvailable && openMobileMoneyCheckout(doc, period)) return;
+            throw new Error("Mobile-money checkout is not available for this plan.");
+          }
+          if (!plan || !plan.product_id) {
+            throw new Error("The selected Google Play plan is not configured.");
           }
           return billing.purchase({ productId: plan.product_id }).then(function (purchase) {
             return api("/api/subscription/google/verify", {
@@ -3238,6 +3558,11 @@
         var state = doc.getElementById("kite-plan-state");
         if (state) state.textContent = data.premium ? "Kite Premium" : "Kite Free";
         if (data.cancel_url) parent.open(data.cancel_url, "_blank", "noopener");
+        else if (data.premium && data.billing_provider === "mobile_money") {
+          var note = doc.getElementById("kite-billing-note");
+          if (note) note.textContent = "Your prepaid mobile-money access does not auto-renew. Renew manually from Settings." +
+            (data.expires_at ? " Access ends " + new Date(data.expires_at).toLocaleDateString() + "." : "");
+        }
         else tell(doc, "You are on the free plan.", false);
       }).catch(function (error) { tell(doc, error.message, true); });
     });
@@ -3246,6 +3571,28 @@
     if (!doc || doc.documentElement.dataset.kiteBridge) return;
     doc.documentElement.dataset.kiteBridge = "ready";
     var route = (location.hash || "#launch").slice(1);
+    var routeKey = routeKeyFromHash(route);
+    var routeParams = new URLSearchParams(route);
+    var authCallback = routeParams.has("access_token") || routeParams.has("error") ||
+      routeParams.has("error_description") || routeParams.get("type") === "recovery" ||
+      routeParams.has("token");
+    if (knownRoutes.indexOf(routeKey) < 0 && launchViews.indexOf(routeKey) < 0 && !authCallback) {
+      route = "launch";
+      routeKey = "launch";
+      var state = window.history.state;
+      var sequence = state && state.kiteRoute === route && Number.isInteger(state.kiteSequence)
+        ? state.kiteSequence : 0;
+      window.history.replaceState({ kiteRoute: route, kiteSequence: sequence }, "",
+        window.location.pathname + window.location.search + "#" + route);
+    }
+    if (launchViews.indexOf(routeKey) >= 0) {
+      if (doc.defaultView.location.hash !== (window.location.hash || "#" + routeKey)) {
+        doc.defaultView.location.hash = window.location.hash || "#" + routeKey;
+      }
+      route = "launch";
+      routeKey = "launch";
+    }
+    if (authCallback) route = "launch";
     var sessionReady = restoreAuthentication();
     if (route.indexOf("access_token=") === 0 || route.indexOf("error=") === 0) route = "launch";
     applyPythonBranding(doc, route);
@@ -3254,9 +3601,10 @@
     doc.defaultView.addEventListener("click", function (event) {
       var target = event.target.closest && event.target.closest("button, a");
       if (!target) return;
-      if (route === "launch" && (target.getAttribute("href") === "#sign-up" || target.getAttribute("href") === "#log-in")) {
+      var authHref = target.getAttribute("href");
+      if (route === "launch" && authHref && launchViews.indexOf(routeKeyFromHash(authHref)) >= 0) {
         event.preventDefault();
-        doc.defaultView.location.hash = target.getAttribute("href");
+        window.location.hash = authHref;
         return;
       }
       if (route === "learn" && target.dataset.kiteLesson) {
@@ -3567,7 +3915,7 @@
           }
         };
         if (pendingEmail) doc.defaultView.addEventListener("hashchange", fillLoginEmail, { once: true });
-        doc.defaultView.location.hash = "#log-in";
+        navigate("log-in");
         if (pendingEmail) setTimeout(fillLoginEmail, 50);
         return;
       }
@@ -3636,27 +3984,38 @@
         api("/api/settings", { theme: target.dataset.v }, "PATCH").catch(function (error) { tell(doc, error.message, true); });
       }
       if (route === "playground" && target.id === "run") {
-        var editor = doc.getElementById("code");
-        var output = doc.getElementById("out");
-        if (!editor || !output) return;
-        if (!token()) {
-          recordGuestPlaygroundRun(doc);
-          if (!sessionStorage.getItem("kite.guestPlaygroundNotice")) {
-            sessionStorage.setItem("kite.guestPlaygroundNotice", "shown");
-            tell(doc, "Guest mode runs code on this device; it is not synced to your Kite account.", false);
-          }
-          return;
-        }
         event.preventDefault();
         event.stopImmediatePropagation();
+        var editor = doc.getElementById("code");
+        var output = doc.getElementById("out");
+        if (!editor || !output) {
+          tell(doc, "The Python editor is unavailable. Reload the Playground and try again.", true);
+          return;
+        }
+        var submittedCode = editor.value;
+        if (!submittedCode.trim()) {
+          output.textContent = "Enter Python code before running.";
+          sessionStorage.setItem(playgroundOutputKey, output.textContent);
+          tell(doc, "Enter Python code before running.", true);
+          return;
+        }
         if (activePlaygroundRun) return;
         var executionId;
-        try { executionId = createPlaygroundExecutionId(doc.defaultView); }
+        var guestExecutionToken;
+        try {
+          executionId = createPlaygroundExecutionId(doc.defaultView);
+          guestExecutionToken = createPlaygroundExecutionId(doc.defaultView, 32);
+        }
         catch (error) {
           tell(doc, error.message, true);
           return;
         }
-        var runState = { id: executionId, doc: doc, cancelled: false };
+        var runState = {
+          id: executionId,
+          doc: doc,
+          cancelled: false,
+          guestToken: guestExecutionToken
+        };
         activePlaygroundRun = runState;
         var stopButton = doc.getElementById("kite-stop");
         if (stopButton) {
@@ -3670,16 +4029,28 @@
         target.disabled = true;
         output.textContent = "Running…";
         sessionStorage.setItem(playgroundOutputKey, "Running…");
-        api("/api/execution/run", { code: editor.value, execution_id: executionId }).then(function (result) {
+        api("/api/execution/run", {
+          code: submittedCode,
+          execution_id: executionId,
+          guest_token: guestExecutionToken
+        }).then(function (result) {
           if (runState.cancelled) output.textContent = "Execution stopped.";
-          else output.textContent = [result.stdout, result.stderr, result.error].filter(Boolean).join("\n");
+          else {
+            if (!result || typeof result.stdout !== "string" || typeof result.stderr !== "string" ||
+                !(result.error === null || typeof result.error === "string")) {
+              throw new Error("The Python runner returned an invalid response.");
+            }
+            var outputParts = [];
+            if (result.stdout) outputParts.push(result.stdout);
+            if (result.stderr) outputParts.push("stderr:\n" + result.stderr);
+            if (result.error) outputParts.push("Execution failed: " + result.error);
+            else outputParts.push(outputParts.length
+              ? "Execution completed."
+              : "Execution completed with no output.");
+            output.textContent = outputParts.join("\n\n");
+          }
           sessionStorage.setItem(playgroundOutputKey, output.textContent);
         }).catch(function (error) {
-          if (error.status === 401) {
-            sessionStorage.setItem(pendingPlaygroundCodeKey, editor.value);
-            signInForRoute("playground");
-            return;
-          }
           output.textContent = error.message;
           sessionStorage.setItem(playgroundOutputKey, output.textContent);
         }).finally(function () {
@@ -3721,12 +4092,6 @@
         var editor = doc.getElementById("ed");
         var results = doc.getElementById("res");
         if (!editor || !results) return;
-        if (!token()) {
-          sessionStorage.setItem("kite.challengeId", challengeId);
-          sessionStorage.setItem(pendingChallengeCodeKey, editor.value);
-          signInForRoute("challenge");
-          return;
-        }
         results.textContent = "";
         setText(doc, "#tc", "Running tests...");
         api("/api/challenges/" + encodeURIComponent(challengeId) + "/submit", { code: editor.value }).then(function (result) {
@@ -3739,18 +4104,15 @@
             results.appendChild(line);
           });
           if (result.passed) {
-            setText(doc, "#wt", "Challenge complete!");
-            setText(doc, "#wp", "+" + result.xp_awarded + " XP");
-            setText(doc, "#wtot", "Total: " + result.total_xp + " XP");
+            setText(doc, "#wt", result.guest ? "Challenge passed!" : "Challenge complete!");
+            setText(doc, "#wp", result.guest ? "Guest attempt · 0 XP" : "+" + result.xp_awarded + " XP");
+            setText(doc, "#wtot", result.guest
+              ? "Sign in later to save challenge progress and earn XP."
+              : "Total: " + result.total_xp + " XP");
             var win = doc.getElementById("win");
             if (win) win.classList.add("on");
           }
         }).catch(function (error) {
-          if (error.status === 401) {
-            sessionStorage.setItem(pendingChallengeCodeKey, editor.value);
-            signInForRoute("challenge");
-            return;
-          }
           setText(doc, "#tc", error.message);
         });
         return;
@@ -3920,41 +4282,10 @@
         if (token()) hydrateNotifications(doc, "all");
         else hydrateGuestNotifications(doc, "all");
       }
+      if (route === "profile") {
+        hydrateProfile(doc, me);
+      }
       if (route === "profile" && me) {
-        var name = doc.getElementById("nm");
-        if (name) name.textContent = me.name;
-        var avatar = doc.getElementById("av");
-        if (avatar) avatar.textContent = me.name.trim().charAt(0).toUpperCase();
-        doc.documentElement.dataset.kiteName = me.name;
-        var stats = doc.querySelector(".stats");
-        if (stats) {
-          Array.prototype.forEach.call(stats.children, function (tile) {
-            var label = tile.querySelector("small");
-            var value = tile.querySelector("b");
-            if (!label || !value) return;
-            if (label.textContent.trim() === "Level" || label.textContent.trim() === "Lessons") {
-              label.textContent = "Lessons";
-              value.textContent = "—";
-            }
-            if (label.textContent.trim() === "XP") value.textContent = Number(me.xp).toLocaleString();
-            if (label.textContent.trim() === "Streak") {
-              var icon = value.querySelector("svg");
-              if (icon) {
-                while (value.firstChild && value.firstChild !== icon) value.removeChild(value.firstChild);
-                value.insertBefore(doc.createTextNode(String(me.streak) + " "), icon);
-              } else value.textContent = String(me.streak);
-            }
-          });
-          api("/api/progress").then(function (progress) {
-            Array.prototype.forEach.call(stats.children, function (tile) {
-              var label = tile.querySelector("small");
-              var value = tile.querySelector("b");
-              if (label && value && label.textContent.trim() === "Lessons") {
-                value.textContent = progress.completed_lessons.length + " / " + progress.total_lessons;
-              }
-            });
-          }).catch(function (error) { tell(doc, error.message, true); });
-        }
         try {
           var profile = JSON.parse(parent.localStorage.getItem("kiteprof") || "{}");
           profile.name = me.name;
@@ -3965,13 +4296,23 @@
     }
 
     if (route === "launch") {
+      function syncLaunchSubroute() {
+        if (frame.contentDocument !== doc) return;
+        var subrouteHash = window.location.hash || "#launch";
+        var subroute = routeKeyFromHash(subrouteHash);
+        if (launchViews.indexOf(subroute) >= 0 && doc.defaultView.location.hash !== subrouteHash) {
+          doc.defaultView.location.hash = subrouteHash;
+        }
+      }
+      window.addEventListener("hashchange", syncLaunchSubroute);
+      syncLaunchSubroute();
       watchRegistrationForm(doc);
       if (handleAuthCallback(doc)) return;
       if (!resetToken() &&
           (sessionStorage.getItem(authModeKey) === "login" ||
            sessionStorage.getItem(subscriptionReturnKey) === "preferences")) {
         sessionStorage.removeItem(authModeKey);
-        doc.defaultView.location.hash = "#log-in";
+        navigate("log-in");
       }
       var passwordResetCredential = resetToken();
       var callbackType = new URLSearchParams(window.location.hash.slice(1)).get("type");
@@ -3980,7 +4321,7 @@
         showPasswordReset(doc, passwordResetCredential);
       } else if (callbackType === "recovery") {
         cleanAuthCallbackUrl();
-        doc.defaultView.location.hash = "#reset";
+        navigate("reset");
         setTimeout(function () {
           tell(doc, "This password-reset link is invalid or expired. Request a new one and try again.", true);
         }, 0);
@@ -4002,7 +4343,7 @@
         }
         return;
       }
-      if (protectedRoutes[route] || (route === "home" && token())) {
+      if (route === "home" && token()) {
         if (!token()) {
           signInForRoute(route);
           return;
@@ -4035,7 +4376,7 @@
       if (route !== "launch") hydrateRouteData(null);
     }).catch(function (error) {
       tell(doc, "Kite couldn't confirm your saved session. Check your connection and try again.", true);
-      if (route !== "launch" && !protectedRoutes[route]) hydrateRouteData(null);
+      if (route !== "launch") hydrateRouteData(null);
     });
     ["b-terms", "b-priv", "b-con"].forEach(function (id) {
       var button = doc.getElementById(id);
@@ -4049,9 +4390,24 @@
   }
   function bind() {
     if (!frame) return;
+    function syncAuthSubroute() {
+      var hashValue = window.location.hash || "";
+      var subroute = routeKeyFromHash(hashValue);
+      if (launchViews.indexOf(subroute) < 0 || !frame.contentWindow) return;
+      if (frame.contentWindow.location.hash !== hashValue) {
+        frame.contentWindow.location.hash = hashValue;
+      }
+    }
     frame.addEventListener("load", function () {
-      try { install(frame.contentDocument); } catch (error) { console.error("Kite bridge could not attach.", error); }
+      try {
+        install(frame.contentDocument);
+        syncAuthSubroute();
+        frame.style.opacity = "1";
+      } catch (error) {
+        console.error("Kite bridge could not attach.", error);
+      }
     });
+    window.addEventListener("hashchange", syncAuthSubroute);
     try { if (frame.contentDocument && frame.contentDocument.readyState === "complete") install(frame.contentDocument); } catch (error) { console.error("Kite bridge could not attach.", error); }
   }
   ensureMoreMenuActions();
@@ -4064,7 +4420,7 @@
       sessionStorage.removeItem(authDestinationKey);
       sessionStorage.removeItem(subscriptionReturnKey);
       sessionStorage.setItem(authModeKey, "login");
-      navigate("launch", true);
+      navigate("log-in");
       return;
     }
     var exitGuest = event.target.closest && event.target.closest("#pn button.kite-menu-exit-guest");
@@ -4076,7 +4432,7 @@
       sessionStorage.removeItem(subscriptionReturnKey);
       clearAuthTokens();
       hydrateShellUser(frame && frame.contentDocument, null);
-      navigate("launch", true);
+      navigate("welcome");
       return;
     }
     var target = event.target.closest && event.target.closest("#pn button.out");
