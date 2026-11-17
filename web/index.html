@@ -45,6 +45,8 @@ body{padding-left:224px}
 .mo{align-items:center}
 .pn{width:min(440px,calc(100vw - 48px));max-height:min(80vh,720px);margin:auto;border-radius:24px;padding-bottom:16px}
 }
+body.kite-entry-flow{padding-left:0}
+body.kite-entry-flow .desk-nav{display:none}
 </style>
 <link rel="stylesheet" href="/assets/playground-shortcut.css">
 </head>
@@ -117,6 +119,7 @@ var CH='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="curr
 [["Profile","profile"],["Notifications","notifications"],["Leaderboard","leaderboard"],["Challenges","challenge"],["Quizzes","quiz"],["Settings","preferences"],["Help & About","about"],["Log Out","launch","out"]].forEach(function(x){
  var b=document.createElement("button");b.className=x[2]||"";b.setAttribute("data-r",x[1]);b.innerHTML="<span>"+x[0].replace("&","&amp;")+"</span>"+CH;pn.appendChild(b)});
 function theme(){try{return JSON.parse(localStorage.getItem("kiteset")||"{}").theme||"system"}catch(e){return"system"}}
+function isEntryRoute(r){return ["launch","welcome","sign-up","log-in","reset"].indexOf(r)>=0}
 function route(){var r=(location.hash||"#launch").slice(1);return DOCS[r]?r:"launch"}
 var routeHistoryKey="kite.routeHistory",routeHistory=[],routeSequence=0;
 function saveRouteHistory(){try{sessionStorage.setItem(routeHistoryKey,JSON.stringify(routeHistory.slice(-100)))}catch(e){console.error("Could not save Kite navigation history.",e)}}
@@ -167,6 +170,7 @@ function goBack(){
 window.kiteGoBack=goBack;
 function show(){
  var r=route();if(r===cur)return;cur=r;closeMore();
+ document.body.classList.toggle("kite-entry-flow",isEntryRoute(r));
  deskNav.querySelectorAll("[data-r]").forEach(function(b){if(b.getAttribute("data-r")===r)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});
  var t=theme(),root=document.documentElement;if(t==="system")root.removeAttribute("data-theme");else root.setAttribute("data-theme",t);
  f.style.opacity=0;
