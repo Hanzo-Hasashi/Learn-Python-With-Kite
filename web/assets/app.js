@@ -945,7 +945,7 @@
     if (route === "launch") {
       var launchLayout = doc.createElement("style");
       launchLayout.textContent = "@media(max-height:900px){.stage{height:75vh}.sheet{max-height:60vh}}" +
-        "@media(min-width:768px) and (max-width:1200px) and (min-height:1000px) and (orientation:portrait){body.kite-email-dashboard .stage svg{position:relative;top:-48px}}";
+        "@media(min-width:800px) and (max-width:840px) and (min-height:1150px) and (max-height:1200px) and (orientation:portrait){body.kite-email-dashboard .stage svg{position:relative;top:-48px}body.kite-email-dashboard .sheet{max-height:62vh;max-height:62dvh}}";
       doc.head.appendChild(launchLayout);
       var launchWindow = doc.defaultView;
       function updateEmailDashboardLayout() {
