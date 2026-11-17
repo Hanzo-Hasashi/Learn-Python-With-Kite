@@ -943,9 +943,19 @@
   }
   function applyPythonBranding(doc, route) {
     if (route === "launch") {
+      var flightString = doc.getElementById("str");
+      var flightKite = doc.getElementById("kite");
+      if (flightString && flightKite && flightString.nextElementSibling === flightKite &&
+          !doc.getElementById("kite-flight")) {
+        var flightGroup = doc.createElementNS("http://www.w3.org/2000/svg", "g");
+        flightGroup.id = "kite-flight";
+        flightString.parentNode.insertBefore(flightGroup, flightString);
+        flightGroup.appendChild(flightString);
+        flightGroup.appendChild(flightKite);
+      }
       var launchLayout = doc.createElement("style");
       launchLayout.textContent = "@media(max-height:900px){.stage{height:75vh}.sheet{max-height:60vh}}" +
-        "@media(min-width:800px) and (max-width:840px) and (min-height:1150px) and (max-height:1200px) and (orientation:portrait){body.kite-email-dashboard .stage svg{position:relative;top:-48px}body.kite-email-dashboard .sheet{max-height:62vh;max-height:62dvh}}";
+        "@media(min-width:800px) and (max-width:840px) and (min-height:1150px) and (max-height:1200px) and (orientation:portrait){body.kite-email-dashboard .stage svg{position:relative;top:-48px}body.kite-email-dashboard .stage svg #kite-flight{transform-box:view-box;transform-origin:200px 255px;transform:translateY(30px) scale(.7)}body.kite-email-dashboard .sheet{max-height:62vh;max-height:62dvh}}";
       doc.head.appendChild(launchLayout);
       var launchWindow = doc.defaultView;
       function updateEmailDashboardLayout() {
