@@ -210,7 +210,13 @@
     navigate("log-in");
   }
   function responseData(response) {
-    return response.json().catch(function () { return {}; }).then(function (data) {
+    return response.json().catch(function () {
+      return {
+        detail: response.status === 404
+          ? "Kite API endpoint not found. Check the API URL and deployment configuration."
+          : "Kite API returned an unreadable response."
+      };
+    }).then(function (data) {
       var detail = data.detail;
       if (Array.isArray(detail)) {
         detail = detail.map(function (item) { return item && item.msg; }).filter(Boolean).join(" ");
@@ -218,7 +224,7 @@
         detail = detail.message;
       }
       if (!response.ok) {
-        var error = new Error(detail || "Request failed.");
+        var error = new Error(detail || "Kite API request failed.");
         error.status = response.status;
         throw error;
       }
@@ -312,7 +318,9 @@
     notice.setAttribute("role", "alert");
     notice.style.cssText = "margin:16px;padding:16px;border:1px solid var(--line,#dbe4f3);border-radius:14px;background:var(--card,#fff);color:var(--ink,#17233d)";
     var message = doc.createElement("p");
-    message.textContent = "The " + resource + " could not be loaded. Check your connection to Kite and try again.";
+    message.textContent = error && error.status === 404
+      ? "Kite could not reach this API endpoint. Check the API URL and deployment configuration, then retry."
+      : "The " + resource + " could not be loaded. Check your connection to Kite and try again.";
     var button = doc.createElement("button");
     button.type = "button";
     button.textContent = "Retry";
@@ -325,6 +333,9 @@
     var status = error && error.status;
     var message = String(error && error.message || "").toLowerCase();
     if (status === 429) return "Too many attempts. Please wait a little while and try again.";
+    if (status === 404) {
+      return "Kite's API is unavailable at this frontend address. Please try again after it is connected.";
+    }
     if (flow === "google") {
       if (message.indexOf("requires configured") >= 0 || message.indexOf("not configured") >= 0) {
         return "Google sign-in is not configured for this Kite deployment yet. You can use email sign-in instead.";
@@ -1684,15 +1695,13 @@
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
       var planOptions = doc.getElementById("kite-plan-options");
-      if (planOptions) planOptions.textContent = "Plans could not be loaded. " + error.message;
+      if (planOptions) showContentUnavailable(doc, planOptions, "subscription plans",
+        function () { window.location.reload(); }, error);
       if (/sign in|session has expired/i.test(error.message)) {
         if (signIn) signIn.style.display = "flex";
         if (manage) manage.style.display = "none";
       }
-      if (note) {
-        note.textContent = error.message;
-        note.hidden = false;
-      }
+      if (note) note.hidden = true;
     });
     if (token()) api("/api/subscription").then(function (data) {
       var state = doc.getElementById("kite-plan-state");
@@ -1722,7 +1731,10 @@
       }
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
-      if (note) note.textContent = error.message;
+      if (note) {
+        note.textContent = error.message;
+        note.hidden = false;
+      }
     });
     bindSubscriptionButtons(doc);
     if (signIn) signIn.addEventListener("click", function () { requestSubscriptionSignIn(); });
@@ -2368,7 +2380,20 @@
             }
           }
           if (me) addGuestProgressPrompt(doc, doc.querySelector(".scroll"), true);
-        }).catch(function (error) { tell(doc, error.message, true); });
+        }).catch(function (error) {
+          setText(doc, "#pct", "—");
+          var fill = doc.getElementById("fill");
+          if (fill) fill.style.width = "0";
+          var progressBar = doc.querySelector('[role="progressbar"]');
+          if (progressBar) {
+            progressBar.removeAttribute("aria-valuenow");
+            progressBar.setAttribute("aria-valuetext", "Unavailable");
+          }
+          var note = doc.querySelector(".pc small");
+          if (note) note.textContent = "Progress data is currently unavailable.";
+          showContentUnavailable(doc, doc.querySelector(".lc:not(.kite-guest-progress)"),
+            "learning summary", function () { window.location.reload(); }, error);
+        });
       }
       function hydrateLearn(doc) {
         api("/api/modules").then(function (modules) {
@@ -3830,7 +3855,10 @@
           }
           applyProgress();
           setTimeout(applyProgress, 1200);
-        }).catch(function (error) { tell(doc, error.message, true); });
+        }).catch(function (error) {
+          showContentUnavailable(doc, doc.querySelector(".scroll"), "progress data",
+            function () { window.location.reload(); }, error);
+        });
       }
       function hydrateLeaderboard(doc, period) {
         api("/api/leaderboard?period=" + encodeURIComponent(period || "week")).then(function (data) {
@@ -3865,7 +3893,12 @@
           if (current) current.textContent = data.current
             ? "You · Rank " + data.current.rank + " · " + data.current.xp.toLocaleString() + " XP"
             : "Sign in to see your personal rank.";
-        }).catch(function (error) { tell(doc, error.message, true); });
+        }).catch(function (error) {
+          var list = doc.getElementById("ls");
+          if (list) showContentUnavailable(doc, list, "leaderboard",
+            function () { hydrateLeaderboard(doc, period); }, error);
+          else tell(doc, error.message, true);
+        });
       }
       function renderNotificationItems(doc, items, category, unread, guest) {
         var panel = doc.getElementById("pn");
@@ -4126,7 +4159,12 @@
               value.textContent = me ? String(data.streak) : "Not tracked";
             }
           });
-        }).catch(function (error) { tell(doc, error.message, true); });
+        }).catch(function (error) {
+          var stats = doc.querySelector(".stats");
+          if (stats) showContentUnavailable(doc, stats, "profile progress",
+            function () { window.location.reload(); }, error);
+          else tell(doc, error.message, true);
+        });
       }
   function bindSubscriptionButtons(doc) {
     var grid = doc.getElementById("kite-plan-options");
@@ -5010,7 +5048,9 @@
       }
       if (route !== "launch") hydrateRouteData(null);
     }).catch(function (error) {
-      tell(doc, "Kite couldn't confirm your saved session. Check your connection and try again.", true);
+      if (error.status !== 404) {
+        tell(doc, "Kite couldn't confirm your saved session. Check your connection and try again.", true);
+      }
       if (route !== "launch") hydrateRouteData(null);
     });
     ["b-terms", "b-priv", "b-con"].forEach(function (id) {
