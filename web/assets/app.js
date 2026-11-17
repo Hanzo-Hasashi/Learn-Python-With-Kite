@@ -143,15 +143,42 @@
     setMoreMenuAuthState(Boolean(authUser));
     return authUser;
   }
+  var sessionRequestTimeout = 15000;
+  var defaultRequestTimeout = 45000;
+  function apiUrl(path) {
+    return String(window.KITE_API_BASE || "").replace(/\/+$/, "") + path;
+  }
+  // fetch() against the configured API origin with an upper time bound, so an unreachable or
+  // stalled backend produces a clear error instead of leaving screens waiting indefinitely.
+  function apiFetch(path, options, timeoutMs) {
+    var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    var timeoutId;
+    var settings = Object.assign({ credentials: "include" }, options || {});
+    if (controller) settings.signal = controller.signal;
+    var request = fetch(apiUrl(path), settings).catch(function (cause) {
+      var failure = new Error("Kite couldn't reach its server. Check your connection and try again.");
+      failure.networkFailure = true;
+      failure.cause = cause;
+      throw failure;
+    });
+    if (!timeoutMs) return request;
+    var timedOut = new Promise(function (resolve, reject) {
+      timeoutId = setTimeout(function () {
+        if (controller) controller.abort();
+        var failure = new Error("Kite took too long to respond. Check your connection and try again.");
+        failure.timedOut = true;
+        reject(failure);
+      }, timeoutMs);
+    });
+    return Promise.race([request, timedOut]).finally(function () { clearTimeout(timeoutId); });
+  }
   function restoreAuthentication() {
     if (authRestoration) return authRestoration;
     var restorationVersion = authStateVersion;
     function fetchCurrentSession() {
       if (restorationVersion !== authStateVersion) return Promise.resolve(authUser);
-      return fetch((window.KITE_API_BASE || "") + "/api/auth/session", {
-        method: "GET",
-        credentials: "include"
-      }).then(responseData).then(function (data) {
+      return apiFetch("/api/auth/session", { method: "GET" }, sessionRequestTimeout)
+        .then(responseData).then(function (data) {
         return acceptAuthSession(data, restorationVersion);
       });
     }
@@ -163,16 +190,15 @@
       sessionStorage.removeItem(rememberMeKey);
     }
     if (legacyAccessToken || legacyRefreshToken) {
-      var migration = fetch((window.KITE_API_BASE || "") + "/api/auth/session", {
+      var migration = apiFetch("/api/auth/session", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           access_token: legacyAccessToken || null,
           refresh_token: legacyRefreshToken,
           remember_me: sessionStorage.getItem(rememberMeKey) === "true"
         })
-      }).then(responseData).then(function (data) {
+      }, sessionRequestTimeout).then(responseData).then(function (data) {
         clearLegacyTokens();
         return acceptAuthSession(data, restorationVersion);
       }).catch(function (error) {
@@ -233,10 +259,8 @@
   }
   function refreshSession() {
     if (refreshInFlight) return refreshInFlight;
-    refreshInFlight = fetch((window.KITE_API_BASE || "") + "/api/auth/session", {
-      method: "GET",
-      credentials: "include"
-    }).then(responseData).then(acceptAuthSession).then(function (user) {
+    refreshInFlight = apiFetch("/api/auth/session", { method: "GET" }, sessionRequestTimeout)
+      .then(responseData).then(acceptAuthSession).then(function (user) {
       if (!user) throw new Error("Your session has expired. Sign in again.");
     }).catch(function (error) {
       if (error.status === 400 || error.status === 401) clearAuthTokens();
@@ -247,7 +271,7 @@
   function api(path, body, method, extraHeaders) {
     var sessionIndependentAuth = path === "/api/auth/login" ||
       path.indexOf("/api/auth/google/") === 0;
-    var authRequestTimeout = sessionIndependentAuth ? 30000 : 0;
+    var requestTimeout = sessionIndependentAuth ? 30000 : defaultRequestTimeout;
     function send(retried) {
       var headers = { "Content-Type": "application/json" };
       Object.keys(extraHeaders || {}).forEach(function (name) {
@@ -256,27 +280,11 @@
       if (token() && authCsrf && (method || (body ? "POST" : "GET")) !== "GET") {
         headers["X-Kite-CSRF"] = authCsrf;
       }
-      var controller = authRequestTimeout && typeof AbortController !== "undefined"
-        ? new AbortController() : null;
-      var request = fetch((window.KITE_API_BASE || "") + path, {
+      var request = apiFetch(path, {
         method: method || (body ? "POST" : "GET"),
-        credentials: "include",
         headers: headers,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller ? controller.signal : undefined
-      });
-      var timeoutId;
-      if (authRequestTimeout) {
-        var timedOut = new Promise(function (resolve, reject) {
-          timeoutId = setTimeout(function () {
-            if (controller) controller.abort();
-            reject(new Error("Sign-in request timed out. Check your connection and try again."));
-          }, authRequestTimeout);
-        });
-        request = Promise.race([request, timedOut]).finally(function () {
-          clearTimeout(timeoutId);
-        });
-      }
+        body: body ? JSON.stringify(body) : undefined
+      }, requestTimeout);
       return request
         .then(function (response) {
           var isAuthRequest = path.indexOf("/api/auth/") === 0;
@@ -318,8 +326,9 @@
     notice.setAttribute("role", "alert");
     notice.style.cssText = "margin:16px;padding:16px;border:1px solid var(--line,#dbe4f3);border-radius:14px;background:var(--card,#fff);color:var(--ink,#17233d)";
     var message = doc.createElement("p");
-    message.textContent = error && error.status === 404
-      ? "Kite could not reach this API endpoint. Check the API URL and deployment configuration, then retry."
+    message.textContent = serviceUnavailable(error)
+      ? "Kite's learning service isn't available right now, so the " + resource +
+        " can't be shown. Please try again later."
       : "The " + resource + " could not be loaded. Check your connection to Kite and try again.";
     var button = doc.createElement("button");
     button.type = "button";
@@ -329,13 +338,19 @@
     notice.append(message, button);
     target.appendChild(notice);
   }
+  // 404 from a static host (no API deployed at the configured origin) or a request that never
+  // reached a server at all (DNS, offline, CORS rejection) both mean the API is unreachable.
+  function serviceUnavailable(error) {
+    return Boolean(error && (error.status === 404 || error.networkFailure));
+  }
   function friendlyAuthMessage(error, flow) {
     var status = error && error.status;
     var message = String(error && error.message || "").toLowerCase();
     if (status === 429) return "Too many attempts. Please wait a little while and try again.";
-    if (status === 404) {
-      return "Kite's API is unavailable at this frontend address. Please try again after it is connected.";
+    if (serviceUnavailable(error)) {
+      return "Kite's account service isn't available right now. Please try again later.";
     }
+    if (error && error.timedOut) return "Kite took too long to respond. Check your connection and try again.";
     if (flow === "google") {
       if (message.indexOf("requires configured") >= 0 || message.indexOf("not configured") >= 0) {
         return "Google sign-in is not configured for this Kite deployment yet. You can use email sign-in instead.";
@@ -1610,7 +1625,7 @@
     var group = doc.createElement("div");
     group.className = "grp";
     group.id = "kite-subscription";
-    group.innerHTML = "<div class=\"row\"><span class=\"l\" id=\"kite-plan-state\">Kite Free</span><span class=\"val\">Current plan</span></div>" +
+    group.innerHTML = "<div class=\"row\"><span class=\"l\" id=\"kite-plan-state\">Checking status...</span><span class=\"val\">Current plan</span></div>" +
       "<h3 style=\"margin:18px 16px 0;font-size:18px\">1. Compare available plans</h3>" +
       "<p class=\"sub\" style=\"padding:6px 16px 0\">Review each plan’s price, access, and renewal terms before choosing.</p>" +
       "<div id=\"kite-plan-options\" role=\"list\" aria-label=\"Available subscription plans\" style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;padding:12px 16px\">Loading plans…</div>" +
@@ -1676,6 +1691,12 @@
     if (manage) manage.style.display = token() ? "flex" : "none";
     api("/api/plans").then(function (result) {
       renderSubscriptionPlans(doc, result.plans);
+      if (!token()) {
+        var planState = doc.getElementById("kite-plan-state");
+        var planSummary = doc.getElementById("kite-plan-summary");
+        if (planState) planState.textContent = "Sign in required";
+        if (planSummary) planSummary.textContent = "Sign in to check your current subscription status.";
+      }
       var mobileMoney = doc.getElementById("kite-mobile-money");
       if (mobileMoney && result.mobile_money) {
         mobileMoney.dataset.enabled = String(Boolean(result.mobile_money.enabled));
@@ -1714,6 +1735,11 @@
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
       var planOptions = doc.getElementById("kite-plan-options");
+      var planState = doc.getElementById("kite-plan-state");
+      var planSummary = doc.getElementById("kite-plan-summary");
+      if (planState) planState.textContent = "Status unavailable";
+      if (planSummary) planSummary.textContent =
+        "Kite could not verify your subscription status. Please try again when the service is available.";
       if (planOptions) showContentUnavailable(doc, planOptions, "subscription plans",
         function () { window.location.reload(); }, error);
       if (/sign in|session has expired/i.test(error.message)) {
@@ -1750,6 +1776,11 @@
       }
     }).catch(function (error) {
       var note = doc.getElementById("kite-billing-note");
+      var state = doc.getElementById("kite-plan-state");
+      var summary = doc.getElementById("kite-plan-summary");
+      if (state) state.textContent = "Status unavailable";
+      if (summary) summary.textContent =
+        "Kite could not verify your subscription status. Please try again when the service is available.";
       if (note) {
         note.textContent = error.message;
         note.hidden = false;
@@ -2337,7 +2368,54 @@
           console.error("Could not update the Kite navigation profile.", error);
         }
       }
+      function prepareHomeLoading(doc) {
+        var progressRegion = doc.querySelector(".pc");
+        if (progressRegion) progressRegion.setAttribute("aria-busy", "true");
+        var metrics = doc.querySelector(".pc .r2");
+        if (metrics) metrics.style.visibility = "hidden";
+        var progressBar = doc.querySelector(".pc .bar");
+        if (progressBar) {
+          progressBar.style.visibility = "hidden";
+          progressBar.removeAttribute("aria-valuenow");
+          progressBar.setAttribute("aria-valuetext", "Loading progress");
+        }
+        var note = doc.querySelector(".pc small");
+        if (note) {
+          note.setAttribute("role", "status");
+          note.textContent = "Loading progress...";
+        }
+        var lessonCard = doc.querySelector(".lc:not(.kite-guest-progress)");
+        if (lessonCard) lessonCard.style.display = "none";
+      }
+      function revealHomeProgress(doc) {
+        var progressRegion = doc.querySelector(".pc");
+        if (progressRegion) progressRegion.removeAttribute("aria-busy");
+        var metrics = doc.querySelector(".pc .r2");
+        if (metrics) metrics.style.visibility = "";
+        var progressBar = doc.querySelector(".pc .bar");
+        if (progressBar) progressBar.style.visibility = "";
+      }
+      function showHomeUnavailable(doc, error) {
+        var note = doc.querySelector(".pc small");
+        if (note) note.textContent = "Progress data is currently unavailable.";
+        var lessonCard = doc.querySelector(".lc:not(.kite-guest-progress)");
+        if (lessonCard) lessonCard.style.display = "";
+        showContentUnavailable(doc, lessonCard, "learning summary",
+          function () { window.location.reload(); }, error);
+        setTimeout(function () {
+          setText(doc, "#pct", "—");
+          var fill = doc.getElementById("fill");
+          if (fill) fill.style.width = "0";
+          var progressBar = doc.querySelector('[role="progressbar"]');
+          if (progressBar) {
+            progressBar.removeAttribute("aria-valuenow");
+            progressBar.setAttribute("aria-valuetext", "Unavailable");
+          }
+          revealHomeProgress(doc);
+        }, 1200);
+      }
       function hydrateHome(doc, me) {
+        prepareHomeLoading(doc);
         Promise.all([
           Promise.resolve(me),
           me ? api("/api/progress") : Promise.resolve(null),
@@ -2361,10 +2439,16 @@
             var fill = doc.getElementById("fill");
             if (fill) fill.style.width = percent + "%";
             var bar = doc.querySelector('[role="progressbar"]');
-            if (bar) bar.setAttribute("aria-valuenow", String(percent));
+            if (bar) {
+              bar.setAttribute("aria-valuenow", String(percent));
+              bar.removeAttribute("aria-valuetext");
+            }
           }
           applyProgress();
-          setTimeout(applyProgress, 1200);
+          setTimeout(function () {
+            applyProgress();
+            revealHomeProgress(doc);
+          }, 1200);
           var next;
           if (me) {
             next = lessons.find(function (lesson) { return lesson.started && !lesson.locked; }) ||
@@ -2390,28 +2474,20 @@
           } else {
             updateNotificationBadge(doc, readGuestNotifications().filter(function (item) { return !item.read; }).length);
           }
-          if (next) sessionStorage.setItem("kite.lessonId", next.id);
-          if (!me && next) {
-            var guestLessonCard = doc.querySelector(".lc:not(.kite-guest-progress)");
-            if (guestLessonCard) {
+          var lessonCard = doc.querySelector(".lc:not(.kite-guest-progress)");
+          if (lessonCard) {
+            lessonCard.style.display = next ? "" : "none";
+            if (next) {
               setText(doc, ".lc:not(.kite-guest-progress) h3", next.title);
               setText(doc, ".lc:not(.kite-guest-progress) p", next.description);
+              var continueButton = lessonCard.querySelector("button");
+              if (continueButton) continueButton.setAttribute("data-t", "Lesson: " + next.title);
             }
           }
+          if (next) sessionStorage.setItem("kite.lessonId", next.id);
           if (me) addGuestProgressPrompt(doc, doc.querySelector(".scroll"), true);
         }).catch(function (error) {
-          setText(doc, "#pct", "—");
-          var fill = doc.getElementById("fill");
-          if (fill) fill.style.width = "0";
-          var progressBar = doc.querySelector('[role="progressbar"]');
-          if (progressBar) {
-            progressBar.removeAttribute("aria-valuenow");
-            progressBar.setAttribute("aria-valuetext", "Unavailable");
-          }
-          var note = doc.querySelector(".pc small");
-          if (note) note.textContent = "Progress data is currently unavailable.";
-          showContentUnavailable(doc, doc.querySelector(".lc:not(.kite-guest-progress)"),
-            "learning summary", function () { window.location.reload(); }, error);
+          showHomeUnavailable(doc, error);
         });
       }
       function hydrateLearn(doc) {
@@ -2724,13 +2800,33 @@
           appendLessonSection(doc, panel, name, sections[name]);
         });
       }
+      function prepareLessonLoading(doc) {
+        setText(doc, "header h1", "Loading lesson...");
+        var panel = doc.getElementById("pn");
+        if (panel) {
+          panel.textContent = "";
+          var status = doc.createElement("p");
+          status.setAttribute("role", "status");
+          status.textContent = "Loading lesson...";
+          panel.appendChild(status);
+        }
+        var nextButton = doc.getElementById("next");
+        if (nextButton) {
+          nextButton.hidden = true;
+          nextButton.style.display = "none";
+        }
+      }
       function hydrateLesson(doc) {
+        prepareLessonLoading(doc);
         var id = sessionStorage.getItem("kite.lessonId") || "python-variables";
         api("/api/lessons/" + encodeURIComponent(id)).then(function (lesson) {
           recordGuestLesson(doc, lesson.id, false);
           setText(doc, "header h1", lesson.title);
           var nextButton = doc.getElementById("next");
-          if (nextButton) nextButton.hidden = false;
+          if (nextButton) {
+            nextButton.hidden = false;
+            nextButton.style.display = "";
+          }
           doc.documentElement.kiteLesson = lesson;
           doc.addEventListener("click", function (event) {
             var tab = event.target.closest && event.target.closest("[data-tab]");
@@ -2760,7 +2856,10 @@
           setText(doc, "header h1", "Lesson unavailable");
           doc.documentElement.kiteLesson = null;
           var nextButton = doc.getElementById("next");
-          if (nextButton) nextButton.hidden = true;
+          if (nextButton) {
+            nextButton.hidden = true;
+            nextButton.style.display = "none";
+          }
           showContentUnavailable(doc, doc.getElementById("pn"), "lesson", function () {
             hydrateLesson(doc);
           }, error);
@@ -5020,6 +5119,8 @@
       }
     }
 
+    if (route === "home") prepareHomeLoading(doc);
+    if (route === "lesson") prepareLessonLoading(doc);
     sessionReady.then(function () {
       if (route === "launch") {
         var resetCredential = resetToken();
@@ -5048,7 +5149,7 @@
             signInForRoute(route);
             return;
           }
-          tell(doc, error.message, true);
+          showHomeUnavailable(doc, error);
         });
         return;
       }
@@ -5061,7 +5162,8 @@
             hydrateRouteData(null);
             return;
           }
-          tell(doc, error.message, true);
+          showContentUnavailable(doc, doc.querySelector(".scroll"), "progress data",
+            function () { window.location.reload(); }, error);
         });
         return;
       }

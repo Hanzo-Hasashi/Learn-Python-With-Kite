@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="top-left" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5ba1f7"/>
+      <stop offset="1" stop-color="#1d6fe8"/>
+    </linearGradient>
+    <linearGradient id="top-right" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1d6fe8"/>
+      <stop offset="1" stop-color="#0e47a8"/>
+    </linearGradient>
+    <linearGradient id="bottom-left" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a7ff0"/>
+      <stop offset="1" stop-color="#0e47a8"/>
+    </linearGradient>
+    <linearGradient id="bottom-right" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffc247"/>
+      <stop offset="1" stop-color="#f08400"/>
+    </linearGradient>
+    <clipPath id="mouth">
+      <path d="M-12 3Q0 23 12 3Z"/>
+    </clipPath>
+  </defs>
+  <rect width="512" height="512" fill="#e6eef9"/>
+  <g transform="translate(256 231) scale(2.7)">
+    <path d="M0 68Q-3.31 76.5-5.75 85" fill="none" stroke="#6b7f9c" stroke-width="1.6" stroke-linecap="round"/>
+    <g transform="translate(-5.75 85) rotate(17)">
+      <path d="M0 0C-4-9-12-7-10 0-12 7-4 9 0 0ZM0 0C4-9 12-7 10 0 12 7 4 9 0 0Z" fill="#ff9f1c"/>
+      <circle r="2" fill="#f08400"/>
+    </g>
+    <path d="M0-66-44-10 0-10Z" fill="url(#top-left)"/>
+    <path d="M0-66 44-10 0-10Z" fill="url(#top-right)"/>
+    <path d="M-44-10 0 68V-10Z" fill="url(#bottom-left)"/>
+    <path d="M44-10 0 68V-10Z" fill="url(#bottom-right)"/>
+    <path d="M0-66V68M-44-10H44" fill="none" stroke="#fff" stroke-opacity=".3" stroke-width="1.2"/>
+    <path d="M-3-58-38-12" fill="none" stroke="#fff" stroke-opacity=".55" stroke-width="2" stroke-linecap="round"/>
+    <path d="M0-66 44-10 0 68-44-10Z" fill="none" stroke="#0a2f73" stroke-width="3" stroke-linejoin="miter"/>
+    <g>
+      <circle cx="-23" cy="-3" r="4.6" fill="#ff8fa3" opacity=".55"/>
+      <circle cx="23" cy="-3" r="4.6" fill="#ff8fa3" opacity=".55"/>
+      <ellipse cx="-12" cy="-21" rx="6.4" ry="8" fill="#fff"/>
+      <ellipse cx="12" cy="-21" rx="6.4" ry="8" fill="#fff"/>
+      <circle cx="-12" cy="-21" r="3.8" fill="#0b1a33"/>
+      <circle cx="-10.6" cy="-22.8" r="1.5" fill="#fff"/>
+      <circle cx="-13.4" cy="-19.4" r=".7" fill="#fff"/>
+      <circle cx="12" cy="-21" r="3.8" fill="#0b1a33"/>
+      <circle cx="13.4" cy="-22.8" r="1.5" fill="#fff"/>
+      <circle cx="10.6" cy="-19.4" r=".7" fill="#fff"/>
+      <path d="M-12 3Q0 23 12 3Z" fill="#0b1a33"/>
+      <g clip-path="url(#mouth)">
+        <ellipse cx="0" cy="13" rx="6" ry="4.5" fill="#ff8a65"/>
+      </g>
+    </g>
+  </g>
+</svg>

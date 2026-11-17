@@ -1,0 +1,50 @@
+#pn button.kite-pwa-install[hidden],
+#desk-nav button.kite-pwa-install[hidden] {
+  display: none !important;
+}
+
+#kite-install-dialog {
+  width: min(420px, calc(100vw - 32px));
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 22px;
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 16px 48px rgba(15, 30, 55, .24);
+  font: 500 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+#kite-install-dialog::backdrop {
+  background: rgba(8, 18, 38, .5);
+}
+
+#kite-install-dialog h2 {
+  margin: 0 36px 10px 0;
+  font-size: 19px;
+  line-height: 1.25;
+}
+
+#kite-install-dialog p {
+  margin: 0 0 20px;
+  color: var(--mut);
+}
+
+#kite-install-dialog .kite-install-close {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  border: 0;
+  border-radius: 11px;
+  padding: 10px 16px;
+  background: var(--blue);
+  color: #fff;
+  font: 700 14px/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+
+#kite-install-dialog .kite-install-close:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 3px;
+}
