@@ -32,22 +32,50 @@ body{background:var(--page);font-family:system-ui,-apple-system,"Segoe UI",sans-
 :focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition-duration:.01s!important}}
 .desk-nav{display:none}
-.desk-nav h1{margin:0;padding:24px 18px;font-size:21px;font-weight:800;letter-spacing:-.4px}
-.desk-nav-list{display:grid;gap:4px;padding:0 10px 18px}
-.desk-nav button{display:flex;align-items:center;width:100%;min-height:44px;border:0;border-radius:10px;padding:10px 12px;background:transparent;color:var(--ink);font:600 14px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;text-align:left;cursor:pointer}
-.desk-nav button:hover,.desk-nav button[aria-current="page"]{background:var(--soft);color:var(--blue)}
-.desk-nav button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.desk-nav h1{margin:0;padding:22px 20px 16px;font-size:21px;font-weight:800;letter-spacing:-.4px}
+.desk-nav h1 span{color:var(--blue)}
+.desk-nav-list{display:grid;gap:2px;padding:0 12px}
+.desk-nav button{display:flex;align-items:center;gap:12px;width:100%;min-height:44px;border:0;border-radius:10px;padding:10px 12px;background:transparent;color:var(--ink);font:600 14px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;text-align:left;cursor:pointer}
+.desk-nav button svg{flex:none;width:20px;height:20px;color:var(--mut)}
+.desk-nav button span{min-width:0;overflow-wrap:anywhere}
+.desk-nav button:hover{background:var(--soft)}
+.desk-nav button[aria-current="page"]{background:var(--soft);color:var(--blue);font-weight:700}
+.desk-nav button[aria-current="page"] svg,.desk-nav button:hover svg{color:var(--blue)}
+.desk-nav button:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+.desk-nav .desk-nav-child{position:relative;min-height:38px;margin-left:21px;width:calc(100% - 21px);padding:8px 12px 8px 19px;border-radius:0 10px 10px 0;font-size:13.5px;font-weight:500}
+.desk-nav .desk-nav-child::before{content:"";position:absolute;left:0;top:4px;bottom:4px;border-left:2px solid var(--line)}
+.desk-nav .desk-nav-child[aria-current="page"]::before{border-left-color:var(--blue)}
+.desk-nav .desk-nav-child svg{display:none}
+.desk-nav-group{margin-top:14px;padding-top:10px;border-top:1px solid var(--line)}
+.desk-nav .desk-nav-toggle{min-height:36px;margin:0 12px;width:calc(100% - 24px);padding:6px 12px;color:var(--mut);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.desk-nav .desk-nav-toggle span{flex:1}
+.desk-nav .desk-nav-toggle svg{width:16px;height:16px;transition:transform .2s}
+.desk-nav .desk-nav-toggle[aria-expanded="false"] svg{transform:rotate(-90deg)}
+.desk-nav .desk-nav-toggle.has-current{color:var(--blue)}
+.desk-nav-sub[hidden]{display:none}
+.desk-nav-account{margin-top:auto;padding:12px 12px 16px;border-top:1px solid var(--line)}
+.desk-nav button.out,.desk-nav button.out svg{color:var(--red)}
 @media (min-width:740px) and (max-width:999px){
-body{padding-left:76px}
-.desk-nav{position:fixed;inset:0 auto 0 0;z-index:11;display:flex;width:76px;flex-direction:column;overflow-y:auto;border-right:1px solid var(--line);background:var(--card);color:var(--ink)}
-.desk-nav h1{padding:14px 4px;font-size:14px;text-align:center}
-.desk-nav-list{gap:2px;padding:0 4px 12px}
-.desk-nav button{justify-content:center;min-height:42px;padding:6px 3px;font-size:11px;line-height:1.15;text-align:center}
+body{padding-left:88px}
+.desk-nav{position:fixed;inset:0 auto 0 0;z-index:11;display:flex;width:88px;flex-direction:column;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;border-right:1px solid var(--line);background:var(--card);color:var(--ink)}
+.desk-nav h1{padding:16px 4px 12px;font-size:16px;text-align:center}
+.desk-nav-list{gap:2px;padding:0 6px}
+.desk-nav button{flex-direction:column;justify-content:center;gap:4px;min-height:54px;padding:7px 2px;font-size:10.5px;line-height:1.15;text-align:center}
+.desk-nav button svg{width:22px;height:22px}
+.desk-nav .desk-nav-child{margin-left:0;width:100%;min-height:54px;padding:7px 2px;border-radius:10px;font-size:10.5px;font-weight:600}
+.desk-nav .desk-nav-child::before{display:none}
+.desk-nav .desk-nav-child svg{display:block}
+.desk-nav-group{margin-top:8px;padding-top:6px}
+.desk-nav-group .desk-nav-sub{padding:0}
+.desk-nav .desk-nav-toggle{flex-direction:row;gap:2px;min-height:32px;margin:0 6px;width:calc(100% - 12px);padding:4px 2px;font-size:10px;letter-spacing:.04em}
+.desk-nav .desk-nav-toggle span{flex:none}
+.desk-nav .desk-nav-toggle svg{width:12px;height:12px}
+.desk-nav-account{padding:8px 6px 12px}
 }
 @media (min-width:1000px){
-body{padding-left:224px}
+body{padding-left:240px}
 #f{width:100%;height:100%}
-.desk-nav{position:fixed;inset:0 auto 0 0;z-index:11;display:flex;width:224px;flex-direction:column;overflow-y:auto;border-right:1px solid var(--line);background:var(--card);color:var(--ink)}
+.desk-nav{position:fixed;inset:0 auto 0 0;z-index:11;display:flex;width:240px;flex-direction:column;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;border-right:1px solid var(--line);background:var(--card);color:var(--ink)}
 .mo{align-items:center}
 .pn{width:min(440px,calc(100vw - 48px));max-height:min(80vh,720px);margin:auto;border-radius:24px;padding-bottom:16px}
 }
@@ -60,21 +88,30 @@ body.kite-entry-flow .desk-nav{display:none}
 <body>
 <iframe id="f" title="Learn Python with Kite"></iframe>
 <nav class="desk-nav" id="desk-nav" aria-label="Primary navigation">
-<h1>Kite</h1>
+<h1>Kite<span>.</span></h1>
 <div class="desk-nav-list">
-<button type="button" data-r="launch">Welcome</button>
-<button type="button" data-r="home">Home</button>
-<button type="button" data-r="learn">Learn</button>
-<button type="button" data-r="lesson">Lesson</button>
-<button type="button" data-r="playground">Playground</button>
-<button type="button" data-r="challenge">Challenges</button>
-<button type="button" data-r="quiz">Quiz</button>
-<button type="button" data-r="progress">Progress</button>
-<button type="button" data-r="leaderboard">Leaderboard</button>
-<button type="button" data-r="profile">Profile</button>
-<button type="button" data-r="preferences">Settings</button>
-<button type="button" data-r="notifications">Notifications</button>
-<button type="button" data-r="about">About</button>
+<button type="button" data-r="home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10"/></svg><span>Home</span></button>
+<button type="button" data-r="learn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h14v14H6.5A2.5 2.5 0 0 0 4 19.5zm0 0A2.5 2.5 0 0 0 6.5 22H20v-5"/></svg><span>Learn</span></button>
+<button type="button" class="desk-nav-child" data-r="lesson"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg><span>Lesson</span></button>
+<button type="button" data-r="playground"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M13.5 5l-3 14"/></svg><span>Playground</span></button>
+<button type="button" data-r="progress"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V12M10 20V6M16 20v-9M22 20H2"/></svg><span>Progress</span></button>
+</div>
+<div class="desk-nav-group">
+<button type="button" class="desk-nav-toggle" aria-expanded="true" aria-controls="desk-nav-more"><span>More</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+<div class="desk-nav-list desk-nav-sub" id="desk-nav-more">
+<button type="button" data-r="profile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0"/></svg><span>Profile</span></button>
+<button type="button" data-r="notifications"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span>Notifications</span></button>
+<button type="button" data-r="leaderboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0zM17 5h3v2a3 3 0 0 1-3 3M7 5H4v2a3 3 0 0 0 3 3"/></svg><span>Leaderboard</span></button>
+<button type="button" data-r="challenge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 22V4M4 4h13l-2.5 4.5L17 13H4"/></svg><span>Challenges</span></button>
+<button type="button" data-r="quiz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h10M10 12h10M10 18h10M3.5 6l1.5 1.5L7.5 5M3.5 12l1.5 1.5L7.5 11M3.5 18l1.5 1.5 2.5-2.5"/></svg><span>Quizzes</span></button>
+<button type="button" data-r="preferences"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg><span>Settings</span></button>
+<button type="button" data-r="about"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 16v-4M12 8h.01"/></svg><span>Help &amp; About</span></button>
+</div>
+</div>
+<div class="desk-nav-account">
+<button type="button" class="kite-menu-sign-in" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg><span>Sign In</span></button>
+<button type="button" class="kite-menu-exit-guest" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg><span>Exit Guest Mode</span></button>
+<button type="button" class="out" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg><span>Log Out</span></button>
 </div>
 </nav>
 <div class="mo" id="mo" role="dialog" aria-modal="true" aria-labelledby="mt"><div class="pn" id="pn"><h2 id="mt">More</h2></div></div>
@@ -115,6 +152,8 @@ img,svg,video,canvas{max-width:100%}
 }
 @media (min-width:660px){
  body[data-kite-wide-nav="true"] .phone>.nav{display:none}
+ body[data-kite-wide-nav="true"] #menu{visibility:hidden}
+ body[data-kite-wide-nav="true"] #dr{display:none}
 }
 @media (min-width:1100px){
  body[data-kite-screen="playground"] #app{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.65fr);grid-template-rows:auto minmax(0,1fr)}
@@ -178,7 +217,7 @@ window.kiteGoBack=goBack;
 function show(){
  var r=route();if(r===cur)return;cur=r;closeMore();
  document.body.classList.toggle("kite-entry-flow",isEntryRoute(r));
- deskNav.querySelectorAll("[data-r]").forEach(function(b){if(b.getAttribute("data-r")===r)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});
+ deskNav.querySelectorAll("[data-r]").forEach(function(b){if(b.getAttribute("data-r")===r)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});syncDeskGroup();
  var t=theme(),root=document.documentElement;if(t==="system")root.removeAttribute("data-theme");else root.setAttribute("data-theme",t);
  f.style.opacity=0;
  setTimeout(function(){var h=DOCS[r];if(t!=="system")h=h.replace('<html lang="en">','<html lang="en" data-theme="'+t+'">');h=h.replace("<body","<body data-kite-screen=\""+r+"\"");h=h.replace("</head>","<style>"+RESPONSIVE_CSS+"</style></head>");f.srcdoc=h},120)}
@@ -190,7 +229,11 @@ window.addEventListener("popstate",function(){syncNavigation()});
 function openMore(){opener=document.activeElement;mo.classList.add("on");var b=pn.querySelector("button");if(b)b.focus()}
 function closeMore(){if(!mo.classList.contains("on"))return;mo.classList.remove("on");try{f.contentWindow.focus()}catch(e){}}
 mo.addEventListener("click",function(e){if(e.target===mo){closeMore();return}var b=e.target.closest("[data-r]");if(b){var r=b.getAttribute("data-r");closeMore();navigateTo(r)}});
-deskNav.addEventListener("click",function(e){var b=e.target.closest("[data-r]");if(b)navigateTo(b.getAttribute("data-r"))});
+var deskToggle=deskNav.querySelector(".desk-nav-toggle"),deskMore=document.getElementById("desk-nav-more"),deskMoreKey="kite.sidebarMoreOpen";
+function syncDeskGroup(){if(deskToggle)deskToggle.classList.toggle("has-current",Boolean(deskMore&&deskMore.hidden&&deskMore.querySelector("[aria-current]")))}
+function setDeskGroup(open){if(!deskToggle||!deskMore)return;deskToggle.setAttribute("aria-expanded",String(open));deskMore.hidden=!open;try{localStorage.setItem(deskMoreKey,open?"1":"0")}catch(e){}syncDeskGroup()}
+try{if(localStorage.getItem(deskMoreKey)==="0")setDeskGroup(false)}catch(e){}
+deskNav.addEventListener("click",function(e){if(e.target.closest(".desk-nav-toggle")){setDeskGroup(deskMore.hidden);return}var b=e.target.closest("[data-r]");if(b)navigateTo(b.getAttribute("data-r"))});
 document.addEventListener("keydown",function(e){if(e.key==="Escape")closeMore()});
 window.addEventListener("message",function(e){
  if(e.source!==f.contentWindow||!e.data||!e.data.kite)return;var r=e.data.r;

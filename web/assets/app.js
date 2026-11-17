@@ -55,30 +55,34 @@
   function token() {
     return authUser ? "cookie-session" : null;
   }
-  function setMoreMenuAuthState(authenticated) {
-    var menu = document.getElementById("pn");
-    if (!menu) return;
-    var signIn = menu.querySelector(".kite-menu-sign-in");
-    var exitGuest = menu.querySelector(".kite-menu-exit-guest");
-    var logOut = menu.querySelector("button.out");
-    if (signIn) signIn.style.display = authenticated === null || authenticated ? "none" : "";
-    if (exitGuest) exitGuest.style.display = authenticated === null || authenticated ? "none" : "";
-    if (logOut) logOut.style.display = authenticated === true ? "" : "none";
-    if (authenticated === false) {
-      try {
-        var who = parent.document.getElementById("dr");
-        who = who && who.querySelector(".who");
-        if (who) {
-          var avatar = who.querySelector(".av");
-          var name = who.querySelector("b");
-          var detail = who.querySelector("small");
-          if (avatar) avatar.textContent = "G";
-          if (name) name.textContent = "Guest";
-          if (detail) detail.textContent = "Progress is stored on this device";
-        }
-      } catch (error) {
-        console.error("Could not update the Kite account menu.", error);
+  // The account actions live in three places: the mobile More sheet (#pn), the desktop/tablet
+  // sidebar (#desk-nav) and the in-screen drawer (#dr) inside the route iframe.
+  function setMoreMenuAuthState(authenticated, screenDoc) {
+    [document.getElementById("pn"), document.getElementById("desk-nav")].forEach(function (menu) {
+      if (!menu) return;
+      var guestActionDisplay = authenticated === null || authenticated ? "none" : "";
+      Array.prototype.forEach.call(menu.querySelectorAll(".kite-menu-sign-in, .kite-menu-exit-guest"),
+        function (button) { button.style.display = guestActionDisplay; });
+      var logOut = menu.querySelector("button.out");
+      if (logOut) logOut.style.display = authenticated === true ? "" : "none";
+    });
+    try {
+      var doc = screenDoc || (frame && frame.contentDocument);
+      var drawer = doc && doc.getElementById("dr");
+      if (!drawer) return;
+      var drawerLogOut = drawer.querySelector('[data-t="Log out"]');
+      if (drawerLogOut) drawerLogOut.style.display = authenticated === true ? "" : "none";
+      var who = drawer.querySelector(".who");
+      if (who && authenticated === false) {
+        var avatar = who.querySelector(".av");
+        var name = who.querySelector("b");
+        var detail = who.querySelector("small");
+        if (avatar) avatar.textContent = "G";
+        if (name) name.textContent = "Guest";
+        if (detail) detail.textContent = "Progress is stored on this device";
       }
+    } catch (error) {
+      console.error("Could not update the Kite account menu.", error);
     }
   }
   function ensureMoreMenuActions() {
@@ -2347,8 +2351,8 @@
             }
             return;
           }
-          setMoreMenuAuthState(Boolean(me));
-          var menu = parent.document.getElementById("dr");
+          setMoreMenuAuthState(Boolean(me), doc);
+          var menu = doc && doc.getElementById("dr");
           var who = menu && menu.querySelector(".who");
           if (!who) return;
           var avatar = who.querySelector(".av");
@@ -5209,7 +5213,7 @@
   ensureMoreMenuActions();
   setMoreMenuAuthState(null);
   document.addEventListener("click", function (event) {
-    var signIn = event.target.closest && event.target.closest("#pn button.kite-menu-sign-in");
+    var signIn = event.target.closest && event.target.closest("#pn button.kite-menu-sign-in, #desk-nav button.kite-menu-sign-in");
     if (signIn) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -5219,7 +5223,7 @@
       navigate("log-in");
       return;
     }
-    var exitGuest = event.target.closest && event.target.closest("#pn button.kite-menu-exit-guest");
+    var exitGuest = event.target.closest && event.target.closest("#pn button.kite-menu-exit-guest, #desk-nav button.kite-menu-exit-guest");
     if (exitGuest) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -5231,7 +5235,7 @@
       navigate("welcome");
       return;
     }
-    var target = event.target.closest && event.target.closest("#pn button.out");
+    var target = event.target.closest && event.target.closest("#pn button.out, #desk-nav button.out");
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
