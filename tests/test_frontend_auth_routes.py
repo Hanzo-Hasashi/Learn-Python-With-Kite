@@ -129,6 +129,24 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
         self.wait_for_heading("Reset your password")
         self.assertEqual(self.page.evaluate("location.hash"), "#reset")
 
+    def test_kite_password_reset_token_opens_new_password_form(self):
+        self.open("#reset?token=audit-placeholder-token")
+        self.wait_for_heading("Choose a new password")
+        self.page.wait_for_timeout(150)
+        self.assertEqual(self.page.evaluate("location.hash"), "")
+        self.assertTrue(
+            self.frame_eval("Boolean(document.querySelector('form[data-kite-reset]'))")
+        )
+
+    def test_supabase_password_reset_fragment_opens_new_password_form(self):
+        self.open("#reset#access_token=audit-placeholder-token&type=recovery")
+        self.wait_for_heading("Choose a new password")
+        self.page.wait_for_timeout(150)
+        self.assertEqual(self.page.evaluate("location.hash"), "")
+        self.assertTrue(
+            self.frame_eval("Boolean(document.querySelector('form[data-kite-reset]'))")
+        )
+
     def test_switching_between_sign_up_and_log_in_stays_stable(self):
         frame = self.open("#sign-up")
         self.wait_for_heading("Create your account")

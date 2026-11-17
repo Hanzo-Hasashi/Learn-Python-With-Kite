@@ -69,11 +69,25 @@ def database_url() -> str:
     return value
 
 
+def database_engine_options(url: str, *, serverless: bool) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "connect_args": {"check_same_thread": False} if url.startswith("sqlite") else {},
+        "pool_pre_ping": True,
+    }
+    if serverless and url.startswith("postgresql+psycopg://"):
+        options["connect_args"] = {"prepare_threshold": None}
+        options["pool_size"] = 1
+        options["max_overflow"] = 0
+    return options
+
+
 DB_URL = database_url()
 engine = create_engine(
     DB_URL,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
-    pool_pre_ping=True,
+    **database_engine_options(
+        DB_URL,
+        serverless=bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV")),
+    ),
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
@@ -1293,7 +1307,12 @@ app.add_middleware(
     ).split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Kite-CSRF"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Kite-CSRF",
+        "X-Kite-Registration-Key",
+    ],
 )
 app.mount("/assets", StaticFiles(directory=Path(__file__).parent.parent / "web" / "assets"), name="assets")
 
@@ -1352,6 +1371,9 @@ def startup() -> None:
                 lesson.title = row[1]
                 lesson.description = row[2]
                 lesson.content = row[3]
+                lesson.order_num = row[4]
+                lesson.premium = row[5]
+                lesson.xp_reward = row[6]
         seed_subscription_plans(db)
         db.commit()
     if not os.getenv("KITE_SECRET_KEY"):

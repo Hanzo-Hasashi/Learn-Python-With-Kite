@@ -17,6 +17,43 @@ Kite is built around the supplied HTML prototype. `web/index.html` is the protot
 
 Signed-in sessions use HTTP-only, same-site cookies and a per-user CSRF header; access and refresh tokens are not exposed to browser JavaScript or stored in browser storage. Sessions last up to eight hours by default, or 30 days when the learner selects “Keep me signed in on this device.” The server remains the source of truth for account, subscription and authenticated learning data. Guest lesson activity and quiz attempts are device-local and are not synchronized to an account automatically. The prototype itself continues to use browser storage for its original cosmetic theme and demo-only values; server-backed settings are also synchronized through the API.
 
+## Quick start
+
+For Docker Compose, create a local `.env` file in the project root with at least the following values:
+
+```powershell
+KITE_SECRET_KEY=replace-with-a-random-32-character-string
+RUNNER_SHARED_SECRET=replace-with-a-different-random-32-character-string
+DATABASE_URL=sqlite:////data/kite.db
+```
+
+Docker Compose reads this file automatically. A plain `uvicorn` process does not load `.env` by itself; set the environment variables in the shell as shown below. Local password authentication is disabled unless `KITE_ALLOW_LOCAL_AUTH` is explicitly enabled.
+
+### Docker (recommended)
+
+```powershell
+docker compose up --build
+```
+
+Then open `http://localhost:8000` in the browser.
+
+### Local Python development server
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+$env:KITE_SECRET_KEY = "replace-with-a-random-value-of-at-least-32-characters"
+$env:DATABASE_URL = "sqlite:///./kite.db"
+# Optional: enable password authentication for local development only.
+$env:KITE_ALLOW_LOCAL_AUTH = "true"
+uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
+```
+
+Then open `http://localhost:8000`.
+
+If you run without Docker, the code-runner and `Stop` action will report runner-unavailable errors unless a separate runner service is configured.
+
 ## Run locally with Docker
 
 1. Install Docker Desktop with Compose support. Linux containers and the `libseccomp` runtime library are required for code execution.
@@ -25,7 +62,13 @@ Signed-in sessions use HTTP-only, same-site cookies and a per-user CSRF header; 
 4. From this directory run `docker compose up --build`.
 5. Open `http://localhost:8000`. Health checks are available at `/health`.
 
-The API and web application share one origin. For a Supabase production deployment, set `SUPABASE_URL` to the project URL, `SUPABASE_ANON_KEY` to its public anon key, `PUBLIC_APP_URL` to the HTTPS origin serving Kite, and `DATABASE_URL` to the Supabase PostgreSQL connection string (with SSL enabled). In Supabase Auth, enable Google, enter the OAuth client ID and secret from Google Cloud, and allow the Supabase callback URL shown in its Google provider setup in Google Cloud. Set the Supabase Site URL and redirect allowlist to the Kite HTTPS origin (and any intentional local development origin). Keep database and service credentials in the deployment secret manager, not in the ZIP or source tree. Back up the database and use a managed TLS-terminating reverse proxy in front of the API.
+The API and web application share one origin. For a Supabase production deployment, set `DATABASE_URL` to the Supabase PostgreSQL connection string with SSL enabled, and set `KITE_SECRET_KEY` to a stable, secret random value of at least 32 characters. The key is required to encrypt registered phone numbers; rotating it makes previously stored numbers unreadable and invalidates existing sessions. `SUPABASE_URL` and `SUPABASE_ANON_KEY` must either both be set or both be empty. They may remain empty while Supabase Auth is intentionally unavailable.
+
+For Vercel serverless functions, use Supabase's shared transaction pooler connection string (port 6543) with the host and username copied from the Supabase Connect dialog. When Vercel is detected, Kite disables Psycopg prepared statements and limits its SQLAlchemy pool to one connection per function instance. For a persistent backend, use the direct connection when the host supports IPv6 (or the IPv4 add-on); otherwise use the shared session pooler. Keep database and service credentials in the deployment secret manager, not in the ZIP or source tree. Back up the database before applying migrations.
+
+When authentication is configured, set `PUBLIC_APP_URL` to the Kite HTTPS origin. In Supabase Auth, enable Google, enter the OAuth client ID and secret from Google Cloud, allow the Supabase callback URL shown in its Google provider setup, and set the Supabase Site URL and redirect allowlist to the Kite HTTPS origin (plus any intentional local development origin).
+
+If the static frontend and API are deployed on different origins, set `window.KITE_API_BASE` in `web/assets/config.js` to the API's HTTPS origin and set `KITE_CORS_ORIGINS` on the API to a comma-separated list of exact frontend origins (for example, `https://learn-python-with-kite.vercel.app`). The API must allow the `X-Kite-Registration-Key` header for guest subscription status and management requests. Do not use wildcard origins with credentialed authentication; the default CORS list intentionally covers local development and Capacitor only.
 
 ### Running the API without Docker
 
@@ -125,6 +168,15 @@ The API tests cover email registration/login and logout revocation, one-time pas
 This source is a deployable application foundation, not a Play-Console-ready release. The service-account key, Play products, OAuth provider, SMTP account, public API URL, TLS/domain, Supabase project and Capacitor billing plugin are not supplied by the prototype and must be configured by the project owner. The Google Play verification endpoint is implemented; the native purchase bridge and production credentials must be connected and validated before charging users. Docker execution was not testable on the current Windows environment because Docker is unavailable, so the isolation changes require validation on a Linux Docker host before they can be considered production-ready.
 
 The current Playground prototype has an editor and output console, not dedicated editor/instructions/test-case tabs; challenge instructions and test-case evaluation remain in the existing Challenge screen. The repository has no generated Android project or native App Back-button handler, so Android hardware/gesture Back behavior and actual isolated execution/cancellation remain unverified until the Android shell and Linux Docker runner are deployed.
+
+## Frontend-only Vercel deployment
+
+This repository's root Vercel setting points to the FastAPI entrypoint in `pyproject.toml`. To deploy only the static frontend, create a Vercel project with **Root Directory** set to `web` and **Framework Preset** set to `Other`. No install or build command is required; if Vercel asks for an output directory, use `.`. The application uses hash-based routes, so nested-route rewrites are not required. Do not select the repository root for this frontend-only project, or Vercel may build the Python backend instead.
+
+The static frontend has no Vite build and does not read Vercel environment variables. There are no frontend secrets to configure. `web/assets/config.js` currently sets `window.KITE_API_BASE` to an empty string, which uses same-origin API requests. Once the FastAPI service is hosted separately, set that value to its HTTPS origin and configure the backend's exact CORS origins, including the Vercel production and preview origins that should be allowed. Never put server credentials in `config.js` or another browser asset.
+
+Until a backend is deployed and connected, account, curriculum, lesson, quiz, challenge, subscription, saved-progress, leaderboard, and other API-backed operations are unavailable; the frontend reports those unavailable states rather than inventing results. Local theme, guest notification, and other explicitly device-local behavior can still run in the browser. Confirm those boundaries on a Vercel Preview deployment before promoting a production domain.
+
 ### Progressive Web App
 
 The static frontend is installable over HTTPS using `web/manifest.webmanifest`. `web/sw.js` caches only the public application shell and allowlisted static assets; all `/api` requests remain network-only. Offline use can reopen the cached shell, but authentication, learning data, subscriptions, and other backend-dependent features still require the API and are never replaced with cached or fabricated responses. Supported browsers expose an **Install Kite** option in the More menu; iPhone and iPad users receive Add to Home Screen guidance. `web/vercel.json` sets the manifest and service-worker response headers required for the existing `web`-root deployment.

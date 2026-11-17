@@ -882,14 +882,15 @@
   function resetToken() {
     var query = new URLSearchParams(window.location.search);
     if (query.get("token")) return query.get("token");
+    // Accepts "#reset?token=…" (Kite email), plus Supabase recovery redirects to "/#reset", which may
+    // append their parameters as "#reset&access_token=…" or "#reset#access_token=…".
     var hash = window.location.hash.slice(1);
-    var queryIndex = hash.indexOf("?");
-    if (queryIndex >= 0) {
-      var fragmentQuery = new URLSearchParams(hash.slice(queryIndex + 1));
-      if (fragmentQuery.get("token")) return fragmentQuery.get("token");
-    }
-    var fragment = new URLSearchParams(hash.slice(queryIndex + 1));
-    if (fragment.get("type") === "recovery") return fragment.get("access_token") || fragment.get("token");
+    var separator = hash.search(/[?#&]/);
+    var head = separator >= 0 ? hash.slice(0, separator) : hash;
+    var paramText = head.indexOf("=") >= 0 ? hash : (separator >= 0 ? hash.slice(separator + 1) : "");
+    var fragment = new URLSearchParams(paramText.replace(/[?#]/g, "&"));
+    if (fragment.get("token")) return fragment.get("token");
+    if (fragment.get("type") === "recovery") return fragment.get("access_token");
     return null;
   }
   function showPasswordReset(doc, reset) {
@@ -1637,7 +1638,7 @@
       "<h3 style=\"margin:0 0 8px;font-size:17px\">2. Review your selection</h3>" +
       "<p id=\"kite-selected-plan-summary\" style=\"margin:0 0 12px;line-height:1.5\"></p>" +
       "<button class=\"kite-subscription-action kite-subscription-action-primary\" id=\"kite-continue-registration\" type=\"button\" hidden>Continue to mobile-money details</button></section>" +
-      "<p class=\"sub\" id=\"kite-plan-summary\" aria-live=\"polite\" style=\"padding:8px 16px 0\">Current plan: Kite Free. No subscription is active.</p>" +
+      "<p class=\"sub\" id=\"kite-plan-summary\" aria-live=\"polite\" style=\"padding:8px 16px 0\">Checking subscription status...</p>" +
       "<button class=\"row\" type=\"button\" id=\"kite-sign-in\"><span class=\"l\">Sign in to continue</span><span class=\"val\">Sign in</span></button>" +
       "<button class=\"row\" type=\"button\" id=\"kite-manage\"><span class=\"l\">Manage subscription</span><span class=\"val\">Google Play</span></button>" +
       "<div id=\"kite-mobile-money\" hidden style=\"padding:16px;border-top:1px solid #e8e8e8\">" +
@@ -4363,7 +4364,8 @@
     });
   }
   function install(doc) {
-    if (!doc || doc.documentElement.dataset.kiteBridge) return;
+    if (!doc || !doc.body || !doc.body.hasAttribute("data-kite-screen") ||
+        doc.documentElement.dataset.kiteBridge) return;
     doc.documentElement.dataset.kiteBridge = "ready";
     var route = (location.hash || "#launch").slice(1);
     var routeKey = routeKeyFromHash(route);
@@ -4749,7 +4751,7 @@
         });
         return;
       }
-      if (target.getAttribute("data-a") === "out") {
+      if (target.getAttribute("data-a") === "out" || target.getAttribute("data-t") === "Log out") {
         event.preventDefault();
         event.stopImmediatePropagation();
         logOut(doc);

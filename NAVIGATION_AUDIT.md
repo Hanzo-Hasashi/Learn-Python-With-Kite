@@ -37,7 +37,17 @@ No separate router was added. Existing hash/history navigation, per-screen actio
 | Profile: Back, Settings, My Activity, My Achievements | Return to prior screen, open Settings, or open the corresponding guest/account panel | Original route guard required sign-in; current worktree has guest profile data and local activity | Preserved guest profile and device-local progress/activity | **Pass:** guest profile showed device-local stats/activity; Settings opened without redirect. My Achievements panel was not individually clicked |
 | Settings: profile/account controls, theme/language/notifications, subscription | Open the requested settings panel or change the preference; require auth only for account changes/purchase | Ordinary Settings route is separate from signed-in account actions | Preserved explicit account/purchase gates and guest theme/preference behavior | **Partial:** Settings and subscription state rendered as Guest/Free; purchase, account mutation, and Google Play flows were not submitted |
 | About: Back, Terms, Privacy, Contact, FAQ | Show the selected legal/help content or return | Existing screen and legal handlers were present | No mapping change | **Partial:** About route rendered; individual legal/FAQ controls were not each activated |
-| Desktop/tablet/mobile layouts | Keep navigation and menu usable within viewport | No route-specific breakage found | No redesign | **Pass:** bottom nav and More menu measured at 375×812, 768×1024, and 1440×900. Menu width stayed within the viewport to sub-pixel rounding; bottom nav had no horizontal overflow |
+| Desktop/tablet/mobile layouts | Keep navigation and menu usable within viewport | The prior audit checked selected navigation and Settings at 375×812, 768×1024, and 1440×900; the embedded screens otherwise retained a 420px phone shell | This responsive pass adds shared screen-width overrides and persistent wide-screen route navigation; see validation details below | **Partial:** desktop Home and Quiz rendered and the desktop route list was available. All routes, orientations, and device widths were not rechecked in this pass. |
+
+## Responsive layout implementation and validation
+
+The loader now applies a shared responsive stylesheet to each of the 13 embedded screen documents (`launch`, `home`, `learn`, `lesson`, `playground`, `challenge`, `quiz`, `progress`, `leaderboard`, `profile`, `preferences`, `notifications`, and `about`). It keeps the compact phone presentation on narrow screens, expands the content container for tablet and desktop widths, constrains wide reading areas, gives Home quick-access and Progress tiles additional columns, and presents the Playground editor beside its output console on sufficiently wide screens. Short landscape viewports use the available height instead of retaining the framed-phone margins.
+
+Navigation is available through the existing mobile screen controls and More sheet, a compact route rail from 740–999px, and a full labeled sidebar from 1000px upward. The wide navigation links to every embedded screen and marks the active route for assistive technology. On wide layouts the redundant in-screen bottom navigation is hidden; it remains available below the route-rail breakpoint.
+
+**Validation in this continuation:** the local app responded with HTTP 200 on the isolated port-8890 server. Using Computer Use, Chrome rendered Home and Quiz in a 1920×1038 desktop window, and the 13-route desktop navigation was exposed with Quiz content loaded. `git diff --check` and Python syntax checks passed.
+
+**Limitations:** Chrome reported user input while window resizing was attempted, so responsive-device emulation was stopped rather than bypassed. The new mobile, tablet, short-landscape, wide-playground, modal, and overflow states have not been empirically checked at each breakpoint; this continuation does not claim all 13 screens are visually validated at every size. The earlier 375×812, 768×1024, and 1440×900 checks were selected Settings/navigation checks, not a route-by-route responsive test. Firefox, Safari/iOS, Android, and installed-app layouts were not tested.
 
 ## Session, API, and history checks
 
@@ -46,7 +56,7 @@ No separate router was added. Existing hash/history navigation, per-screen actio
 - `/api/auth/session` returns `401` when there is no guest session, and `/api/progress` remains account-only. These are expected authorization responses; guest screens use local progress and public modules instead. The browser reports the expected session-check 401 as a console resource error, but it does not interrupt navigation.
 - Browser Back and Forward were exercised after Home → Learn → Lesson and returned to Learn → Lesson. Playground Exit returned to the lesson context.
 - Direct access plus refresh was verified for each of the 13 top-level routes.
-- The full Python test suite passed: 61 tests, including guest leaderboard, guest quizzes/challenges, session restoration/logout, curriculum examples/assessments, and Premium entitlement checks.
+- At the time of the original navigation audit, the Python test suite passed 61 tests, including guest leaderboard, guest quizzes/challenges, session restoration/logout, curriculum examples/assessments, and Premium entitlement checks.
 - `git diff --check` passed.
 
 ## Release verification limits
@@ -57,12 +67,24 @@ This environment has no configured Supabase/Google OAuth identity or native Goog
 
 ### Learning content
 
+#### Availability investigation — 2026-11-16
+
+The shared browser page was pointed at `http://127.0.0.1:8890`. Its lesson request failed with `ERR_CONNECTION_REFUSED` for `/api/lessons/python-variables`; the local test server had been stopped after the preceding responsive checks. The already-loaded lesson document therefore retained its pre-hydration sample while the API-backed lesson content could not be retrieved. This was a local service outage, not deletion or overwriting of curriculum data.
+
+The recovery audit found 101 non-empty lesson rows in the local `kite.db`. Every lesson ID, title, description, and content body matched the current `backend/curriculum.py` source exactly; content lengths range from 2,287 to 4,590 characters. There were no missing or extra lesson rows and no SQLite foreign-key violations. The existing progress row still references a valid lesson.
+
+Quiz and challenge definitions are source-controlled data, not database catalog rows: `backend/curriculum.py` and `backend/app.py` define 25 module quizzes (130 questions), 13 lesson-specific quizzes (52 questions), and 80 challenges (127 test cases). The database stores quiz attempt/results history; it does not store quiz prompts or challenge definitions. Startup seeds/updates the lesson table from the source catalog and does not drop lesson or progress data.
+
+For end-to-end verification, the API was temporarily started on loopback with an isolated SQLite database, leaving the existing `kite.db` untouched. Health, module, lesson, quiz, and challenge endpoints responded successfully; the browser displayed the full first lesson, its mapped 10-question quiz, and the challenge catalog. A guest quiz submission scored 10/10. The frontend now clears pre-hydration sample content and presents an accessible Retry action if lesson, module, quiz, or challenge catalog loading fails; browser checks confirmed the missing-content state and successful recovery after restoring the API route. Eleven targeted regression tests passed, including module/lesson counts, lesson examples and assessments, quiz-to-lesson/challenge mappings, lesson and quiz progress persistence, guest quiz submission, and runner-backed challenge submission with the runner mocked. The local challenge execution service itself is not part of this verification.
+
+No content recreation or database restore was needed. The production Supabase/Vercel database was not queried, so this finding establishes the local repository/database state and the shared localhost failure, not the current contents of a remote deployment.
+
 | Area | Finding and verification | Status |
 |---|---|---|
 | Learning modules and progression | 12 modules contain 101 lessons (8 lessons in each of 11 modules and 13 in Advanced). The module sequence progresses from Python foundations and types through control flow and data structures to files, errors, OOP, and advanced topics. | **FULLY FUNCTIONAL** for catalog and lesson delivery |
 | Lesson content | Every lesson has substantial explanatory content (2,287–4,590 characters in the current catalog), a worked example, walkthrough, expected output, practice, and an assessment. All 101 worked examples are distinct. The curriculum test executes/checks the examples and verifies contextual assessments. | **FULLY POPULATED**; quality is template-supported and should continue to receive educator review |
 | Repeated lesson boilerplate | Replaced the tautological generic definition with each lesson's topic objective, improved the step-by-step explanation, made the result explanation include that example's expected output, and varied the second practice prompt. Lesson IDs, examples, expected outputs, and progression were preserved. | **FIXED and regression-tested** |
-| Quizzes and challenges | The API catalog exposes 25 quizzes and 80 module challenges. Lesson assessments and quiz/topic mappings are covered by API tests. | **PARTIALLY FUNCTIONAL:** quiz/catalog behavior is tested; completing runner-backed challenges is blocked by the unavailable runner described below |
+| Quizzes and challenges | The API exposes 25 module quizzes plus 13 lesson-specific quizzes and 80 challenges. The 25 module quizzes contain 130 questions; the lesson assessments contain 52 more. Quiz/topic/lesson/challenge relationships are covered by API tests. | **CATALOGS POPULATED:** quiz submissions are verified; challenge execution depends on the separately deployed runner |
 
 ### Subscription and billing
 
@@ -74,9 +96,10 @@ The subscription dashboard is part of Settings rather than a separate route. It 
 
 - Free challenge submission is available to guests. The backend evaluates the submission without requiring an account, awards no guest XP, and saves no guest activity; the UI explains that guest results are not saved. A focused regression test covers this behavior.
 - Subscription plan selection no longer redirects to sign-in when checkout is unavailable; the UI reports the provider limitation instead of implying a purchase.
+- Direct Kite and Supabase password-recovery links now survive iframe initialization, open the new-password form, and clear the credential from the address bar; placeholder-token browser checks covered both formats.
 - The existing Python logo is used as the favicon, and the application bundle URL is versioned to avoid stale cached JavaScript during updates.
 - The 13 top-level routes, unknown-hash normalization, selected navigation systems, lesson/quiz/context flows, guest leaderboard periods, and responsive Settings layout were exercised in the browser as itemized above.
-- Python compilation and the full 61-test suite pass. Browser behavior for tested routes and interactions passed; this does not mean every control on every page was clicked.
+- The current unittest suite reports 81 tests: 73 passed and 8 Playwright browser tests were skipped because the Python Playwright package is not installed. Python compilation and `git diff --check` passed. The content-availability follow-up also passed eight focused regression tests and an isolated API/browser smoke check; this does not mean every control on every page was clicked.
 
 ### Remaining functional blockers and scope
 

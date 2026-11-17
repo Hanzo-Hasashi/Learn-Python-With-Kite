@@ -1,11 +1,11 @@
 "use strict";
 
-const CACHE_NAME = "kite-shell-v4";
+const CACHE_NAME = "kite-shell-v5";
 const CACHE_PREFIX = "kite-shell-";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
-  "/assets/app.js?v=frontend-reliability-16",
+  "/assets/app.js?v=frontend-reliability-17",
   "/assets/config.js",
   "/assets/playground-shortcut.js",
   "/assets/playground-shortcut.css",
@@ -20,7 +20,7 @@ const APP_SHELL = [
 ];
 const PUBLIC_ASSETS = new Set([
   "/manifest.webmanifest",
-  "/assets/app.js?v=frontend-reliability-16",
+  "/assets/app.js?v=frontend-reliability-17",
   "/assets/config.js",
   "/assets/playground-shortcut.js",
   "/assets/playground-shortcut.css",

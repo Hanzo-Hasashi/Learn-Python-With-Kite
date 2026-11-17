@@ -1,2 +1,2 @@
-// Set this to the deployed HTTPS FastAPI origin for a packaged Android build.
+// Set this to the separately hosted HTTPS FastAPI origin; empty means same-origin API.
 window.KITE_API_BASE = "";

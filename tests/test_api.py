@@ -23,11 +23,11 @@ os.environ["RUNNER_SHARED_SECRET"] = "test-runner-secret"
 from fastapi.testclient import TestClient
 
 from backend.app import (
-    Activity, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, LessonProgress,
+    Activity, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, Lesson, LessonProgress,
     MobileMoneyPayment, PaymentAttempt, PaymentProviderConfiguration, PaymentStatusHistory,
     PaymentTransaction, PlaygroundError, PlaygroundExecution, MODULES, QUIZZES,
     QUIZ_METADATA, QuizAttempt, SessionLocal, SubscriptionRegistration, User, app, engine, issue_token,
-    decrypt_subscription_phone,
+    database_engine_options, decrypt_subscription_phone, startup,
 )
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
 from backend.payments import PaymentStatus, ProviderPaymentResult, normalize_zambian_phone
@@ -317,11 +317,62 @@ class KiteApiTests(unittest.TestCase):
         self.assertTrue(all(item["locked"] for item in quizzes if item["module_id"] == modules[6]["id"]))
         self.assertTrue(all(item["locked"] for item in challenges if item["module_id"] == modules[6]["id"]))
 
+    def test_startup_resynchronizes_lesson_metadata_from_catalog(self):
+        source = LESSONS[0]
+        with SessionLocal() as db:
+            lesson = db.get(Lesson, source[0])
+            self.assertIsNotNone(lesson)
+            lesson.title = "Stale title"
+            lesson.description = "Stale description"
+            lesson.content = "Stale content"
+            lesson.order_num = 999
+            lesson.premium = not source[5]
+            lesson.xp_reward = 999
+            db.commit()
+
+        startup()
+
+        with SessionLocal() as db:
+            lesson = db.get(Lesson, source[0])
+            self.assertEqual(
+                (lesson.title, lesson.description, lesson.content, lesson.order_num,
+                 lesson.premium, lesson.xp_reward),
+                (source[1], source[2], source[3], source[4], source[5], source[6]),
+            )
+
+    def test_registration_access_key_is_allowed_by_cross_origin_cors(self):
+        response = self.client.options(
+            "/api/subscription/registrations/test-registration",
+            headers={
+                "Origin": "http://localhost",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "x-kite-registration-key",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost")
+        allowed_headers = response.headers.get("access-control-allow-headers", "").lower()
+        self.assertIn("x-kite-registration-key", allowed_headers)
+
+    def test_serverless_postgres_pool_is_compatible_with_transaction_pooling(self):
+        options = database_engine_options(
+            "postgresql+psycopg://user:password@pooler.example.test/database",
+            serverless=True,
+        )
+        self.assertIsNone(options["connect_args"]["prepare_threshold"])
+        self.assertEqual(options["pool_size"], 1)
+        self.assertEqual(options["max_overflow"], 0)
+        self.assertEqual(
+            database_engine_options("sqlite:///kite.db", serverless=True)["connect_args"],
+            {"check_same_thread": False},
+        )
+
     def test_new_curriculum_examples_and_assessments_are_complete(self):
         required_sections = (
             "Learning objectives\n", "Core concept\n", "Why it matters\n", "How it works\n",
             "Syntax\n", "Worked example\n", "Step-by-step walkthrough\n", "Expected output\n",
-            "Practical application\n", "Common mistakes\n", "Practice exercises\n", "Knowledge check\n",
+            "Understand the result\n", "Practical application\n", "Common mistakes\n",
+            "Practice exercises\n", "Knowledge check\n",
         )
         for lesson in LESSONS:
             self.assertGreater(len(lesson[3]), 1800, lesson[0])
@@ -367,6 +418,18 @@ class KiteApiTests(unittest.TestCase):
             self.assertTrue(challenge["description"])
             self.assertTrue(challenge["hint"])
             self.assertGreaterEqual(len(challenge["tests"]), 1)
+
+    def test_repeated_outputs_have_topic_specific_result_explanations(self):
+        lesson_by_id = {lesson[0]: lesson for lesson in LESSONS}
+        first = lesson_by_id["python-functions"][3].split(
+            "\n\nUnderstand the result\n", 1,
+        )[1].split("\n\nPractical application\n", 1)[0]
+        second = lesson_by_id["python-errors-try-except"][3].split(
+            "\n\nUnderstand the result\n", 1,
+        )[1].split("\n\nPractical application\n", 1)[0]
+        self.assertNotEqual(first, second)
+        self.assertIn("define, call, and return from functions", first)
+        self.assertIn("handle expected exceptions", second)
 
     def test_new_lesson_completion_updates_persisted_progress(self):
         with patch("backend.app.premium_entitled", return_value=True):
