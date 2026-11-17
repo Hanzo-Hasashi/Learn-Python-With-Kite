@@ -32,7 +32,7 @@
   var completedQuizResultKey = "kite.completedQuizResult";
   var guestQuizAttemptsKey = "kite.guestQuizAttempts.v1";
   var quizDraftsKey = "kite.quizDrafts.v1";
-  var launchViews = ["sign-up", "log-in", "reset", "welcome"];
+  var launchViews = ["sign-up", "log-in", "reset", "welcome", "done"];
   var knownRoutes = ["about", "challenge", "home", "launch", "leaderboard", "learn", "lesson",
     "notifications", "playground", "preferences", "profile", "progress", "quiz"];
   var refreshInFlight = null;
@@ -795,7 +795,9 @@
         form.insertBefore(label, error);
         form.insertBefore(wrapper, error);
       }
-      if (!form.querySelector("#kite-remember-me")) {
+      // This runs from a MutationObserver on #sbody, so every insertion must be idempotent:
+      // re-inserting the checkbox would re-trigger the observer without end.
+      if (!form.querySelector('input[name="remember_me"]')) {
         var rememberWrapper = doc.createElement("div");
         rememberWrapper.style.cssText = "display:flex;align-items:flex-start;gap:8px;margin:12px 0 4px";
         var remember = doc.createElement("input");
