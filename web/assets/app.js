@@ -944,8 +944,15 @@
   function applyPythonBranding(doc, route) {
     if (route === "launch") {
       var launchLayout = doc.createElement("style");
-      launchLayout.textContent = "@media(max-height:900px){.stage{height:75vh}.sheet{max-height:60vh}}";
+      launchLayout.textContent = "@media(max-height:900px){.stage{height:75vh}.sheet{max-height:60vh}}" +
+        "@media(min-width:768px) and (max-width:1200px) and (min-height:1000px) and (orientation:portrait){body.kite-email-dashboard .stage svg{position:relative;top:-48px}}";
       doc.head.appendChild(launchLayout);
+      var launchWindow = doc.defaultView;
+      function updateEmailDashboardLayout() {
+        doc.body.classList.toggle("kite-email-dashboard", launchWindow.location.hash === "#sign-up");
+      }
+      updateEmailDashboardLayout();
+      launchWindow.addEventListener("hashchange", updateEmailDashboardLayout);
     }
 
     function replaceMark(selector) {
