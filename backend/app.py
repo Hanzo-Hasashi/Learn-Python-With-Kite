@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Annotated, Any
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, func, inspect, select, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, func, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.exc import IntegrityError
 
@@ -60,13 +60,134 @@ class Base(DeclarativeBase):
     pass
 
 
+def is_hosted_environment() -> bool:
+    return bool(
+        os.getenv("RENDER") or os.getenv("VERCEL") or os.getenv("VERCEL_ENV")
+        or os.getenv("KITE_ENV", "").strip().lower() == "production"
+    )
+
+
+def validate_postgres_ssl_url(value: str, setting_name: str) -> None:
+    if not value.startswith("postgresql+psycopg://"):
+        return
+    ssl_modes = parse_qs(urlsplit(value).query).get("sslmode", [])
+    if len(ssl_modes) != 1 or ssl_modes[0].lower() not in {"require", "verify-ca", "verify-full"}:
+        parsed_url = urlsplit(value)
+        if (
+            len(ssl_modes) == 1
+            and ssl_modes[0].lower() == "disable"
+            and setting_name == "MIGRATION_DATABASE_URL"
+            and not is_hosted_environment()
+            and os.getenv("KITE_POSTGRES_INTEGRATION_TESTS") == "1"
+            and os.getenv("KITE_TEST_SAFETY_MARKER") == "KITE_DISPOSABLE_POSTGRES_TEST_ONLY"
+            and os.getenv("KITE_TEST_DATABASE_URL") == value
+            and parsed_url.hostname == "127.0.0.1"
+            and parsed_url.port == 55432
+            and parsed_url.username == "kite_test_owner"
+            and parsed_url.path == "/kite_integration_test"
+        ):
+            return
+        raise RuntimeError(
+            f"{setting_name} must specify sslmode=require, verify-ca, or verify-full."
+        )
+
+
 def database_url() -> str:
-    value = os.getenv("DATABASE_URL", "sqlite:///./kite.db")
+    value = os.getenv("DATABASE_URL", "").strip()
+    if not value:
+        if is_hosted_environment() or os.getenv("KITE_ENV", "").strip().lower() != "development":
+            raise RuntimeError(
+                "DATABASE_URL is required; SQLite is allowed only when KITE_ENV=development."
+            )
+        return "sqlite:///./kite.db"
     if value.startswith("postgres://"):
         value = "postgresql+psycopg://" + value[len("postgres://") :]
     elif value.startswith("postgresql://"):
         value = "postgresql+psycopg://" + value[len("postgresql://") :]
+    if is_hosted_environment() and not value.startswith("postgresql+psycopg://"):
+        raise RuntimeError("Hosted environments require a PostgreSQL DATABASE_URL.")
+    if is_hosted_environment():
+        validate_postgres_ssl_url(value, "DATABASE_URL")
     return value
+
+
+def validate_runtime_configuration() -> None:
+    supabase_url = os.getenv("SUPABASE_URL", "").strip()
+    supabase_key = os.getenv("SUPABASE_ANON_KEY", "").strip()
+    if bool(supabase_url) != bool(supabase_key):
+        raise RuntimeError("Set both SUPABASE_URL and SUPABASE_ANON_KEY, or leave both empty.")
+    if not is_hosted_environment():
+        return
+
+    database_url()
+    if len(os.getenv("KITE_SECRET_KEY", "").strip()) < 32:
+        raise RuntimeError("KITE_SECRET_KEY must contain at least 32 characters in hosted environments.")
+    if not supabase_url or not supabase_key:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_ANON_KEY are required in hosted environments.")
+    parsed_supabase_url = urlsplit(supabase_url)
+    if (
+        parsed_supabase_url.scheme != "https" or not parsed_supabase_url.netloc
+        or parsed_supabase_url.path not in {"", "/"} or parsed_supabase_url.query
+        or parsed_supabase_url.fragment
+    ):
+        raise RuntimeError("SUPABASE_URL must be an HTTPS project origin.")
+
+    app_url = os.getenv("PUBLIC_APP_URL", "").strip()
+    parsed_app_url = urlsplit(app_url)
+    if (
+        parsed_app_url.scheme != "https" or not parsed_app_url.netloc
+        or parsed_app_url.path not in {"", "/"} or parsed_app_url.query
+        or parsed_app_url.fragment
+    ):
+        raise RuntimeError("PUBLIC_APP_URL must be the HTTPS origin of the frontend.")
+    app_origin = parsed_app_url.scheme + "://" + parsed_app_url.netloc
+    api_url = os.getenv("PUBLIC_API_URL", "").strip()
+    parsed_api_url = urlsplit(api_url)
+    if (
+        parsed_api_url.scheme != "https" or not parsed_api_url.netloc
+        or parsed_api_url.path not in {"", "/"} or parsed_api_url.query
+        or parsed_api_url.fragment
+    ):
+        raise RuntimeError("PUBLIC_API_URL must be the HTTPS origin of the API.")
+    cookie_site = os.getenv("KITE_COOKIE_SITE", "").strip().lower().rstrip(".")
+    site_labels = cookie_site.split(".")
+    if (
+        len(site_labels) < 2
+        or any(
+            not label or not label[0].isalnum() or not label[-1].isalnum()
+            or any(not (character.isalnum() or character == "-") for character in label)
+            for label in site_labels
+        )
+        or cookie_site in {"vercel.app", "onrender.com", "supabase.co"}
+    ):
+        raise RuntimeError("KITE_COOKIE_SITE must be a registrable custom domain.")
+    frontend_host = parsed_app_url.hostname or ""
+    api_host = parsed_api_url.hostname or ""
+    if not all(
+        host == cookie_site or host.endswith("." + cookie_site)
+        for host in (frontend_host, api_host)
+    ):
+        raise RuntimeError(
+            "PUBLIC_APP_URL and PUBLIC_API_URL must use subdomains of KITE_COOKIE_SITE."
+        )
+    cors_origins = [origin.strip() for origin in os.getenv("KITE_CORS_ORIGINS", "").split(",") if origin.strip()]
+    if not cors_origins or "*" in cors_origins or app_origin not in cors_origins:
+        raise RuntimeError("KITE_CORS_ORIGINS must list exact origins and include PUBLIC_APP_URL.")
+    for origin in cors_origins:
+        parsed_origin = urlsplit(origin)
+        if (
+            parsed_origin.scheme not in {"https", "capacitor"} or not parsed_origin.netloc
+            or parsed_origin.path or parsed_origin.query or parsed_origin.fragment
+        ):
+            raise RuntimeError("Hosted KITE_CORS_ORIGINS entries must be exact HTTPS or Capacitor origins.")
+    if os.getenv("KITE_COOKIE_SECURE", "").strip().lower() != "true":
+        raise RuntimeError("KITE_COOKIE_SECURE=true is required in hosted environments.")
+    if os.getenv("KITE_COOKIE_SAMESITE", "lax").strip().lower() != "lax":
+        raise RuntimeError(
+            "KITE_COOKIE_SAMESITE=lax is required; use same-site custom domains for the frontend and API."
+        )
+    if os.getenv("KITE_ALLOW_LOCAL_AUTH", "").strip().lower() in {"1", "true", "yes"}:
+        raise RuntimeError("KITE_ALLOW_LOCAL_AUTH must be disabled in hosted environments.")
 
 
 def database_engine_options(url: str, *, serverless: bool) -> dict[str, Any]:
@@ -343,6 +464,14 @@ class QuizResult(Base):
 
 class QuizAttempt(Base):
     __tablename__ = "quiz_attempts"
+    __table_args__ = (
+        Index(
+            "uq_quiz_attempts_submission", "user_id", "quiz_id", "submission_id",
+            unique=True,
+            sqlite_where=text("submission_id IS NOT NULL"),
+            postgresql_where=text("submission_id IS NOT NULL"),
+        ),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     quiz_id: Mapped[str] = mapped_column(String(80), index=True)
@@ -359,6 +488,9 @@ class QuizAttempt(Base):
 
 class Notice(Base):
     __tablename__ = "notifications"
+    __table_args__ = (
+        Index("uq_notifications_user_event", "user_id", "event_key", unique=True),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(160))
@@ -782,17 +914,12 @@ def csrf_token(user_id: int) -> str:
 
 
 def cookie_settings(request: Request, remember_me: bool) -> dict[str, Any]:
-    origin = request.headers.get("origin")
-    cross_origin = False
-    if origin:
-        try:
-            from urllib.parse import urlparse
-
-            cross_origin = urlparse(origin).netloc != urlparse(str(request.base_url)).netloc
-        except ValueError:
-            cross_origin = True
+    same_site = os.getenv(
+        "KITE_COOKIE_SAMESITE", "lax",
+    ).strip().lower()
+    if same_site not in {"lax", "none"}:
+        raise RuntimeError("KITE_COOKIE_SAMESITE must be 'lax' or 'none'.")
     secure = request.url.scheme == "https" or os.getenv("KITE_COOKIE_SECURE", "").lower() == "true"
-    same_site = "none" if cross_origin else "lax"
     max_age = REMEMBER_DAYS * 24 * 60 * 60 if remember_me else None
     if same_site == "none":
         secure = True
@@ -1317,50 +1444,125 @@ app.add_middleware(
 app.mount("/assets", StaticFiles(directory=Path(__file__).parent.parent / "web" / "assets"), name="assets")
 
 
+def assert_database_migrations_applied() -> None:
+    from alembic.config import Config
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    project_root = Path(__file__).parent.parent
+    config = Config(str(project_root / "alembic.ini"))
+    script = ScriptDirectory.from_config(config)
+    heads = script.get_heads()
+    if len(heads) != 1:
+        raise RuntimeError("The database migration history must have exactly one head.")
+    with engine.connect() as connection:
+        current = MigrationContext.configure(connection).get_current_revision()
+    if current != heads[0]:
+        raise RuntimeError(
+            f"Database schema revision is {current or 'uninitialized'}; "
+            f"run 'alembic upgrade head' (expected {heads[0]})."
+        )
+
+
+def assert_database_schema_matches_models() -> None:
+    from backend.db_schema import compare_schema
+
+    with engine.connect() as connection:
+        differences = compare_schema(connection, Base.metadata)
+    if differences:
+        raise RuntimeError(
+            "The database schema does not match the application models. "
+            "Review the differences and create/apply a forward-only Alembic revision: "
+            + "; ".join(map(str, differences))
+        )
+
+
+def validate_runtime_database_role() -> None:
+    integration_test = os.getenv("KITE_POSTGRES_INTEGRATION_TESTS") == "1"
+    if (
+        (not is_hosted_environment() and not integration_test)
+        or engine.dialect.name != "postgresql"
+    ):
+        return
+    with engine.connect() as connection:
+        role = connection.execute(text(
+            "SELECT current_user AS role_name, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, "
+            "has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_database, "
+            "has_schema_privilege(current_user, 'public', 'CREATE') AS can_create_schema "
+            "FROM pg_roles WHERE rolname = current_user"
+        )).mappings().one()
+        elevated_access = connection.execute(text(
+            "SELECT "
+            "EXISTS (SELECT 1 FROM pg_auth_members "
+            "WHERE member = (SELECT oid FROM pg_roles WHERE rolname = current_user)) "
+            "AS has_role_memberships, "
+            "EXISTS (SELECT 1 FROM pg_namespace AS namespace "
+            "WHERE namespace.nspname NOT IN ('information_schema', 'pg_catalog') "
+            "AND namespace.nspname NOT LIKE 'pg_%' "
+            "AND has_schema_privilege(current_user, namespace.oid, 'CREATE')) "
+            "AS can_create_in_schema, "
+            "EXISTS (SELECT 1 FROM pg_class AS relation "
+            "JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+            "WHERE namespace.nspname = 'public' "
+            "AND relation.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) "
+            "AND (relation.relname = ANY(:table_names) OR relation.relname = 'alembic_version' "
+            "OR (relation.relkind = 'S' AND EXISTS ("
+            "SELECT 1 FROM pg_depend AS dependency "
+            "JOIN pg_class AS application_table ON application_table.oid = dependency.refobjid "
+            "WHERE dependency.objid = relation.oid AND dependency.deptype IN ('a', 'i') "
+            "AND application_table.relname = ANY(:table_names))))) "
+            "AS owns_application_objects"
+        ), {"table_names": list(Base.metadata.tables)}).mappings().one()
+        if (
+            role["role_name"] != "kite_runtime" or role["rolsuper"] or not role["rolbypassrls"]
+            or role["rolcreatedb"] or role["rolcreaterole"]
+            or role["can_create_database"] or role["can_create_schema"]
+            or elevated_access["has_role_memberships"]
+            or elevated_access["can_create_in_schema"]
+            or elevated_access["owns_application_objects"]
+        ):
+            raise RuntimeError(
+                "Hosted DATABASE_URL must use the non-superuser kite_runtime role "
+                "with BYPASSRLS, no elevated role memberships, no schema CREATE privileges, "
+                "and no ownership of application objects."
+            )
+        for table in Base.metadata.sorted_tables:
+            has_dml = connection.execute(text(
+                "SELECT has_table_privilege(current_user, :table_name, 'SELECT') "
+                "AND has_table_privilege(current_user, :table_name, 'INSERT') "
+                "AND has_table_privilege(current_user, :table_name, 'UPDATE') "
+                "AND has_table_privilege(current_user, :table_name, 'DELETE')"
+            ), {"table_name": "public." + table.name}).scalar_one()
+            if not has_dml:
+                raise RuntimeError(
+                    f"Hosted DATABASE_URL is missing required application table permissions for {table.name}."
+                )
+        sequences = connection.execute(text(
+            "SELECT seq.relname FROM pg_class AS seq "
+            "JOIN pg_namespace AS sequence_schema ON sequence_schema.oid = seq.relnamespace "
+            "JOIN pg_depend AS dependency ON dependency.objid = seq.oid "
+            "AND dependency.deptype IN ('a', 'i') "
+            "JOIN pg_class AS application_table ON application_table.oid = dependency.refobjid "
+            "WHERE seq.relkind = 'S' AND sequence_schema.nspname = 'public' "
+            "AND application_table.relname = ANY(:table_names)"
+        ), {"table_names": list(Base.metadata.tables)}).scalars().all()
+        for sequence_name in sequences:
+            has_sequence_access = connection.execute(text(
+                "SELECT has_sequence_privilege(current_user, :sequence_name, 'USAGE') "
+                "AND has_sequence_privilege(current_user, :sequence_name, 'SELECT')"
+            ), {"sequence_name": "public." + sequence_name}).scalar_one()
+            if not has_sequence_access:
+                raise RuntimeError(
+                    f"Hosted DATABASE_URL is missing required sequence permissions for {sequence_name}."
+                )
+
+
 @app.on_event("startup")
 def startup() -> None:
-    if bool(os.getenv("SUPABASE_URL")) != bool(os.getenv("SUPABASE_ANON_KEY")):
-        raise RuntimeError("Set both SUPABASE_URL and SUPABASE_ANON_KEY, or leave both empty.")
-    Base.metadata.create_all(engine)
-    notification_columns = {column["name"] for column in inspect(engine).get_columns("notifications")}
-    quiz_attempt_columns = {column["name"] for column in inspect(engine).get_columns("quiz_attempts")}
-    user_columns = {column["name"] for column in inspect(engine).get_columns("users")}
-    with engine.begin() as connection:
-        if "event_key" not in notification_columns:
-            connection.execute(text("ALTER TABLE notifications ADD COLUMN event_key VARCHAR(160)"))
-        if "target_route" not in notification_columns:
-            connection.execute(text("ALTER TABLE notifications ADD COLUMN target_route VARCHAR(40)"))
-        if "submission_id" not in quiz_attempt_columns:
-            connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN submission_id VARCHAR(64)"))
-        if "request_hash" not in quiz_attempt_columns:
-            connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN request_hash VARCHAR(64)"))
-        if "result_json" not in quiz_attempt_columns:
-            connection.execute(text("ALTER TABLE quiz_attempts ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"))
-        if "auth_session_version" not in user_columns:
-            connection.execute(text("ALTER TABLE users ADD COLUMN auth_session_version INTEGER NOT NULL DEFAULT 0"))
-        connection.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_user_event "
-            "ON notifications (user_id, event_key)"
-        ))
-        connection.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_attempts_submission "
-            "ON quiz_attempts (user_id, quiz_id, submission_id) WHERE submission_id IS NOT NULL"
-        ))
-    if engine.dialect.name == "postgresql":
-        identifier_preparer = engine.dialect.identifier_preparer
-        with engine.begin() as connection:
-            roles = connection.execute(text(
-                "SELECT rolname FROM pg_roles WHERE rolname IN (:anon, :authenticated)"
-            ), {"anon": "anon", "authenticated": "authenticated"}).scalars().all()
-            grantees = ["PUBLIC"] + [identifier_preparer.quote(role) for role in roles]
-            for table in Base.metadata.sorted_tables:
-                table_name = "public." + identifier_preparer.quote(table.name)
-                connection.exec_driver_sql(
-                    f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY"
-                )
-                connection.exec_driver_sql(
-                    f"REVOKE ALL PRIVILEGES ON TABLE {table_name} FROM {', '.join(grantees)}"
-                )
+    validate_runtime_configuration()
+    assert_database_migrations_applied()
+    assert_database_schema_matches_models()
+    validate_runtime_database_role()
     with SessionLocal() as db:
         for row in LESSONS:
             lesson = db.get(Lesson, row[0])

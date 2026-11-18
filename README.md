@@ -22,18 +22,23 @@ Signed-in sessions use HTTP-only, same-site cookies and a per-user CSRF header; 
 For Docker Compose, create a local `.env` file in the project root with at least the following values:
 
 ```powershell
+KITE_ENV=development
 KITE_SECRET_KEY=replace-with-a-random-32-character-string
 RUNNER_SHARED_SECRET=replace-with-a-different-random-32-character-string
 DATABASE_URL=sqlite:////data/kite.db
 ```
 
-Docker Compose reads this file automatically. A plain `uvicorn` process does not load `.env` by itself; set the environment variables in the shell as shown below. Local password authentication is disabled unless `KITE_ALLOW_LOCAL_AUTH` is explicitly enabled.
+You can start from `.env.example`, then replace both secret placeholders with different random values. Docker Compose reads `.env` automatically. A plain `uvicorn` process does not load `.env` by itself; set the environment variables in the shell as shown below. Local password authentication is disabled unless `KITE_ALLOW_LOCAL_AUTH` is explicitly enabled.
 
 ### Docker (recommended)
 
 ```powershell
-docker compose up --build
+docker compose build
+docker compose run --rm --no-deps app alembic upgrade head
+docker compose up
 ```
+
+Migrations are an explicit step and do not run from FastAPI startup. Repeat the migration command after pulling a schema revision, before restarting the app.
 
 Then open `http://localhost:8000` in the browser.
 
@@ -44,9 +49,11 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 $env:KITE_SECRET_KEY = "replace-with-a-random-value-of-at-least-32-characters"
+$env:KITE_ENV = "development"
 $env:DATABASE_URL = "sqlite:///./kite.db"
 # Optional: enable password authentication for local development only.
 $env:KITE_ALLOW_LOCAL_AUTH = "true"
+alembic upgrade head
 uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -68,7 +75,7 @@ For Vercel serverless functions, use Supabase's shared transaction pooler connec
 
 When authentication is configured, set `PUBLIC_APP_URL` to the Kite HTTPS origin. In Supabase Auth, enable Google, enter the OAuth client ID and secret from Google Cloud, allow the Supabase callback URL shown in its Google provider setup, and set the Supabase Site URL and redirect allowlist to the Kite HTTPS origin (plus any intentional local development origin).
 
-If the static frontend and API are deployed on different origins, set `window.KITE_API_BASE` in `web/assets/config.js` to the API's HTTPS origin and set `KITE_CORS_ORIGINS` on the API to a comma-separated list of exact frontend origins (for example, `https://learn-python-with-kite.vercel.app`). The API must allow the `X-Kite-Registration-Key` header for guest subscription status and management requests. Do not use wildcard origins with credentialed authentication; the default CORS list intentionally covers local development and Capacitor only.
+If the static frontend and API are deployed on different origins, set `window.KITE_API_BASE` in `web/assets/config.js` to the API's HTTPS origin and set `KITE_CORS_ORIGINS` on the API to a comma-separated list of exact frontend origins (for example, `https://learn.example.com`). The API must allow the `X-Kite-Registration-Key` header for guest subscription status and management requests. Do not use wildcard origins with credentialed authentication. Production cookie authentication additionally requires the shared custom-domain configuration described below; allowing an origin through CORS alone does not make cross-site cookies reliable.
 
 ### Running the API without Docker
 
@@ -81,6 +88,86 @@ python -m pip install -r requirements.txt
 Keep the same `.env` and `KITE_SECRET_KEY` across server restarts; `.env` is ignored by Git and changing the key invalidates locally issued sign-in tokens.
 
 In this mode authentication, learning and settings endpoints run, but code execution and Stop intentionally report runner-unavailable errors unless a separately isolated runner is configured. The Playground does not run its prototype JavaScript interpreter as a Python fallback. Do not execute learner code inside the API process.
+
+## Render + Supabase backend preparation
+
+The frontend remains on Vercel; this section prepares the existing FastAPI backend for a separate Render web service and Supabase Postgres/Auth. No Render service, Supabase project, or live configuration is created by these instructions. Render explicitly describes its Free instances as unsuitable for production: they spin down after 15 minutes without inbound traffic, take about a minute to wake, and have an ephemeral filesystem. Use a Free web service only for preview or staging; never rely on its filesystem or SQLite for persistent data. Keep durable data in Supabase Postgres.
+
+### Render web service
+
+Create a Web Service from this repository using the repository root as its root directory and `main` as the branch. Select Python and a region also available for the Supabase project; Frankfurt is one possible shared region, but latency from Zambia has not been measured. The root `.python-version` selects the latest available Python 3.12 patch, matching the project's `>=3.12` requirement and Docker runtime.
+
+Use these commands and settings:
+
+| Render setting | Value |
+| --- | --- |
+| Build command | `pip install -r requirements.txt` |
+| Start command | `uvicorn backend.app:app --host 0.0.0.0 --port $PORT` |
+| Health check path | `/health` |
+
+Render supplies `PORT`; do not hardcode a port. `/health` is a liveness response, not an end-to-end database or authentication check. Run reviewed migrations from a trusted one-off environment before starting the service; the web process performs read-only migration/schema checks and refuses to start if the database is not current.
+
+### Required Render environment variables
+
+Set these in the Render dashboard's environment settings, not in Git or the frontend:
+
+| Variable | Required value |
+| --- | --- |
+| `KITE_ENV` | `production` (fails closed if a production deployment omits its PostgreSQL URL) |
+| `DATABASE_URL` | Supabase Postgres connection string for the `kite_runtime` role created below. A persistent backend can use the direct connection when Render has IPv6 reachability; otherwise use Supabase's shared **Session Pooler** URL (port 5432). Preserve the copied host, adapt the username to the `kite_runtime` role using Supabase's documented pooler format, percent-encode reserved characters in the database password, and include `sslmode=require` (or stronger certificate verification). Do not use the transaction pooler intended for short-lived serverless connections. |
+| `KITE_SECRET_KEY` | A stable, private random value of at least 32 characters. Keep it unchanged: rotation invalidates sessions and makes existing encrypted phone numbers unreadable. |
+| `SUPABASE_URL` | The HTTPS Project URL from the Supabase project settings. |
+| `SUPABASE_ANON_KEY` | The project's publishable key (or legacy anon key); this is the variable name the backend currently reads. Never put a service-role/secret key here. |
+| `PUBLIC_APP_URL` | The frontend's custom HTTPS origin, e.g. `https://learn.example.com` (no path). |
+| `PUBLIC_API_URL` | The API's custom HTTPS origin, e.g. `https://api.example.com` (no path). |
+| `KITE_COOKIE_SITE` | The shared registrable custom domain, e.g. `example.com`; both public origins must be that domain or one of its subdomains. |
+| `KITE_CORS_ORIGINS` | The exact frontend custom origin, e.g. `https://learn.example.com`; add only other exact origins actually used. Never use `*` with credentialed requests. |
+| `KITE_COOKIE_SECURE` | `true` |
+| `KITE_COOKIE_SAMESITE` | `lax`; frontend and API must be under the same registrable custom domain. |
+
+`KITE_ALLOW_LOCAL_AUTH` must remain unset or `false`. `LOG_LEVEL=INFO` is optional. Render supplies its own `RENDER` and `PORT` values; do not set these manually. Keep `MIGRATION_DATABASE_URL` out of the web service environment; it is a separate, short-lived, privileged connection for trusted migration commands only. Keep payment provider credentials, Google Play service-account credentials, and runner secrets unset unless those separate integrations have been deliberately configured and verified. `KITE_PAWAPAY_ENABLED` must remain `false` until merchant onboarding and payment tests are complete. Backend `SMTP_*` settings do not configure Supabase Auth email.
+
+Lenco is not implemented in this repository. Do not configure or advertise Lenco payments until a provider adapter and signed-webhook verification are implemented and validated against Lenco's current integration documentation and sandbox.
+
+### Supabase setup
+
+1. Create a Supabase project and set a strong database password. Copy the connection string from **Connect**; do not construct the pooler hostname or username manually. For Render's persistent process, prefer the direct connection only after confirming IPv6 reachability; otherwise choose Session Pooler. The connection password belongs only in Render's `DATABASE_URL`.
+2. Before applying the migration, connect as the database owner and run `migrations/bootstrap_runtime_role.psql` with `psql -v ON_ERROR_STOP=1 -f migrations/bootstrap_runtime_role.psql $env:MIGRATION_DATABASE_URL`. The script prompts for a unique password for `kite_runtime`; store that password only in the restricted runtime `DATABASE_URL`. It removes public-schema CREATE inherited by all users, grants the runtime role only schema usage, and does not grant application-table access until the security migration.
+3. In a trusted migration environment, set `MIGRATION_DATABASE_URL` to the owner connection string and run `alembic upgrade head` for a fresh database. The fresh baseline creates all application tables; the next revision enables RLS, restricts client-role table/sequence access, and grants the runtime role only required DML and sequence access. Use the same migration owner for later revisions. Clear `MIGRATION_DATABASE_URL` from the process environment after migration.
+4. For an existing Kite database, take and verify a backup first. Set `MIGRATION_DATABASE_URL`, run `python -m backend.migration_tools preflight`, and proceed only if it reports an exact baseline match or only the specifically listed additive compatibility columns/indexes. Then run `alembic stamp d9f9f9ebbced`, `alembic upgrade head`, and `alembic check`. The stamp records the existing schema baseline; it does not apply the initial table-creation migration. Any other difference is a stop condition and must be reviewed separately. Never run the legacy `migrations/20261116_subscription_payments.sql`; its schema is now managed by Alembic.
+
+Example trusted-migration commands in PowerShell:
+
+```powershell
+$env:MIGRATION_DATABASE_URL = "<owner connection URL>"
+# Fresh, empty database:
+alembic upgrade head
+alembic check
+
+# Existing database only, after backup and successful preflight:
+python -m backend.migration_tools preflight
+alembic stamp d9f9f9ebbced
+alembic upgrade head
+alembic check
+
+Remove-Item Env:\MIGRATION_DATABASE_URL
+```
+
+Run either the fresh-database commands or the existing-database commands, not both. Do not copy the migration-owner URL into Render's service environment.
+5. In **Authentication → URL Configuration**, set the Site URL to the frontend custom origin (for example, `https://learn.example.com`). Add the exact production redirect URLs used by the app, such as `https://learn.example.com/` and `https://learn.example.com/#reset`. Add local redirect URLs only to a development project or when intentionally testing locally.
+6. Enable email authentication. Supabase's default SMTP is restricted to project team members and has a low rate limit; configure a custom SMTP provider in Supabase Auth before sending email to real learners. Render Free also blocks outbound SMTP ports, so do not depend on the backend's local SMTP fallback.
+7. For Google sign-in, configure the Google provider in Supabase Auth. In Google Cloud, add the callback URI displayed by the Supabase provider setup (the project-specific Supabase `/auth/v1/callback` URL); do not guess the project reference or callback value.
+8. The frontend is a separate Vercel static site. Set `window.KITE_API_BASE` in `web/assets/config.js` to the Render API custom origin (for example, `https://api.example.com`) and redeploy the existing Vercel project. Keep the corresponding frontend origin in Render's `KITE_CORS_ORIGINS`.
+
+For production, keep Vercel and Render but map custom hostnames under one registrable domain, such as `learn.example.com` to Vercel and `api.example.com` to Render. Set `window.KITE_API_BASE` in `web/assets/config.js` to the API custom origin, retain the exact frontend origin in `KITE_CORS_ORIGINS`, and use `KITE_COOKIE_SAMESITE=lax`. Do not deploy the current `vercel.app`/`onrender.com` cross-site cookie configuration: third-party-cookie restrictions can break authentication. The actual domain and DNS are operator-provided and are not configured here. Verify sign-in, refresh, sign-out, CSRF, password recovery, and CORS in the target browsers before release; browser compatibility has not been tested in this repository.
+
+### Database and runtime limitations
+
+Alembic migrations are versioned and forward-only; automatic destructive downgrades are intentionally unsupported. FastAPI startup performs no table creation, schema repair, or DDL. It verifies the current migration revision and model/schema compatibility, checks the restricted runtime-role privileges, and then retains the existing idempotent lesson and plan synchronization. Use `alembic check` after applying migrations to catch model/migration drift. The runtime role is deliberately `BYPASSRLS` because this API uses its own authenticated data-access checks and does not set per-user PostgreSQL RLS context; never expose its connection string to the browser or Supabase client.
+
+The backend's `/health` route is a liveness response and does not test database or authentication flows. PostgreSQL-specific migrations, Supabase role grants, and cookie behavior have not been verified against a live Supabase project or deployed Render service. Production startup requires Vercel and Render custom hostnames under the configured shared domain and `SameSite=Lax`; the default `vercel.app` and `onrender.com` origins are intentionally rejected. Real-browser authentication testing remains a deployment gate. The Python runner is a separate isolated Docker service; no hosted runner configuration is included here.
+
+Official references: [Render Python version](https://render.com/docs/python-version), [Render web services](https://render.com/docs/web-services), [Render Free limitations](https://render.com/docs/free), [Supabase Postgres connection methods](https://supabase.com/docs/guides/database/connecting-to-postgres), [Supabase Auth redirect URLs](https://supabase.com/docs/guides/auth/redirect-urls), [Supabase custom SMTP](https://supabase.com/docs/guides/auth/auth-smtp), and [Supabase Google sign-in](https://supabase.com/docs/guides/auth/social-sign-in/auth-google).
 
 ## Google Play subscriptions
 
@@ -122,7 +209,7 @@ The Settings subscription journey is usable even when no mobile-money processor 
 
 Zambian mobile numbers are normalized to E.164 (`+260` plus nine national digits; mobile ranges starting with 7 or 9) on both client and server. The backend encrypts the full number with AES-GCM using a key derived from `KITE_SECRET_KEY`; only the last four digits are returned to clients. `KITE_SECRET_KEY` must be a stable, secret value of at least 32 characters and must be backed up securely: changing it makes existing encrypted phone numbers unreadable. Phone lookup and idempotency digests are keyed, and registration access keys are high-entropy capabilities stored only as hashes. Guest registrations can be viewed using the `X-Kite-Registration-Key` header and linked to a signed-in account before payment initiation. The `phone_ciphertext` is never returned by the API.
 
-The additive schema is in [`migrations/20261116_subscription_payments.sql`](./migrations/20261116_subscription_payments.sql). It creates plan, registration, transaction, attempt, status-history, and provider-configuration tables with foreign keys, uniqueness constraints, indexes, status checks, and deny-by-default RLS. The application also creates these tables through SQLAlchemy and applies the same no-direct-client-access RLS/revoke policy on PostgreSQL startup. Apply the migration only after checking the target Supabase schema and taking a backup; this repository environment did not have access to the production Supabase database, so its schema was not queried or changed. Keep `DATABASE_URL` server-side. Do not grant the Supabase `anon` or `authenticated` roles direct access to payment or phone tables.
+The historical [`migrations/20261116_subscription_payments.sql`](./migrations/20261116_subscription_payments.sql) is retained for reference and must not be applied. All application tables, including payment tables, are now managed by the Alembic revision chain described in the deployment section. The PostgreSQL security revision enables RLS and revokes direct client-role access; it does not create per-user RLS policies because requests use the server-side API authorization layer. Keep `DATABASE_URL` server-side. Do not grant the Supabase `anon` or `authenticated` roles direct access to payment or phone tables.
 
 The provider boundary lives in [`backend/payments.py`](./backend/payments.py): adapters implement initiation, transaction verification, and signed-webhook verification and return the shared payment states `NOT_INITIATED`, `PENDING`, `PROCESSING`, `SUCCESSFUL`, `FAILED`, `CANCELLED`, or `EXPIRED`. Register the adapter in the backend provider registry and add an enabled `payment_provider_configurations` row; credentials belong in the host's secret manager/environment, never in that table or browser code. The provider initiation response cannot activate a subscription. Only a verified response/webhook with the exact reference, amount, and currency can create an active subscription; duplicate events are idempotent. Verification can also reconcile delayed outcomes. Failed attempts are recorded and may be retried with a new idempotency key and transaction reference. Provider-specific authentication, payload parsing, signature verification, callback URL, retry rules, and status mapping remain the adapter's responsibility.
 
@@ -136,7 +223,9 @@ Local password authentication is disabled by default. To use it for local develo
 
 Password recovery uses Supabase Auth when Supabase is configured. Local recovery sends email only when `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, and (if required by the SMTP server) `SMTP_USER`/`SMTP_PASSWORD` are configured. Local auth attempts are rate-limited per process and are not shared across multiple workers or restarts, so production deployments must also enable Supabase Auth limits and appropriate edge/proxy rate limiting.
 
-On PostgreSQL startup, Kite enables row-level security for its application tables and revokes direct table privileges from `PUBLIC` and the Supabase `anon`/`authenticated` roles when present. The FastAPI backend continues to access the tables through its server-side `DATABASE_URL`; never expose that URL or a Supabase service-role key to browser code.
+The versioned PostgreSQL security migration enables row-level security and revokes direct table privileges from `PUBLIC` and the Supabase `anon`/`authenticated` roles when present. FastAPI startup verifies the migration revision, schema, and restricted runtime-role privileges; it does not perform schema DDL. The backend accesses tables through its server-side `DATABASE_URL`; never expose that URL or a Supabase service-role key to browser code.
+
+The `kite_runtime` role has `BYPASSRLS` and there are no per-user PostgreSQL RLS policies. RLS is therefore not the tenant-isolation boundary for API requests: FastAPI authorization and user-scoped queries are. Every handler reading or changing user-owned data must scope access to the authenticated user or an explicitly validated capability. Keep runtime database credentials private, and test cross-user access whenever adding or changing an ownership-sensitive endpoint.
 
 Google sign-in uses Supabase Auth with PKCE. In Supabase, enable the Google provider, enter the OAuth client ID and secret from Google Cloud, and allow the Supabase callback and Kite HTTPS origin. Without the required provider configuration, Kite reports an error instead of creating a false session. This environment has no configured Supabase project, Google OAuth credentials, or SMTP delivery, so real Google sign-in, email verification delivery, and provider-issued recovery links cannot be exercised here.
 
@@ -162,6 +251,42 @@ python -m unittest discover -s tests -v
 ```
 
 The API tests cover email registration/login and logout revocation, one-time password-reset tokens, provider verification and identity linking, rate limiting, profile/email/password/settings changes, persisted progress and XP idempotency, module/lesson catalogs, quiz scoring and best-score retries, challenge scoring, notification actions, authenticated and guest leaderboard access, Python Pro/Top 10/Bug Hunter achievement tracking, premium access, mocked Google purchase verification/expiry, and ownership-checked Playground cancellation. Runner API tests cover authentication, input bounds, cancellation signaling and fail-closed behavior outside Linux. Browser verification covers editor indentation, syntax highlighting, line-number updates, local save/restore, console clearing and contextual navigation. For release, test real execution and process cleanup in the Linux Docker container and the Play Billing lifecycle against Play test products.
+
+### Isolated PostgreSQL integration tests
+
+PostgreSQL integration tests use a separate Compose project and a dedicated `kite_integration_test` database. They do not use the root `compose.yaml`, its application/runner services, the `.env` file, or any Supabase/Render configuration. The test container is pinned to PostgreSQL 17.12, exposes port 55432 on `127.0.0.1` only, and stores data in a separate named volume. The local `tests\postgres-test.env` file contains disposable credentials, is ignored by Git, and must never be reused outside this test database.
+
+From the repository root in Windows PowerShell, create the local environment file from the safe template, replace both password placeholders with different URL-safe random test-only values of at least 24 characters, then start with a clean test-only volume:
+
+```powershell
+Copy-Item tests\postgres-test.env.example tests\postgres-test.env
+# Edit tests\postgres-test.env with unique test-only values before continuing.
+docker compose --env-file tests\postgres-test.env -f compose.postgres-test.yaml down --volumes --remove-orphans
+docker compose --env-file tests\postgres-test.env -f compose.postgres-test.yaml up --detach --wait postgres-test
+```
+
+Run the PostgreSQL-only integration suite (Python dependencies from `requirements.txt` must already be installed):
+
+```powershell
+.\tests\run_postgres_integration.ps1
+```
+
+The runner reads only `tests\postgres-test.env`, sets explicit owner/runtime URLs and the required safety marker, removes hosted/Supabase environment variables, and checks that the database is ready. The Python suite independently refuses to run unless both URLs point to `127.0.0.1:55432/kite_integration_test` with the expected test roles and marker. Before each destructive schema reset, it verifies the connected database and owner identity. It exercises fresh/repeated migrations, legacy-schema adoption with data preservation, migration-history access, role/table/sequence privileges, forbidden DDL, FastAPI startup as `kite_runtime`, and cross-user progress, quiz, notification, subscription/payment, and execution access. These tests run against PostgreSQL; SQLite tests are not substituted.
+
+Inspect the latest test results and service state:
+
+```powershell
+docker compose --env-file tests\postgres-test.env -f compose.postgres-test.yaml ps
+docker compose --env-file tests\postgres-test.env -f compose.postgres-test.yaml logs --no-color postgres-test
+```
+
+Stop and remove only this test stack and its disposable database volume:
+
+```powershell
+docker compose --env-file tests\postgres-test.env -f compose.postgres-test.yaml down --volumes --remove-orphans
+```
+
+The PostgreSQL suite has not been run until Docker Desktop is available and the explicit runner completes successfully. A passing SQLite suite does not count as PostgreSQL verification.
 
 ## Important release boundary
 

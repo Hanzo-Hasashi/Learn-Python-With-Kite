@@ -7,3 +7,4 @@ node_modules/
 android/
 *.py[cod]
 google-play-service-account.json
+tests/postgres-test.env

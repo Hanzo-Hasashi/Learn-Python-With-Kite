@@ -11,9 +11,13 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
+
 DB_DIR = tempfile.TemporaryDirectory()
 logging.disable(logging.CRITICAL)
 os.environ["DATABASE_URL"] = "sqlite:///" + Path(DB_DIR.name, "test.db").as_posix()
+os.environ.pop("MIGRATION_DATABASE_URL", None)
 os.environ["KITE_SECRET_KEY"] = "test-only-secret-key-with-at-least-32-characters"
 os.environ["KITE_ALLOW_LOCAL_AUTH"] = "true"
 os.environ["SUPABASE_URL"] = ""
@@ -21,13 +25,16 @@ os.environ["SUPABASE_ANON_KEY"] = ""
 os.environ["RUNNER_SHARED_SECRET"] = "test-runner-secret"
 
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from backend.app import (
     Activity, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, Lesson, LessonProgress,
     MobileMoneyPayment, PaymentAttempt, PaymentProviderConfiguration, PaymentStatusHistory,
     PaymentTransaction, PlaygroundError, PlaygroundExecution, MODULES, QUIZZES,
     QUIZ_METADATA, QuizAttempt, SessionLocal, SubscriptionRegistration, User, app, engine, issue_token,
-    database_engine_options, decrypt_subscription_phone, startup,
+    cookie_settings, database_engine_options, database_url, decrypt_subscription_phone, startup,
+    validate_runtime_configuration,
+    validate_postgres_ssl_url,
 )
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
 from backend.payments import PaymentStatus, ProviderPaymentResult, normalize_zambian_phone
@@ -36,7 +43,7 @@ from backend.payments import PaymentStatus, ProviderPaymentResult, normalize_zam
 class KiteApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        Base.metadata.create_all(engine)
+        command.upgrade(Config(str(Path(__file__).parent.parent / "alembic.ini")), "head")
         cls.client_context = TestClient(app)
         cls.client = cls.client_context.__enter__()
 
@@ -111,6 +118,131 @@ class KiteApiTests(unittest.TestCase):
             })
             self.assertEqual(hosted_registration.status_code, 503)
 
+    def test_hosted_database_configuration_requires_postgres(self):
+        with patch.dict(os.environ, {"RENDER": "true"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "DATABASE_URL is required"):
+                database_url()
+            os.environ["DATABASE_URL"] = "sqlite:///local.db"
+            with self.assertRaisesRegex(RuntimeError, "require a PostgreSQL"):
+                database_url()
+            os.environ["DATABASE_URL"] = "postgres://user:password@db.example.test/postgres?sslmode=require"
+            self.assertEqual(
+                database_url(),
+                "postgresql+psycopg://user:password@db.example.test/postgres?sslmode=require",
+            )
+            os.environ["DATABASE_URL"] = "postgresql://user:password@db.example.test/postgres"
+            with self.assertRaisesRegex(RuntimeError, "must specify sslmode"):
+                database_url()
+            os.environ["DATABASE_URL"] = "postgresql://user:password@db.example.test/postgres?sslmode=disable"
+            with self.assertRaisesRegex(RuntimeError, "must specify sslmode"):
+                database_url()
+
+    def test_sqlite_fallback_requires_explicit_development_mode(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "KITE_ENV=development"):
+                database_url()
+
+        with patch.dict(os.environ, {"KITE_ENV": "development"}, clear=True):
+            self.assertEqual(database_url(), "sqlite:///./kite.db")
+
+        with patch.dict(os.environ, {"KITE_ENV": "production"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "DATABASE_URL is required"):
+                database_url()
+            os.environ["DATABASE_URL"] = "sqlite:///local.db"
+            with self.assertRaisesRegex(RuntimeError, "require a PostgreSQL"):
+                database_url()
+
+    def test_ssl_disabled_is_allowed_only_for_marked_local_migration_tests(self):
+        test_url = (
+            "postgresql+psycopg://kite_test_owner:test-password@127.0.0.1:55432/"
+            "kite_integration_test?sslmode=disable"
+        )
+        test_environment = {
+            "KITE_POSTGRES_INTEGRATION_TESTS": "1",
+            "KITE_TEST_SAFETY_MARKER": "KITE_DISPOSABLE_POSTGRES_TEST_ONLY",
+            "KITE_TEST_DATABASE_URL": test_url,
+        }
+        with patch.dict(os.environ, test_environment, clear=True):
+            validate_postgres_ssl_url(test_url, "MIGRATION_DATABASE_URL")
+
+        unsafe_url = test_url.replace("127.0.0.1", "db.example.test")
+        with patch.dict(os.environ, {
+            **test_environment,
+            "KITE_TEST_DATABASE_URL": unsafe_url,
+        }, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "must specify sslmode"):
+                validate_postgres_ssl_url(unsafe_url, "MIGRATION_DATABASE_URL")
+
+    def test_hosted_runtime_requires_supabase_secure_cookies_and_exact_cors(self):
+        hosted_config = {
+            "RENDER": "true",
+            "DATABASE_URL": "postgresql://kite_runtime:password@db.example.test/postgres?sslmode=require",
+            "KITE_SECRET_KEY": "test-only-secret-key-with-at-least-32-characters",
+            "SUPABASE_URL": "https://kite-project.supabase.co",
+            "SUPABASE_ANON_KEY": "sb_publishable_test",
+            "PUBLIC_APP_URL": "https://learn.example.com",
+            "PUBLIC_API_URL": "https://api.example.com",
+            "KITE_COOKIE_SITE": "example.com",
+            "KITE_CORS_ORIGINS": "https://learn.example.com",
+            "KITE_COOKIE_SECURE": "true",
+            "KITE_COOKIE_SAMESITE": "lax",
+            "KITE_ALLOW_LOCAL_AUTH": "false",
+        }
+        with patch.dict(os.environ, hosted_config, clear=True):
+            validate_runtime_configuration()
+
+            os.environ["KITE_CORS_ORIGINS"] = "*"
+            with self.assertRaisesRegex(RuntimeError, "exact origins"):
+                validate_runtime_configuration()
+
+            os.environ["KITE_CORS_ORIGINS"] = hosted_config["KITE_CORS_ORIGINS"]
+            os.environ["KITE_COOKIE_SECURE"] = "false"
+            with self.assertRaisesRegex(RuntimeError, "KITE_COOKIE_SECURE=true"):
+                validate_runtime_configuration()
+
+            os.environ["KITE_COOKIE_SECURE"] = "true"
+            os.environ["SUPABASE_ANON_KEY"] = ""
+            with self.assertRaisesRegex(RuntimeError, "both SUPABASE_URL and SUPABASE_ANON_KEY"):
+                validate_runtime_configuration()
+
+            os.environ["SUPABASE_ANON_KEY"] = hosted_config["SUPABASE_ANON_KEY"]
+            os.environ["PUBLIC_API_URL"] = "https://kite.onrender.com"
+            with self.assertRaisesRegex(RuntimeError, "must use subdomains"):
+                validate_runtime_configuration()
+
+            os.environ["PUBLIC_API_URL"] = hosted_config["PUBLIC_API_URL"]
+            os.environ["KITE_COOKIE_SAMESITE"] = "none"
+            with self.assertRaisesRegex(RuntimeError, "KITE_COOKIE_SAMESITE=lax"):
+                validate_runtime_configuration()
+
+    def test_cookie_policy_uses_secure_same_site_settings_in_hosted_environment(self):
+        request = Request({
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/auth/login",
+            "raw_path": b"/api/auth/login",
+            "query_string": b"",
+            "headers": [],
+            "server": ("api.onrender.com", 80),
+            "client": ("127.0.0.1", 12345),
+        })
+        with patch.dict(os.environ, {
+            "RENDER": "true",
+            "KITE_COOKIE_SECURE": "true",
+            "KITE_COOKIE_SAMESITE": "lax",
+        }, clear=True):
+            settings = cookie_settings(request, True)
+        self.assertTrue(settings["httponly"])
+        self.assertTrue(settings["secure"])
+        self.assertEqual(settings["samesite"], "lax")
+
+        with patch.dict(os.environ, {}, clear=True):
+            local_settings = cookie_settings(request, False)
+        self.assertFalse(local_settings["secure"])
+        self.assertEqual(local_settings["samesite"], "lax")
+
     def test_local_password_recovery_requires_auth_provider_or_local_opt_in(self):
         with patch.dict(os.environ, {
             "KITE_ALLOW_LOCAL_AUTH": "false",
@@ -184,6 +316,12 @@ class KiteApiTests(unittest.TestCase):
         response = self.client.post("/api/auth/logout", headers=self.headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.get("/api/me", headers=self.headers).status_code, 401)
+
+    def test_tampered_local_auth_token_is_rejected(self):
+        token = self.issue_token(self.email)
+        tampered = token[:-1] + ("a" if token[-1] != "a" else "b")
+        response = self.client.get("/api/me", headers={"Authorization": "Bearer " + tampered})
+        self.assertEqual(response.status_code, 401)
 
     def test_profile_email_password_and_settings_changes_persist(self):
         profile = self.client.patch("/api/me", headers=self.headers, json={"name": "Updated Kite Learner"})
@@ -353,6 +491,20 @@ class KiteApiTests(unittest.TestCase):
         self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost")
         allowed_headers = response.headers.get("access-control-allow-headers", "").lower()
         self.assertIn("x-kite-registration-key", allowed_headers)
+
+    def test_credentials_cors_does_not_allow_unlisted_origins(self):
+        response = self.client.options(
+            "/api/me",
+            headers={
+                "Origin": "https://attacker.example",
+                "Access-Control-Request-Method": "PATCH",
+                "Access-Control-Request-Headers": "x-kite-csrf",
+            },
+        )
+        self.assertNotEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://attacker.example",
+        )
 
     def test_serverless_postgres_pool_is_compatible_with_transaction_pooling(self):
         options = database_engine_options(

@@ -1,0 +1,14 @@
+\set ON_ERROR_STOP on
+
+SELECT 'CREATE ROLE kite_runtime'
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'kite_runtime')
+\gexec
+
+ALTER ROLE kite_runtime
+    WITH LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
+\password kite_runtime
+
+SELECT format('GRANT CONNECT ON DATABASE %I TO kite_runtime', current_database())
+\gexec
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO kite_runtime;
