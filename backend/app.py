@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, func, select, text
@@ -33,7 +34,15 @@ from backend.payments import (
     PaymentProviderError,
     ProviderPaymentResult,
     get_mobile_money_provider,
+    is_payment_provider_available,
     normalize_zambian_phone,
+    register_mobile_money_provider,
+)
+from backend.lenco import (
+    LENCO_COLLECTION_WEBHOOK_EVENTS,
+    LENCO_PROVIDER_IDS,
+    lenco_providers,
+    verify_lenco_webhook_signature,
 )
 from backend.curriculum import (
     ADDITIONAL_LESSONS,
@@ -48,6 +57,10 @@ from backend.curriculum import (
     LESSON_ONLY_QUIZ_DATA,
     LESSON_ONLY_QUIZ_LESSONS,
 )
+
+
+for lenco_provider in lenco_providers:
+    register_mobile_money_provider(lenco_provider)
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -65,6 +78,20 @@ def is_hosted_environment() -> bool:
         os.getenv("RENDER") or os.getenv("VERCEL") or os.getenv("VERCEL_ENV")
         or os.getenv("KITE_ENV", "").strip().lower() == "production"
     )
+
+
+def vercel_proxy_mode() -> bool:
+    return os.getenv("KITE_VERCEL_PROXY", "").strip().lower() in {"1", "true", "yes"}
+
+
+def configured_cors_origins() -> list[str]:
+    return [
+        origin.strip()
+        for origin in os.getenv(
+            "KITE_CORS_ORIGINS", "http://localhost,https://localhost,capacitor://localhost"
+        ).split(",")
+        if origin.strip()
+    ]
 
 
 def validate_postgres_ssl_url(value: str, setting_name: str) -> None:
@@ -149,28 +176,7 @@ def validate_runtime_configuration() -> None:
         or parsed_api_url.fragment
     ):
         raise RuntimeError("PUBLIC_API_URL must be the HTTPS origin of the API.")
-    cookie_site = os.getenv("KITE_COOKIE_SITE", "").strip().lower().rstrip(".")
-    site_labels = cookie_site.split(".")
-    if (
-        len(site_labels) < 2
-        or any(
-            not label or not label[0].isalnum() or not label[-1].isalnum()
-            or any(not (character.isalnum() or character == "-") for character in label)
-            for label in site_labels
-        )
-        or cookie_site in {"vercel.app", "onrender.com", "supabase.co"}
-    ):
-        raise RuntimeError("KITE_COOKIE_SITE must be a registrable custom domain.")
-    frontend_host = parsed_app_url.hostname or ""
-    api_host = parsed_api_url.hostname or ""
-    if not all(
-        host == cookie_site or host.endswith("." + cookie_site)
-        for host in (frontend_host, api_host)
-    ):
-        raise RuntimeError(
-            "PUBLIC_APP_URL and PUBLIC_API_URL must use subdomains of KITE_COOKIE_SITE."
-        )
-    cors_origins = [origin.strip() for origin in os.getenv("KITE_CORS_ORIGINS", "").split(",") if origin.strip()]
+    cors_origins = configured_cors_origins()
     if not cors_origins or "*" in cors_origins or app_origin not in cors_origins:
         raise RuntimeError("KITE_CORS_ORIGINS must list exact origins and include PUBLIC_APP_URL.")
     for origin in cors_origins:
@@ -180,11 +186,51 @@ def validate_runtime_configuration() -> None:
             or parsed_origin.path or parsed_origin.query or parsed_origin.fragment
         ):
             raise RuntimeError("Hosted KITE_CORS_ORIGINS entries must be exact HTTPS or Capacitor origins.")
+    if vercel_proxy_mode():
+        if app_origin != parsed_api_url.scheme + "://" + parsed_api_url.netloc:
+            raise RuntimeError(
+                "Vercel proxy mode requires PUBLIC_API_URL to match PUBLIC_APP_URL."
+            )
+        proxy_secret = os.getenv("KITE_PROXY_SECRET", "").strip()
+        previous_proxy_secret = os.getenv("KITE_PROXY_SECRET_PREVIOUS", "").strip()
+        if len(proxy_secret) < 32:
+            raise RuntimeError(
+                "KITE_PROXY_SECRET must contain at least 32 characters in Vercel proxy mode."
+            )
+        if previous_proxy_secret and (
+            len(previous_proxy_secret) < 32
+            or hmac.compare_digest(previous_proxy_secret, proxy_secret)
+        ):
+            raise RuntimeError(
+                "KITE_PROXY_SECRET_PREVIOUS must be a different value of at least 32 characters."
+            )
+    else:
+        cookie_site = os.getenv("KITE_COOKIE_SITE", "").strip().lower().rstrip(".")
+        site_labels = cookie_site.split(".")
+        if (
+            len(site_labels) < 2
+            or any(
+                not label or not label[0].isalnum() or not label[-1].isalnum()
+                or any(not (character.isalnum() or character == "-") for character in label)
+                for label in site_labels
+            )
+            or cookie_site in {"vercel.app", "onrender.com", "supabase.co"}
+        ):
+            raise RuntimeError("KITE_COOKIE_SITE must be a registrable custom domain.")
+        frontend_host = parsed_app_url.hostname or ""
+        api_host = parsed_api_url.hostname or ""
+        if not all(
+            host == cookie_site or host.endswith("." + cookie_site)
+            for host in (frontend_host, api_host)
+        ):
+            raise RuntimeError(
+                "PUBLIC_APP_URL and PUBLIC_API_URL must use subdomains of KITE_COOKIE_SITE."
+            )
     if os.getenv("KITE_COOKIE_SECURE", "").strip().lower() != "true":
         raise RuntimeError("KITE_COOKIE_SECURE=true is required in hosted environments.")
     if os.getenv("KITE_COOKIE_SAMESITE", "lax").strip().lower() != "lax":
         raise RuntimeError(
-            "KITE_COOKIE_SAMESITE=lax is required; use same-site custom domains for the frontend and API."
+            "KITE_COOKIE_SAMESITE=lax is required for hosted cookie authentication."
         )
     if os.getenv("KITE_ALLOW_LOCAL_AUTH", "").strip().lower() in {"1", "true", "yes"}:
         raise RuntimeError("KITE_ALLOW_LOCAL_AUTH must be disabled in hosted environments.")
@@ -738,6 +784,12 @@ def enforce_auth_rate_limit(
     window_seconds: int,
 ) -> None:
     client_host = request.client.host if request.client else "unknown"
+    if getattr(request.state, "kite_proxy_authenticated", False):
+        forwarded_ip = request.headers.get("x-real-ip", "").strip()
+        try:
+            client_host = str(ipaddress.ip_address(forwarded_ip))
+        except ValueError:
+            pass
     identity_hash = hashlib.sha256(
         (action + "\0" + client_host + "\0" + identity.strip().lower()).encode()
     ).hexdigest()
@@ -1429,9 +1481,7 @@ def seed_subscription_plans(db: Session) -> None:
 app = FastAPI(title="Kite API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv(
-        "KITE_CORS_ORIGINS", "http://localhost,https://localhost,capacitor://localhost"
-    ).split(",") if origin.strip()],
+    allow_origins=configured_cors_origins(),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=[
@@ -1442,6 +1492,43 @@ app.add_middleware(
     ],
 )
 app.mount("/assets", StaticFiles(directory=Path(__file__).parent.parent / "web" / "assets"), name="assets")
+
+
+@app.middleware("http")
+async def enforce_proxy_and_browser_origin(request: Request, call_next):
+    if vercel_proxy_mode() and request.url.path != "/health":
+        expected = os.getenv("KITE_PROXY_SECRET", "").strip()
+        previous = os.getenv("KITE_PROXY_SECRET_PREVIOUS", "").strip()
+        supplied = request.headers.get("x-kite-proxy-secret", "")
+        valid_secret = bool(expected) and hmac.compare_digest(supplied, expected)
+        if previous:
+            valid_secret = hmac.compare_digest(supplied, previous) | valid_secret
+        if not valid_secret:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Not found"},
+                headers={"Cache-Control": "private, no-store"},
+            )
+        request.state.kite_proxy_authenticated = True
+
+    if (
+        is_hosted_environment()
+        and request.url.path.startswith("/api/")
+        and request.method not in {"GET", "HEAD", "OPTIONS"}
+        and not request.url.path.startswith("/api/payment-webhooks/")
+    ):
+        origin = request.headers.get("origin")
+        if not origin or origin not in configured_cors_origins():
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "This request origin is not allowed."},
+                headers={"Cache-Control": "private, no-store"},
+            )
+
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 def assert_database_migrations_applied() -> None:
@@ -2917,6 +3004,17 @@ def subscription_registration_payload(
         message = "Verified payment received. Your prepaid Kite Premium access is active."
     elif payment_payload and payment_payload["status"] == PaymentStatus.NOT_INITIATED.value:
         message = "Registration saved. Payment has not started, and Premium is not active."
+    elif (
+        payment_payload
+        and payment_payload["provider_id"] in LENCO_PROVIDER_IDS
+        and payment_payload["status"] in {
+            PaymentStatus.PENDING.value, PaymentStatus.PROCESSING.value,
+        }
+    ):
+        message = (
+            "Lenco payment request sent. Approve it on your selected mobile-money phone; "
+            "Kite will activate Premium only after server-side verification."
+        )
     elif payment_payload and payment_payload["status"] == PaymentStatus.FAILED.value:
         message = "Registration saved, but the latest payment attempt failed. Premium is not active."
     elif payment_payload and payment_payload["status"] == PaymentStatus.SUCCESSFUL.value:
@@ -3028,12 +3126,35 @@ def reconcile_payment_result(
     source: str,
     db: Session,
 ) -> bool:
+    locked_payment = db.scalar(
+        select(PaymentTransaction)
+        .where(PaymentTransaction.id == payment.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked_payment is None:
+        return False
+    payment = locked_payment
+    amounts_match = False
+    try:
+        actual_amount = Decimal(str(result.amount)) if result.amount is not None else None
+        expected_amount = Decimal(payment.amount)
+        amounts_match = bool(
+            actual_amount is not None
+            and actual_amount.is_finite()
+            and expected_amount.is_finite()
+            and actual_amount == expected_amount
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        amounts_match = False
     if (
         not result.verified
         or result.transaction_reference != payment.reference
-        or result.amount != payment.amount
+        or not amounts_match
         or result.currency != payment.currency
     ):
+        payment.failure_code = result.failure_code or "VERIFICATION_MISMATCH"
+        payment.updated_at = utcnow()
         log.warning("Rejected unverified or mismatched provider result for %s.", payment.reference)
         return False
     if result.provider_reference:
@@ -3073,7 +3194,7 @@ def plans(db: Session = Depends(get_db)):
         PaymentProviderConfiguration.enabled.is_(True),
     )):
         provider = get_mobile_money_provider(config.provider_id)
-        if provider:
+        if provider and is_payment_provider_available(provider):
             configured_payment_providers.append({
                 "id": provider.provider_id,
                 "name": provider.display_name,
@@ -3256,7 +3377,11 @@ def claim_subscription_registration(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    registration = db.get(SubscriptionRegistration, registration_id)
+    registration = db.scalar(
+        select(SubscriptionRegistration)
+        .where(SubscriptionRegistration.id == registration_id)
+        .with_for_update()
+    )
     if registration is None or not hmac.compare_digest(
         registration.access_key_hash, hashlib.sha256(payload.access_key.encode()).hexdigest(),
     ):
@@ -3276,7 +3401,11 @@ def cancel_subscription_registration(
     access_key: Annotated[str | None, Header(alias="X-Kite-Registration-Key")] = None,
     db: Session = Depends(get_db),
 ):
-    registration = db.get(SubscriptionRegistration, registration_id)
+    registration = db.scalar(
+        select(SubscriptionRegistration)
+        .where(SubscriptionRegistration.id == registration_id)
+        .with_for_update()
+    )
     if registration is None:
         raise HTTPException(status_code=404, detail="Subscription registration not found.")
     authorize_subscription_registration(registration, user, access_key)
@@ -3310,10 +3439,19 @@ def initiate_subscription_payment(
     access_key: Annotated[str | None, Header(alias="X-Kite-Registration-Key")] = None,
     db: Session = Depends(get_db),
 ):
-    registration = db.get(SubscriptionRegistration, registration_id)
+    registration = db.scalar(
+        select(SubscriptionRegistration)
+        .where(SubscriptionRegistration.id == registration_id)
+        .with_for_update()
+    )
     if registration is None:
         raise HTTPException(status_code=404, detail="Subscription registration not found.")
     authorize_subscription_registration(registration, user, access_key)
+    if registration.status in {"CANCELLED", "FAILED", "EXPIRED"}:
+        raise HTTPException(
+            status_code=409,
+            detail="This subscription registration is no longer available for payment.",
+        )
 
     duplicate_attempt = db.scalar(select(PaymentAttempt).where(
         PaymentAttempt.idempotency_key == payload.idempotency_key,
@@ -3326,10 +3464,13 @@ def initiate_subscription_payment(
 
     provider_config = db.get(PaymentProviderConfiguration, payload.provider_id)
     provider = get_mobile_money_provider(payload.provider_id)
-    if not provider_config or not provider_config.enabled or provider is None:
+    if (
+        not provider_config or not provider_config.enabled or provider is None
+        or not is_payment_provider_available(provider)
+    ):
         return {
             **subscription_registration_payload(registration, db),
-            "message": "Registration is saved. Payment has not started because a mobile-money provider is not connected.",
+            "message": "Registration is saved. Payment has not started because this payment provider is not available for checkout.",
         }
     if registration.user_id is None:
         raise HTTPException(
@@ -3445,9 +3586,19 @@ def verify_subscription_payment(
         return subscription_registration_payload(registration, db)
     provider_config = db.get(PaymentProviderConfiguration, payment.provider_id)
     provider = get_mobile_money_provider(payment.provider_id)
-    if not provider_config or not provider_config.enabled or provider is None:
+    if (
+        not provider_config or not provider_config.enabled or provider is None
+        or not is_payment_provider_available(provider)
+    ):
         return subscription_registration_payload(registration, db)
-    result = provider.verify(payment.reference, payment.provider_reference)
+    try:
+        result = provider.verify(payment.reference, payment.provider_reference)
+    except PaymentProviderError:
+        log.warning("Payment provider verification could not be completed.")
+        raise HTTPException(
+            status_code=503,
+            detail="Payment status could not be confirmed. Please check again.",
+        ) from None
     reconcile_payment_result(payment, result, "verification", db)
     db.commit()
     return subscription_registration_payload(registration, db)
@@ -3455,17 +3606,57 @@ def verify_subscription_payment(
 
 @app.post("/api/payment-webhooks/{provider_id}")
 async def receive_payment_webhook(provider_id: str, request: Request, db: Session = Depends(get_db)):
-    provider_config = db.get(PaymentProviderConfiguration, provider_id)
-    provider = get_mobile_money_provider(provider_id)
-    if not provider_config or not provider_config.enabled or provider is None:
+    body = await request.body()
+    payment = None
+    configured_provider_id = provider_id
+    if provider_id == "lenco":
+        if not verify_lenco_webhook_signature(
+            body, request.headers, os.getenv("KITE_LENCO_API_TOKEN"),
+        ):
+            raise HTTPException(status_code=400, detail="Payment webhook signature is invalid.")
+        try:
+            event = json.loads(body)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Payment webhook payload is invalid.") from None
+        if not isinstance(event, dict):
+            raise HTTPException(status_code=400, detail="Payment webhook payload is invalid.")
+        if event.get("event") not in LENCO_COLLECTION_WEBHOOK_EVENTS:
+            return {"received": True, "ignored": True}
+        event_data = event.get("data")
+        reference = event_data.get("reference") if isinstance(event_data, dict) else None
+        if not isinstance(reference, str) or not reference:
+            raise HTTPException(status_code=400, detail="Payment webhook reference is invalid.")
+        payment = db.scalar(select(PaymentTransaction).where(
+            PaymentTransaction.reference == reference,
+            PaymentTransaction.provider_id.in_(LENCO_PROVIDER_IDS),
+        ))
+        if payment is None:
+            return {"received": True, "ignored": True}
+        configured_provider_id = payment.provider_id
+    provider_config = db.get(PaymentProviderConfiguration, configured_provider_id)
+    provider = get_mobile_money_provider(configured_provider_id)
+    if (
+        not provider_config or not provider_config.enabled or provider is None
+        or not is_payment_provider_available(provider)
+    ):
         raise HTTPException(status_code=404, detail="Payment provider webhook is not configured.")
-    result = provider.verify_webhook(await request.body(), request.headers)
+    try:
+        result = provider.verify_webhook(body, request.headers)
+    except PaymentProviderError:
+        log.warning("Payment webhook transaction could not be independently verified.")
+        raise HTTPException(
+            status_code=503,
+            detail="Payment status could not be confirmed. The provider may retry this webhook.",
+        ) from None
+    if result.failure_code == "IGNORED_EVENT":
+        return {"received": True, "ignored": True}
     if not result.verified or not result.transaction_reference:
         raise HTTPException(status_code=400, detail="Payment webhook signature or transaction is invalid.")
-    payment = db.scalar(select(PaymentTransaction).where(
-        PaymentTransaction.reference == result.transaction_reference,
-        PaymentTransaction.provider_id == provider_id,
-    ))
+    if payment is None:
+        payment = db.scalar(select(PaymentTransaction).where(
+            PaymentTransaction.reference == result.transaction_reference,
+            PaymentTransaction.provider_id == configured_provider_id,
+        ))
     if payment is None:
         raise HTTPException(status_code=404, detail="Payment transaction not found.")
     reconcile_payment_result(payment, result, "webhook", db)

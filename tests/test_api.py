@@ -1,5 +1,6 @@
 import contextlib
 import hashlib
+import hmac
 import io
 import logging
 import os
@@ -30,7 +31,7 @@ from starlette.requests import Request
 from backend.app import (
     Activity, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, Lesson, LessonProgress,
     MobileMoneyPayment, PaymentAttempt, PaymentProviderConfiguration, PaymentStatusHistory,
-    PaymentTransaction, PlaygroundError, PlaygroundExecution, MODULES, QUIZZES,
+    PaymentTransaction, PlaygroundError, PlaygroundExecution, Subscription, MODULES, QUIZZES,
     QUIZ_METADATA, QuizAttempt, SessionLocal, SubscriptionRegistration, User, app, engine, issue_token,
     cookie_settings, database_engine_options, database_url, decrypt_subscription_phone, startup,
     validate_runtime_configuration,
@@ -110,12 +111,13 @@ class KiteApiTests(unittest.TestCase):
             **disabled_auth,
             "KITE_ALLOW_LOCAL_AUTH": "true",
             "VERCEL": "1",
+            "KITE_CORS_ORIGINS": "https://learn.example.com",
         }):
             hosted_registration = self.client.post("/api/auth/register", json={
                 "name": "Unverified Learner",
                 "email": registration_email,
                 "password": "secure-example-password",
-            })
+            }, headers={"Origin": "https://learn.example.com"})
             self.assertEqual(hosted_registration.status_code, 503)
 
     def test_hosted_database_configuration_requires_postgres(self):
@@ -214,6 +216,150 @@ class KiteApiTests(unittest.TestCase):
             os.environ["KITE_COOKIE_SAMESITE"] = "none"
             with self.assertRaisesRegex(RuntimeError, "KITE_COOKIE_SAMESITE=lax"):
                 validate_runtime_configuration()
+
+    def test_hosted_runtime_accepts_same_origin_vercel_proxy_with_secret(self):
+        proxy_config = {
+            "RENDER": "true",
+            "DATABASE_URL": "postgresql://kite_runtime:password@db.example.test/postgres?sslmode=require",
+            "KITE_SECRET_KEY": "test-only-secret-key-with-at-least-32-characters",
+            "SUPABASE_URL": "https://kite-project.supabase.co",
+            "SUPABASE_ANON_KEY": "sb_publishable_test",
+            "PUBLIC_APP_URL": "https://learn-python-with-kite.vercel.app",
+            "PUBLIC_API_URL": "https://learn-python-with-kite.vercel.app",
+            "KITE_VERCEL_PROXY": "true",
+            "KITE_PROXY_SECRET": "proxy-secret-for-tests-that-is-at-least-32",
+            "KITE_CORS_ORIGINS": "https://learn-python-with-kite.vercel.app",
+            "KITE_COOKIE_SECURE": "true",
+            "KITE_COOKIE_SAMESITE": "lax",
+            "KITE_ALLOW_LOCAL_AUTH": "false",
+        }
+        with patch.dict(os.environ, proxy_config, clear=True):
+            validate_runtime_configuration()
+
+            os.environ["KITE_PROXY_SECRET"] = "too-short"
+            with self.assertRaisesRegex(RuntimeError, "KITE_PROXY_SECRET"):
+                validate_runtime_configuration()
+
+            os.environ["KITE_PROXY_SECRET"] = proxy_config["KITE_PROXY_SECRET"]
+            os.environ["KITE_PROXY_SECRET_PREVIOUS"] = "short"
+            with self.assertRaisesRegex(RuntimeError, "KITE_PROXY_SECRET_PREVIOUS"):
+                validate_runtime_configuration()
+
+            os.environ["KITE_PROXY_SECRET_PREVIOUS"] = proxy_config["KITE_PROXY_SECRET"]
+            with self.assertRaisesRegex(RuntimeError, "different value"):
+                validate_runtime_configuration()
+
+            os.environ.pop("KITE_PROXY_SECRET_PREVIOUS")
+            os.environ["PUBLIC_API_URL"] = "https://kite.onrender.com"
+            with self.assertRaisesRegex(RuntimeError, "match PUBLIC_APP_URL"):
+                validate_runtime_configuration()
+
+    def test_vercel_proxy_blocks_direct_api_requests_and_keeps_health_public(self):
+        secret = "proxy-secret-for-tests-that-is-at-least-32"
+        with patch.dict(os.environ, {
+            "KITE_VERCEL_PROXY": "true",
+            "KITE_PROXY_SECRET": secret,
+            "KITE_PROXY_SECRET_PREVIOUS": "",
+        }, clear=False):
+            direct = self.client.get("/api/auth/session")
+            self.assertEqual(direct.status_code, 404)
+            self.assertEqual(direct.headers["Cache-Control"], "private, no-store")
+
+            proxied = self.client.get(
+                "/api/auth/session",
+                headers={"X-Kite-Proxy-Secret": secret},
+            )
+            self.assertEqual(proxied.status_code, 401)
+            self.assertEqual(proxied.headers["Cache-Control"], "private, no-store")
+
+            health = self.client.get("/health")
+            self.assertEqual(health.status_code, 200)
+
+    def test_proxy_secret_rotation_accepts_current_and_previous_secret(self):
+        current = "proxy-secret-current-for-tests-at-least-32"
+        previous = "proxy-secret-previous-for-tests-at-least-32"
+        with patch.dict(os.environ, {
+            "KITE_VERCEL_PROXY": "true",
+            "KITE_PROXY_SECRET": current,
+            "KITE_PROXY_SECRET_PREVIOUS": previous,
+        }, clear=False):
+            for secret in (current, previous):
+                response = self.client.get(
+                    "/api/auth/session",
+                    headers={"X-Kite-Proxy-Secret": secret},
+                )
+                self.assertEqual(response.status_code, 401)
+
+            rejected = self.client.get(
+                "/api/auth/session",
+                headers={"X-Kite-Proxy-Secret": "unrecognized-secret"},
+            )
+            self.assertEqual(rejected.status_code, 404)
+
+    def test_proxy_rate_limit_uses_validated_visitor_ip(self):
+        secret = "proxy-secret-for-tests-that-is-at-least-32"
+        email = f"proxy-limit-{uuid.uuid4().hex}@example.com"
+        payload = {
+            "name": "Proxy Rate Limit",
+            "email": email,
+            "password": "secure-example-password",
+        }
+        with patch.dict(os.environ, {
+            "KITE_VERCEL_PROXY": "true",
+            "KITE_PROXY_SECRET": secret,
+            "KITE_PROXY_SECRET_PREVIOUS": "",
+        }, clear=False):
+            headers = {
+                "X-Kite-Proxy-Secret": secret,
+                "X-Real-IP": "203.0.113.10",
+            }
+            for _ in range(5):
+                self.client.post("/api/auth/register", json=payload, headers=headers)
+            limited = self.client.post("/api/auth/register", json=payload, headers=headers)
+            self.assertEqual(limited.status_code, 429)
+
+            other_visitor = self.client.post(
+                "/api/auth/register",
+                json=payload,
+                headers={
+                    "X-Kite-Proxy-Secret": secret,
+                    "X-Real-IP": "203.0.113.11",
+                },
+            )
+            self.assertNotEqual(other_visitor.status_code, 429)
+
+    def test_hosted_unsafe_api_requests_require_an_allowed_origin(self):
+        with patch.dict(os.environ, {
+            "KITE_ENV": "production",
+            "KITE_VERCEL_PROXY": "false",
+            "KITE_PROXY_SECRET": "",
+            "KITE_CORS_ORIGINS": "https://learn.example.com",
+            "SUPABASE_URL": "",
+            "SUPABASE_ANON_KEY": "",
+            "KITE_ALLOW_LOCAL_AUTH": "false",
+        }, clear=False):
+            payload = {
+                "name": "Origin Check",
+                "email": f"origin-{uuid.uuid4().hex}@example.com",
+                "password": "secure-example-password",
+            }
+            missing_origin = self.client.post("/api/auth/register", json=payload)
+            self.assertEqual(missing_origin.status_code, 403)
+            self.assertEqual(missing_origin.headers["Cache-Control"], "private, no-store")
+
+            untrusted_origin = self.client.post(
+                "/api/auth/register",
+                json=payload,
+                headers={"Origin": "https://attacker.example"},
+            )
+            self.assertEqual(untrusted_origin.status_code, 403)
+
+            trusted_origin = self.client.post(
+                "/api/auth/register",
+                json=payload,
+                headers={"Origin": "https://learn.example.com"},
+            )
+            self.assertEqual(trusted_origin.status_code, 503)
 
     def test_cookie_policy_uses_secure_same_site_settings_in_hosted_environment(self):
         request = Request({
@@ -1558,6 +1704,551 @@ class KiteApiTests(unittest.TestCase):
         self.assertFalse(plans.json()["mobile_money"]["enabled"])
         self.assertEqual(plans.json()["mobile_money"]["providers"], [])
         self.assertEqual(checkout.status_code, 503)
+
+    def test_lenco_stays_hidden_and_unavailable_while_collection_flags_are_off(self):
+        with SessionLocal() as db:
+            db.merge(PaymentProviderConfiguration(
+                provider_id="lenco_airtel",
+                enabled=True,
+                environment="sandbox",
+                options_json="{}",
+            ))
+            user = db.query(User).filter_by(email=self.email).one()
+            registration_id = str(uuid.uuid4())
+            db.add(SubscriptionRegistration(
+                id=registration_id,
+                user_id=user.id,
+                plan_id="premium_monthly",
+                idempotency_key=str(uuid.uuid4()),
+                request_hash="a" * 64,
+                access_key_hash="b" * 64,
+                phone_ciphertext="unused",
+                phone_hash="c" * 64,
+                phone_last4="4567",
+                status="PENDING_PAYMENT",
+            ))
+            db.add(PaymentTransaction(
+                id=str(uuid.uuid4()),
+                registration_id=registration_id,
+                reference="KITE-SUB-" + uuid.uuid4().hex[:20].upper(),
+                amount="19.99",
+                currency="ZMW",
+                status="NOT_INITIATED",
+            ))
+            db.commit()
+
+        env = {
+            "KITE_LENCO_BASE_URL": "https://api.lenco.co/access/v2",
+            "KITE_LENCO_API_TOKEN": "test-only-lenco-token",
+            "KITE_LENCO_PUBLIC_KEY": "test-only-lenco-public-key",
+            "KITE_LENCO_COLLECTION_ENABLED": "false",
+            "KITE_LENCO_ZMW_COLLECTION_CONFIRMED": "false",
+            "KITE_PAWAPAY_ENABLED": "false",
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False):
+                plans = self.client.get("/api/plans")
+                self.assertTrue(all(plan["currency"] == "ZMW" for plan in plans.json()["plans"]))
+                self.assertNotIn(env["KITE_LENCO_API_TOKEN"], plans.text)
+                self.assertNotIn(env["KITE_LENCO_PUBLIC_KEY"], plans.text)
+                self.assertNotIn(
+                    "lenco",
+                    [provider["id"] for provider in plans.json()["payment_providers"]],
+                )
+
+                started = self.client.post(
+                    "/api/subscription/registrations/" + registration_id + "/payments",
+                    headers=self.headers,
+                    json={
+                        "provider_id": "lenco_airtel",
+                        "idempotency_key": str(uuid.uuid4()),
+                    },
+                )
+                self.assertEqual(started.status_code, 200, started.text)
+                self.assertEqual(started.json()["payment"]["status"], "NOT_INITIATED")
+                self.assertFalse(started.json()["premium_active"])
+
+                webhook = self.client.post(
+                    "/api/payment-webhooks/lenco",
+                    content=b'{"event":"transaction.successful"}',
+                    headers={"X-Lenco-Signature": "invalid"},
+                )
+                self.assertEqual(webhook.status_code, 400)
+
+                with SessionLocal() as db:
+                    transaction = db.query(PaymentTransaction).filter_by(
+                        registration_id=registration_id,
+                    ).one()
+                    self.assertEqual(transaction.currency, "ZMW")
+                    self.assertEqual(transaction.status, "NOT_INITIATED")
+                    self.assertEqual(
+                        db.query(PaymentAttempt).filter_by(transaction_id=transaction.id).count(),
+                        0,
+                    )
+        finally:
+            with SessionLocal() as db:
+                db.query(PaymentProviderConfiguration).filter_by(provider_id="lenco_airtel").delete()
+                db.commit()
+
+    def test_lenco_payment_is_verified_before_once_only_subscription_activation(self):
+        registration_key = secrets.token_urlsafe(32)
+        registration = self.client.post(
+            "/api/subscription/registrations",
+            headers=self.headers,
+            json={
+                "plan_id": "premium_monthly",
+                "phone_number": "+260971234567",
+                "idempotency_key": str(uuid.uuid4()),
+                "access_key": registration_key,
+            },
+        )
+        self.assertEqual(registration.status_code, 201, registration.text)
+        registration_id = registration.json()["registration_id"]
+        reference = registration.json()["payment"]["reference"]
+
+        with SessionLocal() as db:
+            db.add(PaymentProviderConfiguration(
+                provider_id="lenco_airtel",
+                enabled=True,
+                environment="sandbox",
+                options_json="{}",
+            ))
+            db.commit()
+
+        def collection(status, amount="19.99", currency="ZMW"):
+            return {
+                "reference": reference,
+                "amount": amount,
+                "currency": currency,
+                "type": "mobile-money",
+                "status": status,
+                "lencoReference": "lenco-" + reference[-8:],
+                "mobileMoneyDetails": {"country": "zm", "operator": "airtel"},
+            }
+
+        env = {
+            "KITE_LENCO_BASE_URL": "https://api.lenco.co/access/v2",
+            "KITE_LENCO_API_TOKEN": "test-only-lenco-token",
+            "KITE_LENCO_COLLECTION_ENABLED": "true",
+            "KITE_LENCO_ZMW_COLLECTION_CONFIRMED": "true",
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False):
+                with patch(
+                    "backend.lenco._lenco_api_request",
+                    side_effect=[
+                        collection("pay-offline"),
+                        collection("successful"),
+                        collection("successful"),
+                    ],
+                ) as provider_request:
+                    started = self.client.post(
+                        f"/api/subscription/registrations/{registration_id}/payments",
+                        headers=self.headers,
+                        json={
+                            "provider_id": "lenco_airtel",
+                            "idempotency_key": str(uuid.uuid4()),
+                        },
+                    )
+                    self.assertEqual(started.status_code, 200, started.text)
+                    self.assertEqual(started.json()["payment"]["status"], "PENDING")
+                    self.assertIn("Approve it on your selected mobile-money phone", started.json()["message"])
+                    self.assertFalse(started.json()["premium_active"])
+
+                    verify_url = f"/api/subscription/registrations/{registration_id}/verify"
+                    verified = self.client.post(verify_url, headers=self.headers)
+                    self.assertEqual(verified.status_code, 200, verified.text)
+                    self.assertEqual(verified.json()["payment"]["status"], "SUCCESSFUL")
+                    self.assertTrue(verified.json()["premium_active"])
+
+                    repeated = self.client.post(verify_url, headers=self.headers)
+                    self.assertEqual(repeated.status_code, 200, repeated.text)
+                    self.assertTrue(repeated.json()["premium_active"])
+                    self.assertEqual(provider_request.call_count, 3)
+
+            with SessionLocal() as db:
+                transaction = db.query(PaymentTransaction).filter_by(
+                    registration_id=registration_id,
+                ).one()
+                self.assertEqual(transaction.currency, "ZMW")
+                self.assertEqual(transaction.status, "SUCCESSFUL")
+                self.assertEqual(
+                    db.query(Subscription).filter_by(
+                        token_hash=hashlib.sha256(
+                            ("mobile-money:" + transaction.id).encode(),
+                        ).hexdigest(),
+                    ).count(),
+                    1,
+                )
+        finally:
+            with SessionLocal() as db:
+                db.query(PaymentProviderConfiguration).filter_by(
+                    provider_id="lenco_airtel",
+                ).delete()
+                db.commit()
+
+    def test_lenco_payment_initiation_replay_does_not_create_another_attempt(self):
+        registration = self.client.post(
+            "/api/subscription/registrations",
+            headers=self.headers,
+            json={
+                "plan_id": "premium_monthly",
+                "phone_number": "+260971234567",
+                "idempotency_key": str(uuid.uuid4()),
+                "access_key": secrets.token_urlsafe(32),
+            },
+        )
+        self.assertEqual(registration.status_code, 201, registration.text)
+        registration_id = registration.json()["registration_id"]
+        reference = registration.json()["payment"]["reference"]
+        with SessionLocal() as db:
+            db.add(PaymentProviderConfiguration(
+                provider_id="lenco_airtel",
+                enabled=True,
+                environment="sandbox",
+                options_json="{}",
+            ))
+            db.commit()
+
+        collection = {
+            "reference": reference,
+            "amount": "19.99",
+            "currency": "ZMW",
+            "type": "mobile-money",
+            "status": "pay-offline",
+            "lencoReference": "lenco-" + reference[-8:],
+            "mobileMoneyDetails": {"country": "zm", "operator": "airtel"},
+        }
+        env = {
+            "KITE_LENCO_BASE_URL": "https://api.lenco.co/access/v2",
+            "KITE_LENCO_API_TOKEN": "test-only-lenco-token",
+            "KITE_LENCO_COLLECTION_ENABLED": "true",
+            "KITE_LENCO_ZMW_COLLECTION_CONFIRMED": "true",
+        }
+        idempotency_key = str(uuid.uuid4())
+        payload = {
+            "provider_id": "lenco_airtel",
+            "idempotency_key": idempotency_key,
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False), patch(
+                "backend.lenco._lenco_api_request", return_value=collection,
+            ) as provider_request:
+                first = self.client.post(
+                    f"/api/subscription/registrations/{registration_id}/payments",
+                    headers=self.headers,
+                    json=payload,
+                )
+                replay = self.client.post(
+                    f"/api/subscription/registrations/{registration_id}/payments",
+                    headers=self.headers,
+                    json=payload,
+                )
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(first.json()["payment"]["status"], "PENDING")
+            self.assertEqual(replay.json()["payment"]["status"], "PENDING")
+            provider_request.assert_called_once()
+            with SessionLocal() as db:
+                transaction = db.query(PaymentTransaction).filter_by(
+                    registration_id=registration_id,
+                ).one()
+                self.assertEqual(
+                    db.query(PaymentAttempt).filter_by(transaction_id=transaction.id).count(),
+                    1,
+                )
+        finally:
+            with SessionLocal() as db:
+                db.query(PaymentProviderConfiguration).filter_by(
+                    provider_id="lenco_airtel",
+                ).delete()
+                db.commit()
+
+    def test_lenco_webhook_requires_signature_and_reverifies_status_idempotently(self):
+        registration_key = secrets.token_urlsafe(32)
+        registration = self.client.post(
+            "/api/subscription/registrations",
+            headers=self.headers,
+            json={
+                "plan_id": "premium_monthly",
+                "phone_number": "+260971234567",
+                "idempotency_key": str(uuid.uuid4()),
+                "access_key": registration_key,
+            },
+        )
+        self.assertEqual(registration.status_code, 201, registration.text)
+        registration_id = registration.json()["registration_id"]
+        reference = registration.json()["payment"]["reference"]
+        lenco_reference = "lenco-" + reference[-8:]
+
+        with SessionLocal() as db:
+            db.add(PaymentProviderConfiguration(
+                provider_id="lenco_mtn",
+                enabled=True,
+                environment="sandbox",
+                options_json="{}",
+            ))
+            db.commit()
+
+        def collection(status):
+            return {
+                "reference": reference,
+                "amount": "19.99",
+                "currency": "ZMW",
+                "type": "mobile-money",
+                "status": status,
+                "lencoReference": lenco_reference,
+                "mobileMoneyDetails": {"country": "zm", "operator": "mtn"},
+            }
+
+        token = "test-only-lenco-token"
+        env = {
+            "KITE_LENCO_BASE_URL": "https://api.lenco.co/access/v2",
+            "KITE_LENCO_API_TOKEN": token,
+            "KITE_LENCO_COLLECTION_ENABLED": "true",
+            "KITE_LENCO_ZMW_COLLECTION_CONFIRMED": "true",
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False):
+                with patch(
+                    "backend.lenco._lenco_api_request",
+                    return_value=collection("pay-offline"),
+                ):
+                    started = self.client.post(
+                        f"/api/subscription/registrations/{registration_id}/payments",
+                        headers=self.headers,
+                        json={
+                            "provider_id": "lenco_mtn",
+                            "idempotency_key": str(uuid.uuid4()),
+                        },
+                    )
+                self.assertEqual(started.status_code, 200, started.text)
+
+                webhook_data = {
+                    "event": "collection.failed",
+                    "data": {
+                        "reference": reference,
+                        "amount": "19.99",
+                        "currency": "ZMW",
+                        "type": "mobile-money",
+                        "status": "failed",
+                        "lencoReference": lenco_reference,
+                    },
+                }
+                body = __import__("json").dumps(webhook_data, separators=(",", ":")).encode()
+                invalid = self.client.post(
+                    "/api/payment-webhooks/lenco",
+                    content=body,
+                    headers={"X-Lenco-Signature": "invalid"},
+                )
+                self.assertEqual(invalid.status_code, 400)
+
+                signing_key = hashlib.sha256(token.encode()).hexdigest().encode("ascii")
+                signature = hmac.new(signing_key, body, hashlib.sha512).hexdigest()
+                with patch(
+                    "backend.lenco._lenco_api_request",
+                    side_effect=[collection("successful"), collection("successful")],
+                ) as provider_request:
+                    first = self.client.post(
+                        "/api/payment-webhooks/lenco",
+                        content=body,
+                        headers={"X-Lenco-Signature": signature},
+                    )
+                    duplicate = self.client.post(
+                        "/api/payment-webhooks/lenco",
+                        content=body,
+                        headers={"X-Lenco-Signature": signature},
+                    )
+                self.assertEqual(first.status_code, 200, first.text)
+                self.assertEqual(duplicate.status_code, 200, duplicate.text)
+                self.assertEqual(first.json()["status"], "SUCCESSFUL")
+                self.assertEqual(duplicate.json()["status"], "SUCCESSFUL")
+                self.assertEqual(provider_request.call_count, 2)
+
+            with SessionLocal() as db:
+                transaction = db.query(PaymentTransaction).filter_by(
+                    registration_id=registration_id,
+                ).one()
+                self.assertEqual(transaction.status, "SUCCESSFUL")
+                self.assertEqual(
+                    db.query(Subscription).filter_by(
+                        token_hash=hashlib.sha256(
+                            ("mobile-money:" + transaction.id).encode(),
+                        ).hexdigest(),
+                    ).count(),
+                    1,
+                )
+        finally:
+            with SessionLocal() as db:
+                db.query(PaymentProviderConfiguration).filter_by(
+                    provider_id="lenco_mtn",
+                ).delete()
+                db.commit()
+
+    def test_only_configured_zambia_lenco_operators_are_advertised_to_checkout(self):
+        with SessionLocal() as db:
+            db.add_all([
+                PaymentProviderConfiguration(
+                    provider_id="lenco_airtel",
+                    enabled=True,
+                    environment="sandbox",
+                    options_json="{}",
+                ),
+                PaymentProviderConfiguration(
+                    provider_id="lenco_mtn",
+                    enabled=True,
+                    environment="sandbox",
+                    options_json="{}",
+                ),
+                PaymentProviderConfiguration(
+                    provider_id="lenco_zamtel",
+                    enabled=False,
+                    environment="sandbox",
+                    options_json="{}",
+                ),
+            ])
+            db.commit()
+        env = {
+            "KITE_LENCO_BASE_URL": "https://api.lenco.co/access/v2",
+            "KITE_LENCO_API_TOKEN": "test-only-lenco-token",
+            "KITE_LENCO_COLLECTION_ENABLED": "true",
+            "KITE_LENCO_ZMW_COLLECTION_CONFIRMED": "true",
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False):
+                response = self.client.get("/api/plans")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                [item["id"] for item in response.json()["payment_providers"]],
+                ["lenco_airtel", "lenco_mtn"],
+            )
+            self.assertTrue(all(plan["currency"] == "ZMW" for plan in response.json()["plans"]))
+            self.assertNotIn(env["KITE_LENCO_API_TOKEN"], response.text)
+        finally:
+            with SessionLocal() as db:
+                db.query(PaymentProviderConfiguration).filter(
+                    PaymentProviderConfiguration.provider_id.in_(
+                        ("lenco_airtel", "lenco_mtn", "lenco_zamtel"),
+                    ),
+                ).delete(synchronize_session=False)
+                db.commit()
+
+    def test_lenco_amount_mismatch_is_not_accepted_as_payment(self):
+        registration_key = secrets.token_urlsafe(32)
+        registration = self.client.post(
+            "/api/subscription/registrations",
+            headers=self.headers,
+            json={
+                "plan_id": "premium_monthly",
+                "phone_number": "+260971234567",
+                "idempotency_key": str(uuid.uuid4()),
+                "access_key": registration_key,
+            },
+        )
+        self.assertEqual(registration.status_code, 201, registration.text)
+        registration_id = registration.json()["registration_id"]
+        reference = registration.json()["payment"]["reference"]
+        with SessionLocal() as db:
+            db.add(PaymentProviderConfiguration(
+                provider_id="lenco_airtel",
+                enabled=True,
+                environment="sandbox",
+                options_json="{}",
+            ))
+            db.commit()
+
+        def collection(status, amount):
+            return {
+                "reference": reference,
+                "amount": amount,
+                "currency": "ZMW",
+                "type": "mobile-money",
+                "status": status,
+                "lencoReference": "lenco-" + reference[-8:],
+                "mobileMoneyDetails": {"country": "zm", "operator": "airtel"},
+            }
+
+        env = {
+            "KITE_LENCO_BASE_URL": "https://api.lenco.co/access/v2",
+            "KITE_LENCO_API_TOKEN": "test-only-lenco-token",
+            "KITE_LENCO_COLLECTION_ENABLED": "true",
+            "KITE_LENCO_ZMW_COLLECTION_CONFIRMED": "true",
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False):
+                with patch(
+                    "backend.lenco._lenco_api_request",
+                    side_effect=[
+                        collection("pay-offline", "19.99"),
+                        collection("successful", "20.00"),
+                    ],
+                ):
+                    started = self.client.post(
+                        f"/api/subscription/registrations/{registration_id}/payments",
+                        headers=self.headers,
+                        json={
+                            "provider_id": "lenco_airtel",
+                            "idempotency_key": str(uuid.uuid4()),
+                        },
+                    )
+                    self.assertEqual(started.status_code, 200, started.text)
+                    verified = self.client.post(
+                        f"/api/subscription/registrations/{registration_id}/verify",
+                        headers=self.headers,
+                    )
+            self.assertEqual(verified.status_code, 200, verified.text)
+            self.assertEqual(verified.json()["payment"]["status"], "PENDING")
+            self.assertEqual(
+                verified.json()["payment"]["failure_code"], "VERIFICATION_MISMATCH",
+            )
+            self.assertFalse(verified.json()["premium_active"])
+            with SessionLocal() as db:
+                transaction = db.query(PaymentTransaction).filter_by(
+                    registration_id=registration_id,
+                ).one()
+                self.assertEqual(
+                    db.query(Subscription).filter_by(
+                        token_hash=hashlib.sha256(
+                            ("mobile-money:" + transaction.id).encode(),
+                        ).hexdigest(),
+                    ).count(),
+                    0,
+                )
+        finally:
+            with SessionLocal() as db:
+                db.query(PaymentProviderConfiguration).filter_by(
+                    provider_id="lenco_airtel",
+                ).delete()
+                db.commit()
+
+    def test_lenco_payment_verification_is_scoped_to_registration_owner(self):
+        registration = self.client.post(
+            "/api/subscription/registrations",
+            headers=self.headers,
+            json={
+                "plan_id": "premium_monthly",
+                "phone_number": "+260971234567",
+                "idempotency_key": str(uuid.uuid4()),
+                "access_key": secrets.token_urlsafe(32),
+            },
+        )
+        self.assertEqual(registration.status_code, 201, registration.text)
+        registration_id = registration.json()["registration_id"]
+        other_email = f"other-{uuid.uuid4().hex}@example.com"
+        other = self.client.post("/api/auth/register", json={
+            "name": "Other Learner",
+            "email": other_email,
+            "password": "secure-example-password",
+        })
+        self.assertEqual(other.status_code, 201, other.text)
+        other_headers = {"Authorization": "Bearer " + self.issue_token(other_email)}
+        with patch("backend.lenco._lenco_api_request") as provider_request:
+            verified = self.client.post(
+                f"/api/subscription/registrations/{registration_id}/verify",
+                headers=other_headers,
+            )
+        self.assertEqual(verified.status_code, 404)
+        provider_request.assert_not_called()
 
     def test_mobile_money_only_grants_entitlement_after_verified_completion(self):
         payment_idempotency_key = str(uuid.uuid4())

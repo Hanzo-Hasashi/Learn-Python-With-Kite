@@ -63,6 +63,11 @@ def get_mobile_money_provider(provider_id: str) -> MobileMoneyProvider | None:
         return _providers.get(provider_id)
 
 
+def is_payment_provider_available(provider: MobileMoneyProvider) -> bool:
+    availability_check = getattr(provider, "is_available", None)
+    return availability_check() if callable(availability_check) else True
+
+
 def normalize_zambian_phone(value: str) -> str:
     value = value.strip()
     if not value or not re.fullmatch(r"\+?[0-9\s().-]+", value):

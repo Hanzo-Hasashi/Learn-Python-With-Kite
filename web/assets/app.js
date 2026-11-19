@@ -1290,7 +1290,7 @@
         {
           title: "5. Premium plans and payments",
           paragraphs: [
-            "The current advertised Premium prices are K19.99 per month and K99.99 per year. Twelve monthly payments at the advertised rate total K239.88; the annual plan is K139.89 less (approximately 58.3%). The purchase screen and Google Play checkout, when available, show the terms that apply to your transaction.",
+            "The current advertised Premium prices are ZMW 19.99 per month and ZMW 99.99 per year. Twelve monthly payments at the advertised rate total ZMW 239.88; the annual plan is ZMW 139.89 less (approximately 58.3%). The purchase screen and Google Play checkout, when available, show the terms that apply to your transaction.",
             "Where enabled, Google Play purchases are verified by the Service and are managed through Google Play, including automatic renewal, cancellation, payment method and refund arrangements under its terms and applicable law. Zambian mobile-money purchases are prepaid for 30 or 365 days and do not automatically renew. A verified payment is required to activate or extend Premium. A mobile-money registration alone does not charge you or activate Premium. Never enter a mobile-money PIN in Kite. Contact Kite support about a payment discrepancy or refund request; mobile-money refunds are not currently available in-app and remain subject to applicable law. Payment initiation is unavailable unless a provider is configured."
           ]
         },
@@ -1501,13 +1501,15 @@
       card.appendChild(titleRow);
 
       var price = doc.createElement("p");
-      price.textContent = plan.price + (plan.period ? " / " + plan.period : "");
+      price.textContent = subscriptionPlanPrice(plan) + (plan.period ? " / " + plan.period : "");
       price.style.cssText = "margin:0;font-size:22px;font-weight:750";
       card.appendChild(price);
 
       if (plan.best_value && plan.savings) {
         var savings = doc.createElement("p");
-        savings.textContent = "Save " + plan.savings + (plan.percentage_savings ? " · " + plan.percentage_savings + " less" : "");
+        var savingsAmount = String(plan.savings).replace(/^K\s*/, "");
+        savings.textContent = "Save " + (plan.currency ? plan.currency + " " : "") +
+          savingsAmount + (plan.percentage_savings ? " · " + plan.percentage_savings + " less" : "");
         savings.style.cssText = "margin:-6px 0 0;color:var(--mut,#66758d);font-size:13px";
         card.appendChild(savings);
       }
@@ -1644,7 +1646,7 @@
       "<div id=\"kite-mobile-money\" hidden style=\"padding:16px;border-top:1px solid #e8e8e8\">" +
       "<h3 style=\"margin:0 0 8px;font-size:17px\">3. Mobile-money details</h3>" +
       "<p id=\"kite-mm-plan-details\" style=\"margin:0 0 12px\"></p>" +
-      "<p class=\"sub\" style=\"margin:0 0 12px\">Enter the Zambian mobile-money number to associate with this registration.</p>" +
+      "<p class=\"sub\" style=\"margin:0 0 12px\">Enter the Zambian mobile-money number that should receive the payment authorization prompt.</p>" +
       "<h3 id=\"kite-registration-title\" hidden style=\"margin:16px 0 8px\">Registration confirmation</h3>" +
       "<div id=\"kite-registration-summary\" hidden style=\"margin:8px 0 14px;padding:12px;border:1px solid var(--line,#e3eaf5);border-radius:10px;background:var(--card,#fff)\">" +
       "<div style=\"display:grid;grid-template-columns:minmax(100px,0.8fr) minmax(0,1.2fr);gap:8px;font-size:14px\">" +
@@ -1995,12 +1997,20 @@
   }
   function subscriptionPlanDescription(plan) {
     var description = plan.name || "Selected plan";
-    if (plan.price) description += " · " + plan.price;
+    var price = subscriptionPlanPrice(plan);
+    if (price) description += " · " + price;
     if (plan.period) description += " / " + plan.period;
     if (plan.summary) description += ". " + plan.summary;
     var features = Array.isArray(plan.features) ? plan.features : [];
     if (features.length) description += " Features: " + features.join("; ") + ".";
     return description;
+  }
+
+  function subscriptionPlanPrice(plan) {
+    if (plan && plan.premium && plan.amount && plan.currency) {
+      return plan.currency + " " + plan.amount;
+    }
+    return plan && plan.price ? plan.price : "";
   }
 
   function bindSubscriptionRegistration(doc) {
@@ -2042,7 +2052,8 @@
       if (planName) planName.textContent = selectedPlan ? selectedPlan.name : "Premium";
       var priceAndTerm = doc.getElementById("kite-registration-price");
       if (priceAndTerm) priceAndTerm.textContent = selectedPlan
-        ? selectedPlan.price + (selectedPlan.period ? " / " + selectedPlan.period : "")
+        ? subscriptionPlanPrice(selectedPlan) +
+          (selectedPlan.period ? " / " + selectedPlan.period : "")
         : "See selected plan";
       var registrationPhone = doc.getElementById("kite-registration-phone");
       if (registrationPhone) registrationPhone.textContent = result.phone_number || "Not available";

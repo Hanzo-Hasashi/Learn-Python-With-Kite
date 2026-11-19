@@ -6,6 +6,7 @@ skipped when Playwright or a Chrome/Chromium browser is not installed.
 """
 import functools
 import http.server
+import json
 import threading
 import unittest
 from pathlib import Path
@@ -165,6 +166,184 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
     def test_unknown_route_still_falls_back_to_launch(self):
         self.open("#not-a-kite-route")
         self.assertEqual(self.page.evaluate("location.hash"), "#launch")
+
+    def test_lenco_checkout_waits_for_server_verified_payment_status(self):
+        requests = []
+        verification_requests = []
+        user = {"id": 7, "name": "Kite Learner", "email": "learner@example.test"}
+        plan = {
+            "id": "premium_monthly",
+            "name": "Premium Monthly",
+            "price": "K19.99",
+            "amount": "19.99",
+            "currency": "ZMW",
+            "period": "month",
+            "premium": True,
+            "summary": "Monthly Premium access",
+            "features": [],
+        }
+        annual_plan = {
+            "id": "premium_annual",
+            "name": "Premium Annual",
+            "price": "K99.99",
+            "amount": "99.99",
+            "currency": "ZMW",
+            "period": "year",
+            "premium": True,
+            "summary": "Annual Premium access",
+            "features": [],
+            "best_value": True,
+            "savings": "K139.89",
+            "percentage_savings": "58.3%",
+        }
+
+        def response_for(request):
+            path = request.url.split("?", 1)[0]
+            if path.endswith("/api/auth/session"):
+                return {"user": user, "csrf_token": "test-csrf"}
+            if path.endswith("/api/me"):
+                return {**user, "settings": {}}
+            if path.endswith("/api/plans"):
+                return {
+                    "plans": [plan, annual_plan],
+                    "payment_providers": [
+                        {"id": "lenco_airtel", "name": "Lenco - Airtel Money"},
+                    ],
+                    "mobile_money": {"enabled": False, "providers": [], "currency": "ZMW"},
+                }
+            if path.endswith("/api/subscription"):
+                return {"plan": "free", "status": "none", "premium": False}
+            if path.endswith("/api/subscription/registrations") and request.method == "POST":
+                return {
+                    "registration_id": "test-registration",
+                    "plan": plan,
+                    "phone_number": "****4567",
+                    "subscription_status": "PENDING_PAYMENT",
+                    "subscription_expires_at": None,
+                    "renewal": "manual",
+                    "premium_active": False,
+                    "payment": {
+                        "id": "test-payment",
+                        "reference": "KITE-SUB-TEST",
+                        "provider_id": None,
+                        "amount": "19.99",
+                        "currency": "ZMW",
+                        "status": "NOT_INITIATED",
+                        "failure_code": None,
+                    },
+                    "message": "Registration saved. Payment has not started.",
+                }
+            if path.endswith("/api/subscription/registrations/test-registration/payments"):
+                requests.append(request.post_data_json)
+                return {
+                    "registration_id": "test-registration",
+                    "plan": plan,
+                    "phone_number": "****4567",
+                    "subscription_status": "PENDING_PAYMENT",
+                    "subscription_expires_at": None,
+                    "renewal": "manual",
+                    "premium_active": False,
+                    "payment": {
+                        "id": "test-payment",
+                        "reference": "KITE-SUB-TEST",
+                        "provider_id": "lenco_airtel",
+                        "amount": "19.99",
+                        "currency": "ZMW",
+                        "status": "PENDING",
+                        "failure_code": None,
+                    },
+                    "message": (
+                        "Lenco payment request sent. Approve it on your selected "
+                        "mobile-money phone; Kite will activate Premium only after "
+                        "server-side verification."
+                    ),
+                }
+            if path.endswith("/api/subscription/registrations/test-registration/verify"):
+                verification_requests.append(request.post_data_json)
+                return {
+                    "registration_id": "test-registration",
+                    "plan": plan,
+                    "phone_number": "****4567",
+                    "subscription_status": "ACTIVE",
+                    "subscription_expires_at": "2026-12-19T00:00:00+00:00",
+                    "renewal": "manual",
+                    "premium_active": True,
+                    "payment": {
+                        "id": "test-payment",
+                        "reference": "KITE-SUB-TEST",
+                        "provider_id": "lenco_airtel",
+                        "amount": "19.99",
+                        "currency": "ZMW",
+                        "status": "SUCCESSFUL",
+                        "failure_code": None,
+                    },
+                    "message": "Verified payment received. Your prepaid Kite Premium access is active.",
+                }
+            return {}
+
+        def handle_api(route):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(response_for(route.request)),
+            )
+
+        self.page.route(
+            "https://fonts.googleapis.com/**",
+            lambda route: route.fulfill(status=200, content_type="text/css", body=""),
+        )
+        self.page.route("**/api/**", handle_api)
+        self.page.goto(self.base + "#preferences", wait_until="load")
+        self.page.wait_for_function(
+            "() => { const frame = document.getElementById('f');"
+            " return Boolean(frame && frame.contentDocument &&"
+            " frame.contentDocument.documentElement &&"
+            " frame.contentDocument.documentElement.dataset &&"
+            " frame.contentDocument.documentElement.dataset.kiteBridge === 'ready'); }",
+            timeout=30000,
+        )
+        frame = self.page.frame_locator("#f")
+        frame.locator("#kite-plan-options button[data-plan-id='premium_monthly']").wait_for()
+        self.assertIn(
+            "ZMW 19.99 / month",
+            frame.locator("#kite-plan-options article[data-plan-id='premium_monthly']").inner_text(),
+        )
+        annual_text = frame.locator("#kite-plan-options article[data-plan-id='premium_annual']").inner_text()
+        self.assertIn("ZMW 99.99 / year", annual_text)
+        self.assertIn("Save ZMW 139.89", annual_text)
+        frame.locator("#kite-plan-options button[data-plan-id='premium_monthly']").click()
+        frame.locator("#kite-continue-registration").click()
+        frame.locator("#kite-mm-phone").fill("97 123 4567")
+        frame.locator("#kite-mm-register").click()
+        frame.locator("#kite-payment-provider").wait_for(state="visible")
+        frame.locator("#kite-payment-provider").select_option("lenco_airtel")
+        frame.locator("#kite-payment-initiate").click()
+
+        self.page.wait_for_function(
+            "() => document.getElementById('f').contentDocument"
+            ".getElementById('kite-payment-status').textContent === 'Pending'"
+        )
+        self.assertIn(
+            "Approve it on your selected mobile-money phone",
+            frame.locator("#kite-mm-status").inner_text(),
+        )
+        self.assertEqual(frame.locator("#kite-registration-price").inner_text(), "ZMW 19.99 / month")
+        self.assertEqual(
+            frame.locator("#kite-registration-status").inner_text(),
+            "Pending payment",
+        )
+        self.assertEqual(frame.locator("#kite-payment-status").inner_text(), "Pending")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["provider_id"], "lenco_airtel")
+        self.assertFalse(verification_requests)
+
+        frame.locator("#kite-registration-check").click()
+        self.page.wait_for_function(
+            "() => document.getElementById('f').contentDocument"
+            ".getElementById('kite-payment-status').textContent === 'Successful'"
+        )
+        self.assertEqual(frame.locator("#kite-registration-status").inner_text(), "Active")
+        self.assertTrue(verification_requests)
 
     def test_guest_can_start_a_free_lesson(self):
         frame = self.open()
