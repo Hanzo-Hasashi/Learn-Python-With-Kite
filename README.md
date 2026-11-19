@@ -140,47 +140,115 @@ Controlled activation requires: (1) Lenco confirms the V2 collection payload/sta
 
 ### Supabase setup
 
-The live project `izdtxorekfpasdkgasvs` was reached with its authenticated dashboard session. It is running PostgreSQL 17.11 and contains 21 public application tables; `lessons` contains 101 records and the important payment/provider tables contain 0 rows. All 21 application tables have RLS enabled and no RLS policies. There is no `alembic_version` table and the `kite_runtime` and `kite_migrator` roles are not present. The live database has therefore not been migrated or stamped, and its backup/PITR recovery state was not verifiable through the available dashboard routes. No database role, schema, migration, or production configuration was changed.
+The hosted PostgreSQL database is configured on Supabase project `learnwithkite` (reference `izdtxorekfpasdkgasvs`, region `eu-west-1`, PostgreSQL 17.11). The database is migrated to Alembic head revision `e85bcc461ab0` and secured under the FastAPI-enforced authorization architecture.
 
-1. Create a Supabase project and set a strong database password. Copy the connection string from **Connect**; do not construct the pooler hostname or username manually. For Render's persistent process, prefer the direct connection only after confirming IPv6 reachability; otherwise choose Session Pooler. The connection password belongs only in Render's `DATABASE_URL`.
-2. Before applying the migration, connect as the database owner and run `migrations/bootstrap_runtime_role.psql` with `psql -v ON_ERROR_STOP=1 -f migrations/bootstrap_runtime_role.psql $env:MIGRATION_DATABASE_URL`. The script prompts for a unique password for `kite_runtime`; store that password only in the restricted runtime `DATABASE_URL`. It removes public-schema CREATE inherited by all users, grants the runtime role only schema usage, and does not grant application-table access until the security migration.
-3. In a trusted migration environment, set `MIGRATION_DATABASE_URL` to the owner connection string and run `alembic upgrade head` for a fresh database. The fresh baseline creates all application tables; the next revision enables RLS, restricts client-role table/sequence access and unsafe public defaults for known object owners, and grants the runtime role only required DML and sequence access. It also removes default function execution for `PUBLIC`; grant execution to client roles only on reviewed functions. The migration role must be a member of every object-owner role whose unsafe defaults it cleans, or the migration fails closed. Use the same migration owner for later revisions. Clear `MIGRATION_DATABASE_URL` from the process environment after migration.
-4. For an existing Kite database, take and verify a backup first. Set `MIGRATION_DATABASE_URL`, run `python -m backend.migration_tools preflight`, and proceed only if it reports an exact baseline match or only the specifically listed additive compatibility columns/indexes. Then run `alembic stamp d9f9f9ebbced`, `alembic upgrade head`, and `alembic check`. The stamp records the existing schema baseline; it does not apply the initial table-creation migration. Any other difference is a stop condition and must be reviewed separately. Never run the legacy `migrations/20261116_subscription_payments.sql`; its schema is now managed by Alembic.
+#### Database Role Architecture
 
-Example trusted-migration commands in PowerShell:
+1. **Owner / Migration Role (`postgres`)**:
+   - Connection URL: configured via `MIGRATION_DATABASE_URL` (user `postgres.izdtxorekfpasdkgasvs`).
+   - Owns all 21 public application tables, 9 sequences, and the `alembic_version` metadata table.
+   - Used exclusively for running Alembic schema migrations and trusted administrative tasks.
+   - Never configured in ordinary runtime service environments or exposed to client applications.
+
+2. **Restricted Runtime Role (`kite_runtime`)**:
+   - Connection URL: configured via `DATABASE_URL` (user `kite_runtime.izdtxorekfpasdkgasvs`).
+   - Role attributes: `LOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`, `NOCREATEDB`, `NOCREATEROLE`, `NOINHERIT`.
+   - Has no elevated role memberships and owns zero database objects.
+   - Schema permissions: `USAGE` on schema `public`; `CREATE` is revoked. Runtime DDL is denied.
+   - Alembic metadata: All access to `public.alembic_version` is revoked.
+   - Application table privileges follow a strict least-privilege matrix:
+     - **Read-only** (`lessons`, `subscription_plans`, `payment_provider_configurations`): `SELECT`.
+     - **Append-only** (`activity`, `quiz_attempts`, `payment_status_history`): `SELECT`, `INSERT`.
+     - **Ephemeral / locks** (`guest_playground_executions`, `playground_executions`, `revoked_tokens`): `SELECT`, `INSERT`, `DELETE`.
+     - **User records & state** (`users`, `subscriptions`, `subscription_registrations`, `payment_transactions`, `payment_attempts`, `playground_errors`, `quiz_results`, `lesson_progress`, `mobile_money_payments`): `SELECT`, `INSERT`, `UPDATE`.
+     - **Full lifecycle** (`auth_sessions`, `notifications`, `password_resets`): `SELECT`, `INSERT`, `UPDATE`, `DELETE`.
+   - Sequence privileges: `USAGE`, `SELECT` on all 9 application sequences (`activity_id_seq`, `notifications_id_seq`, `password_resets_id_seq`, `payment_attempts_id_seq`, `payment_status_history_id_seq`, `playground_errors_id_seq`, `quiz_attempts_id_seq`, `subscriptions_id_seq`, `users_id_seq`).
+
+3. **Data API & Client Role Isolation**:
+   - All privileges on all 21 application tables, sequences, and Alembic metadata are revoked from `PUBLIC`, `anon`, `authenticated`, and `service_role`.
+   - PostgREST / Supabase Data API cannot access application tables directly. All access is mediated by FastAPI.
+
+#### Authorization & Security Assumptions
+
+- **FastAPI-Enforced Authorization**: Row-Level Security (RLS) is disabled on application tables for `kite_runtime` because caller-controlled PostgreSQL GUCs (such as `kite.user_id`) can be spoofed by any database client executing SQL. FastAPI validates credentials, session records, and object ownership in application code on every endpoint.
+- **Credential Handling**:
+  - Valid signed tokens / sessions authenticate users.
+  - Completely absent credentials may be treated as guests only where guest access is explicitly permitted (e.g. guest playground runs, public lesson browsing).
+  - Invalid, expired, malformed, or revoked credentials return HTTP 401 Unauthorized and are never silently treated as guest requests.
+
+#### Startup & Reference Data Management
+
+- Reference data (101 curriculum lessons and 3 subscription plans) is seeded and managed exclusively through Alembic migrations using `ON CONFLICT (id) DO NOTHING`.
+- Ordinary FastAPI startup under `kite_runtime` performs zero DDL, does not seed or rewrite reference data, and preserves administrator edits to lessons or plans across service restarts.
+- Application startup verifies:
+  1. Migration status via `assert_database_migrations_applied()`.
+  2. Model and database schema alignment via `assert_database_schema_matches_models()`.
+  3. Role attributes, privileges, and Alembic metadata denial via `validate_runtime_database_role()`.
+
+#### Alembic Migration Commands
+
+Alembic revisions:
+- `d9f9f9ebbced`: Initial application schema baseline (tables, foreign keys, sequences, constraints).
+- `9c11c44d3729`: Security baseline (additive columns, indexes, initial role grants).
+- `e85bcc461ab0`: Final least-privilege matrix, reference data seeding, RLS cleanup, Alembic metadata denial.
+
+To execute migrations in PowerShell:
 
 ```powershell
-$env:MIGRATION_DATABASE_URL = "<owner connection URL>"
-# Fresh, empty database:
+$env:MIGRATION_DATABASE_URL = "<postgres migration connection URL>"
 alembic upgrade head
 alembic check
-
-# Existing database only, after backup and successful preflight:
-python -m backend.migration_tools preflight
-alembic stamp d9f9f9ebbced
-alembic upgrade head
-alembic check
-
 Remove-Item Env:\MIGRATION_DATABASE_URL
 ```
 
-Run either the fresh-database commands or the existing-database commands, not both. Do not copy the migration-owner URL into Render's service environment.
-5. In **Authentication → URL Configuration**, set the Site URL to the frontend custom origin (for example, `https://learn.example.com`). Add the exact production redirect URLs used by the app, such as `https://learn.example.com/` and `https://learn.example.com/#reset`. Add local redirect URLs only to a development project or when intentionally testing locally.
-6. Enable email authentication. Supabase's default SMTP is restricted to project team members and has a low rate limit; configure a custom SMTP provider in Supabase Auth before sending email to real learners. Render Free also blocks outbound SMTP ports, so do not depend on the backend's local SMTP fallback.
-7. For Google sign-in, configure the Google provider in Supabase Auth. In Google Cloud, add the callback URI displayed by the Supabase provider setup (the project-specific Supabase `/auth/v1/callback` URL); do not guess the project reference or callback value.
-8. For the existing `vercel.app` frontend without a custom domain, keep `window.KITE_API_BASE` empty so browser calls remain at `/api/*`. Configure a Vercel external route for `/api/*` to the Render service, preserving that path and injecting `X-Kite-Proxy-Secret` with Vercel's request-header transform. Store the same high-entropy `KITE_PROXY_SECRET` only in Vercel's server-side environment and Render; do not expose it in static assets. Set `KITE_VERCEL_PROXY=true`, `PUBLIC_APP_URL` and `PUBLIC_API_URL` to the Vercel origin, and `KITE_CORS_ORIGINS` to that exact origin. The Vercel target hostname is not known until the Render service exists, so the route is not configured in this repository.
+To run local FastAPI against the hosted Supabase database:
 
-The backend rejects requests to Render unless the proxy secret is valid when proxy mode is enabled; `/health` is the only unauthenticated exception for Render health checks. Vercel's external rewrite must overwrite any client-supplied proxy-secret header. Vercel forwards visitor-IP headers; the backend uses `x-real-ip` for auth rate-limit keys only after validating the proxy secret. Keep platform-level rate limiting enabled as well, because the application's in-memory limiter is not shared across workers or instances. Route provider webhooks through the Vercel proxy too, or they will be rejected in proxy mode.
+```powershell
+$env:DATABASE_URL = "<kite_runtime connection URL with sslmode=require>"
+$env:KITE_SECRET_KEY = "<secret-key-at-least-32-chars>"
+$env:KITE_ENV = "development"
+$env:KITE_ALLOW_LOCAL_AUTH = "true"
+.\.venv\Scripts\uvicorn.exe backend.app:app --host 127.0.0.1 --port 8000
+```
 
-To rotate the proxy secret without an outage, set Render's `KITE_PROXY_SECRET` to the new value and `KITE_PROXY_SECRET_PREVIOUS` to the old value first; deploy and verify Render. Then update Vercel's server-side `KITE_PROXY_SECRET` and redeploy. After requests succeed, remove `KITE_PROXY_SECRET_PREVIOUS` from Render and redeploy. Never set the overlap secret in Vercel or frontend configuration.
+#### Backup and Recovery Procedure
 
-The Vercel proxy keeps browser requests and host-only `Secure; HttpOnly; SameSite=Lax` cookies on the Vercel origin, avoiding third-party-cookie dependence. Same-origin browser requests do not need CORS, but the backend still requires an exact allowed origin and rejects unsafe API requests without a matching `Origin` (except signed payment webhooks). API responses carry `Cache-Control: private, no-store`; verify Vercel honors that header. Do not enable proxy mode until the Vercel route and both secret settings are configured together. Verify POST bodies, multiple `Set-Cookie` headers, redirects, cache behavior, login, refresh, logout, password recovery, CSRF, and rate limits in a Vercel Preview and the target browsers before production; these behaviors have not been tested against a deployed Vercel/Render pair.
+1. **Logical Backups**:
+   - Supabase Free-Tier projects **do not** include automated daily backups or Point-in-Time Recovery (PITR).
+   - Logical backups must be taken manually using `pg_dump` prior to applying schema migrations:
+     ```powershell
+     pg_dump --clean --if-exists --no-owner --no-privileges -Fc -d "<MIGRATION_DATABASE_URL>" -f "%LOCALAPPDATA%\kite-supabase-backups\kite-supabase-<timestamp>.dump"
+     Get-FileHash -Algorithm SHA256 "%LOCALAPPDATA%\kite-supabase-backups\kite-supabase-<timestamp>.dump"
+     ```
+   - Current verified backup: `%LOCALAPPDATA%\kite-supabase-backups\kite-supabase-20261119-191154.dump`
+   - Verified SHA256: `5d4723466574df5862d2ae0a16042d1350138dc716df7ad54e12bb9938cbbd24`
+2. **Restoration Verification**:
+   - Test restorations must be conducted on disposable PostgreSQL 17 databases (such as the Compose integration container) to verify schema, table counts (21 tables), lesson count (101), plan count (3), and constraint counts (54) before making production changes.
 
-### Database and runtime limitations
+#### Disposable PostgreSQL 17 Test Suite
 
-Alembic migrations are versioned and forward-only; automatic destructive downgrades are intentionally unsupported. FastAPI startup performs no table creation, schema repair, or DDL. It verifies the current migration revision and model/schema compatibility, checks the restricted runtime-role privileges, and then retains the existing idempotent lesson and plan synchronization. Use `alembic check` after applying migrations to catch model/migration drift. The runtime role is deliberately `BYPASSRLS` because this API uses its own authenticated data-access checks and does not set per-user PostgreSQL RLS context; never expose its connection string to the browser or Supabase client.
+Run the isolated integration test suite on Docker Compose (`postgres:17.12-bookworm`):
 
-The backend's `/health` route is a liveness response and does not test database or authentication flows. PostgreSQL-specific migrations, Supabase role grants, and cookie behavior have not been verified against a live Supabase project or deployed Render service. Production can use either a Vercel same-origin proxy with its secret-header check or Vercel and Render custom hostnames under one shared registrable domain. The default `vercel.app`/`onrender.com` direct cross-site cookie arrangement remains rejected. Real-browser proxy and authentication testing remains a deployment gate. The Python runner is a separate isolated Docker service; no hosted runner configuration is included here.
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\run_postgres_integration.ps1
+```
+
+The suite validates:
+1. Pinned server version matching PostgreSQL 17.12.
+2. Fresh migration creation from empty schema.
+3. Repeated migration idempotency.
+4. Existing schema adoption and additive repair.
+5. Runtime least-privilege role validation, DDL denial, and Alembic metadata denial.
+6. FastAPI startup under the restricted runtime role.
+7. Complete API user data isolation across progress, quizzes, notifications, subscriptions, and executions.
+
+#### What Remains Necessary Before Backend Hosting
+
+1. Deploy the FastAPI backend service (e.g. Render) configuring `DATABASE_URL` to the `kite_runtime` connection string with `sslmode=require`.
+2. Securely provision backend environment variables: `KITE_SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `KITE_PROXY_SECRET`, `RUNNER_SHARED_SECRET`.
+3. Configure Vercel external rewrite rule for `/api/*` to forward traffic to the hosted backend with `X-Kite-Proxy-Secret` validation.
+4. Verify end-to-end production cookie handling, CSRF validation, and CORS restrictions against the Vercel frontend origin.
+5. Complete Lenco merchant onboarding and contract verification before activating `KITE_LENCO_COLLECTION_ENABLED`.
 
 Official references: [Render Python version](https://render.com/docs/python-version), [Render web services](https://render.com/docs/web-services), [Render Free limitations](https://render.com/docs/free), [Supabase Postgres connection methods](https://supabase.com/docs/guides/database/connecting-to-postgres), [Supabase Auth redirect URLs](https://supabase.com/docs/guides/auth/redirect-urls), [Supabase custom SMTP](https://supabase.com/docs/guides/auth/auth-smtp), and [Supabase Google sign-in](https://supabase.com/docs/guides/auth/social-sign-in/auth-google).
 

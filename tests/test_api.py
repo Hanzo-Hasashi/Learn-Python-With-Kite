@@ -36,6 +36,7 @@ from backend.app import (
     cookie_settings, database_engine_options, database_url, decrypt_subscription_phone, startup,
     validate_runtime_configuration,
     validate_postgres_ssl_url,
+    auth_attempts,
 )
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
 from backend.payments import PaymentStatus, ProviderPaymentResult, normalize_zambian_phone
@@ -56,6 +57,7 @@ class KiteApiTests(unittest.TestCase):
         DB_DIR.cleanup()
 
     def setUp(self):
+        auth_attempts.clear()
         self.email = f"user-{uuid.uuid4().hex}@example.com"
         response = self.client.post("/api/auth/register", json={
             "name": "Kite Learner",
@@ -601,28 +603,21 @@ class KiteApiTests(unittest.TestCase):
         self.assertTrue(all(item["locked"] for item in quizzes if item["module_id"] == modules[6]["id"]))
         self.assertTrue(all(item["locked"] for item in challenges if item["module_id"] == modules[6]["id"]))
 
-    def test_startup_resynchronizes_lesson_metadata_from_catalog(self):
+    def test_startup_preserves_existing_lesson_data_without_runtime_ddl_or_writes(self):
         source = LESSONS[0]
         with SessionLocal() as db:
             lesson = db.get(Lesson, source[0])
             self.assertIsNotNone(lesson)
-            lesson.title = "Stale title"
-            lesson.description = "Stale description"
-            lesson.content = "Stale content"
-            lesson.order_num = 999
-            lesson.premium = not source[5]
-            lesson.xp_reward = 999
+            lesson.title = "Custom Admin Title"
             db.commit()
 
         startup()
 
         with SessionLocal() as db:
             lesson = db.get(Lesson, source[0])
-            self.assertEqual(
-                (lesson.title, lesson.description, lesson.content, lesson.order_num,
-                 lesson.premium, lesson.xp_reward),
-                (source[1], source[2], source[3], source[4], source[5], source[6]),
-            )
+            self.assertEqual(lesson.title, "Custom Admin Title")
+            lesson.title = source[1]
+            db.commit()
 
     def test_registration_access_key_is_allowed_by_cross_origin_cors(self):
         response = self.client.options(

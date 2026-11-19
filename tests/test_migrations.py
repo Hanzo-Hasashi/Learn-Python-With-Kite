@@ -1,4 +1,6 @@
 import os
+
+os.environ.setdefault("KITE_ENV", "development")
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +17,7 @@ from backend.db_schema import validate_existing_schema_baseline
 
 ROOT = Path(__file__).parent.parent
 BASELINE_REVISION = "d9f9f9ebbced"
-HEAD_REVISION = "9c11c44d3729"
+HEAD_REVISION = "e85bcc461ab0"
 
 
 def migration_environment(database_url: str) -> dict[str, str]:

@@ -100,7 +100,7 @@ def upgrade() -> None:
         "FROM pg_roles WHERE rolname = 'kite_runtime'"
     )).mappings().one_or_none()
     if (
-        runtime_role is None or runtime_role["rolsuper"] or not runtime_role["rolbypassrls"]
+        runtime_role is None or runtime_role["rolsuper"]
         or runtime_role["rolcreatedb"] or runtime_role["rolcreaterole"]
     ):
         raise RuntimeError(

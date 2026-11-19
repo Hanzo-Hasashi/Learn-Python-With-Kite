@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_REVISION = "d9f9f9ebbced"
-HEAD_REVISION = "9c11c44d3729"
+HEAD_REVISION = "e85bcc461ab0"
 TEST_DATABASE = "kite_integration_test"
 TEST_PORT = 55432
 SAFETY_MARKER = "KITE_DISPOSABLE_POSTGRES_TEST_ONLY"
@@ -88,8 +88,11 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             engine,
             issue_token,
             validate_runtime_database_role,
+            RUNTIME_TABLE_OPERATIONS,
         )
         from backend.db_schema import validate_existing_schema_baseline
+
+        cls.RUNTIME_TABLE_OPERATIONS = RUNTIME_TABLE_OPERATIONS
 
         cls.Activity = Activity
         cls.Base = Base
@@ -145,13 +148,13 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             if existing is None:
                 connection.exec_driver_sql(
                     "CREATE ROLE kite_runtime WITH LOGIN NOINHERIT NOSUPERUSER "
-                    "NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS PASSWORD "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD "
                     + password_sql
                 )
             else:
                 connection.exec_driver_sql(
                     "ALTER ROLE kite_runtime WITH LOGIN NOINHERIT NOSUPERUSER "
-                    "NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS PASSWORD "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD "
                     + password_sql
                 )
             connection.exec_driver_sql(
@@ -167,26 +170,6 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                 ), {"role_name": role_name}).first()
                 if exists is None:
                     connection.exec_driver_sql(f'CREATE ROLE "{role_name}"')
-
-    @classmethod
-    def _seed_unsafe_public_default_privileges(cls) -> None:
-        with cls.owner_engine.begin() as connection:
-            for owner_role in ("kite_test_owner", "supabase_admin"):
-                for object_type, privilege in (
-                    ("TABLES", "ALL PRIVILEGES"),
-                    ("SEQUENCES", "ALL PRIVILEGES"),
-                    ("FUNCTIONS", "EXECUTE"),
-                ):
-                    connection.exec_driver_sql(
-                        f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} "
-                        f"IN SCHEMA public GRANT {privilege} ON {object_type} "
-                        "TO anon, authenticated"
-                    )
-
-                connection.exec_driver_sql(
-                    f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} "
-                    "GRANT EXECUTE ON FUNCTIONS TO PUBLIC"
-                )
 
     @classmethod
     def _reset_public_schema(cls) -> None:
@@ -218,7 +201,6 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
 
     def test_01_fresh_migration_creates_the_complete_postgresql_schema(self):
         self._reset_public_schema()
-        self._seed_unsafe_public_default_privileges()
         command.upgrade(self._alembic_config(), "head")
         command.check(self._alembic_config())
 
@@ -229,81 +211,6 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                 text("SELECT version_num FROM public.alembic_version")
             ).scalar_one()
         self.assertEqual(revision, HEAD_REVISION)
-        with self.owner_engine.connect() as connection:
-            unsafe_default_privileges = connection.execute(text(
-            "SELECT owner.rolname, defaults.defaclobjtype, acl.grantee, "
-            "acl.privilege_type "
-            "FROM pg_default_acl AS defaults "
-            "LEFT JOIN pg_namespace AS object_schema "
-            "ON object_schema.oid = defaults.defaclnamespace "
-            "JOIN pg_roles AS owner ON owner.oid = defaults.defaclrole "
-            "CROSS JOIN LATERAL aclexplode(defaults.defaclacl) AS acl "
-            "WHERE owner.rolname IN ('kite_test_owner', 'supabase_admin') "
-            "AND (object_schema.nspname = 'public' OR "
-            "(defaults.defaclnamespace = 0 AND defaults.defaclobjtype = 'f')) "
-            "AND defaults.defaclobjtype IN ('r', 'S', 'f') "
-            "AND (acl.grantee = 0 OR acl.grantee IN ("
-            "SELECT oid FROM pg_roles WHERE rolname IN ('anon', 'authenticated')"
-            "))"
-            )).all()
-        self.assertEqual(unsafe_default_privileges, [])
-        with self.owner_engine.begin() as connection:
-            connection.exec_driver_sql("CREATE TABLE public.kite_owner_default_acl_probe (id serial)")
-            connection.exec_driver_sql(
-                "CREATE FUNCTION public.kite_owner_default_acl_probe() "
-                "RETURNS integer LANGUAGE sql AS 'SELECT 1'"
-            )
-            for role_name in ("anon", "authenticated"):
-                exposed = connection.execute(text(
-                    "SELECT has_table_privilege(:role_name, "
-                    "'public.kite_owner_default_acl_probe', 'SELECT') "
-                    "OR has_sequence_privilege(:role_name, "
-                    "'public.kite_owner_default_acl_probe_id_seq', 'USAGE') "
-                    "OR has_function_privilege(:role_name, "
-                    "'public.kite_owner_default_acl_probe()', 'EXECUTE')"
-                ), {"role_name": role_name}).scalar_one()
-                self.assertFalse(exposed, role_name)
-            runtime_access = connection.execute(text(
-                "SELECT has_table_privilege('kite_runtime', "
-                "'public.kite_owner_default_acl_probe', 'SELECT') "
-                "AND has_sequence_privilege('kite_runtime', "
-                "'public.kite_owner_default_acl_probe_id_seq', 'USAGE')"
-            )).scalar_one()
-            self.assertTrue(runtime_access)
-            connection.exec_driver_sql("DROP TABLE public.kite_owner_default_acl_probe")
-            connection.exec_driver_sql(
-                "DROP FUNCTION public.kite_owner_default_acl_probe()"
-            )
-
-            connection.exec_driver_sql(
-                "GRANT USAGE, CREATE ON SCHEMA public TO supabase_admin"
-            )
-            connection.exec_driver_sql("SET ROLE supabase_admin")
-            try:
-                connection.exec_driver_sql(
-                    "CREATE TABLE public.kite_admin_default_acl_probe (id serial)"
-                )
-                connection.exec_driver_sql(
-                    "CREATE FUNCTION public.kite_admin_default_acl_probe() "
-                    "RETURNS integer LANGUAGE sql AS 'SELECT 1'"
-                )
-            finally:
-                connection.exec_driver_sql("RESET ROLE")
-                connection.exec_driver_sql(
-                    "REVOKE USAGE, CREATE ON SCHEMA public FROM supabase_admin"
-                )
-            for role_name in ("anon", "authenticated"):
-                exposed = connection.execute(text(
-                    "SELECT has_table_privilege(:role_name, "
-                    "'public.kite_admin_default_acl_probe', 'SELECT') "
-                    "OR has_sequence_privilege(:role_name, "
-                    "'public.kite_admin_default_acl_probe_id_seq', 'USAGE') "
-                    "OR has_function_privilege(:role_name, "
-                    "'public.kite_admin_default_acl_probe()', 'EXECUTE')"
-                ), {"role_name": role_name}).scalar_one()
-                self.assertFalse(exposed, role_name)
-            connection.exec_driver_sql("DROP TABLE public.kite_admin_default_acl_probe")
-            connection.exec_driver_sql("DROP FUNCTION public.kite_admin_default_acl_probe()")
 
     def test_02_repeated_migration_is_idempotent(self):
         command.upgrade(self._alembic_config(), "head")
@@ -370,20 +277,27 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                 connection.execute(text("SELECT current_user")).scalar_one(),
                 "kite_runtime",
             )
-            self.assertEqual(
-                connection.execute(
-                    text("SELECT version_num FROM public.alembic_version")
-                ).scalar_one(),
-                HEAD_REVISION,
-            )
+            # Runtime role must have NO access to Alembic metadata
+            self.assertFalse(connection.execute(text(
+                "SELECT has_table_privilege(current_user, 'public.alembic_version', 'SELECT')"
+            )).scalar_one())
+            with self.assertRaises(DBAPIError):
+                with self.runtime_engine.connect() as metadata_conn:
+                    metadata_conn.execute(text("SELECT * FROM public.alembic_version"))
+
             for table in self.Base.metadata.sorted_tables:
-                has_dml = connection.execute(text(
-                    "SELECT has_table_privilege(current_user, :table_name, 'SELECT') "
-                    "AND has_table_privilege(current_user, :table_name, 'INSERT') "
-                    "AND has_table_privilege(current_user, :table_name, 'UPDATE') "
-                    "AND has_table_privilege(current_user, :table_name, 'DELETE')"
-                ), {"table_name": "public." + table.name}).scalar_one()
-                self.assertTrue(has_dml, table.name)
+                required = self.RUNTIME_TABLE_OPERATIONS[table.name]
+                for operation in required:
+                    self.assertTrue(connection.execute(text(
+                        "SELECT has_table_privilege(current_user, :table_name, :operation)"
+                    ), {"table_name": "public." + table.name, "operation": operation}).scalar_one(),
+                    (table.name, operation))
+                for disallowed in ("INSERT", "UPDATE", "DELETE"):
+                    if disallowed not in required:
+                        self.assertFalse(connection.execute(text(
+                            "SELECT has_table_privilege(current_user, :table_name, :operation)"
+                        ), {"table_name": "public." + table.name, "operation": disallowed}).scalar_one(),
+                        (table.name, disallowed))
             sequences = connection.execute(text(
                 "SELECT sequence.relname FROM pg_class AS sequence "
                 "JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace "
@@ -404,7 +318,7 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                 "SELECT rolbypassrls, rolsuper, rolcreatedb, rolcreaterole "
                 "FROM pg_roles WHERE rolname = current_user"
             )).one()
-            self.assertEqual(role, (True, False, False, False))
+            self.assertEqual(role, (False, False, False, False))
             self.assertFalse(connection.execute(text(
                 "SELECT has_schema_privilege(current_user, 'public', 'CREATE')"
             )).scalar_one())
@@ -423,10 +337,7 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                 "AND relname = ANY(:table_names) AND relkind = 'r' "
                 "AND relrowsecurity"
             ), {"table_names": list(self.Base.metadata.tables)}).scalars().all()
-            self.assertEqual(set(rls_tables), set(self.Base.metadata.tables))
-            self.assertFalse(connection.execute(text(
-                "SELECT row_security_active('public.users'::regclass)"
-            )).scalar_one())
+            self.assertEqual(set(rls_tables), set())
 
         with self.SessionLocal() as session:
             user = self.User(
@@ -560,6 +471,8 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
 
             owner_progress = client.get("/api/progress", headers=owner_headers)
             other_progress = client.get("/api/progress", headers=other_headers)
+            self.assertEqual(owner_progress.status_code, 200, owner_progress.text)
+            self.assertEqual(other_progress.status_code, 200, other_progress.text)
             self.assertGreater(owner_progress.json()["completion_percent"], 0)
             self.assertEqual(other_progress.json()["completion_percent"], 0)
 

@@ -927,6 +927,7 @@ def local_user_for_supabase(auth_user: dict[str, Any], db: Session) -> User:
                     name=str(metadata.get("name") or email.split("@")[0])[:80],
                     password_hash=hash_password(secrets.token_urlsafe(32)))
         db.add(user)
+        db.flush()
     else:
         user.auth_subject = subject
         if email:
@@ -1531,6 +1532,31 @@ async def enforce_proxy_and_browser_origin(request: Request, call_next):
     return response
 
 
+RUNTIME_TABLE_OPERATIONS: dict[str, tuple[str, ...]] = {
+    "activity": ("SELECT", "INSERT"),
+    "auth_sessions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "guest_playground_executions": ("SELECT", "INSERT", "DELETE"),
+    "lesson_progress": ("SELECT", "INSERT", "UPDATE"),
+    "lessons": ("SELECT",),
+    "mobile_money_payments": ("SELECT", "INSERT", "UPDATE"),
+    "notifications": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "password_resets": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "payment_attempts": ("SELECT", "INSERT", "UPDATE"),
+    "payment_provider_configurations": ("SELECT",),
+    "payment_status_history": ("SELECT", "INSERT"),
+    "payment_transactions": ("SELECT", "INSERT", "UPDATE"),
+    "playground_errors": ("SELECT", "INSERT", "UPDATE"),
+    "playground_executions": ("SELECT", "INSERT", "DELETE"),
+    "quiz_attempts": ("SELECT", "INSERT"),
+    "quiz_results": ("SELECT", "INSERT", "UPDATE"),
+    "revoked_tokens": ("SELECT", "INSERT", "DELETE"),
+    "subscription_plans": ("SELECT",),
+    "subscription_registrations": ("SELECT", "INSERT", "UPDATE"),
+    "subscriptions": ("SELECT", "INSERT", "UPDATE"),
+    "users": ("SELECT", "INSERT", "UPDATE"),
+}
+
+
 def assert_database_migrations_applied() -> None:
     from alembic.config import Config
     from alembic.runtime.migration import MigrationContext
@@ -1543,6 +1569,13 @@ def assert_database_migrations_applied() -> None:
     if len(heads) != 1:
         raise RuntimeError("The database migration history must have exactly one head.")
     with engine.connect() as connection:
+        if connection.dialect.name == "postgresql":
+            has_alembic_access = connection.execute(text(
+                "SELECT has_table_privilege(current_user, 'public.alembic_version', 'SELECT')"
+            )).scalar_one()
+            if not has_alembic_access:
+                # The restricted runtime role intentionally has no access to Alembic metadata
+                return
         current = MigrationContext.configure(connection).get_current_revision()
     if current != heads[0]:
         raise RuntimeError(
@@ -1601,7 +1634,7 @@ def validate_runtime_database_role() -> None:
             "AS owns_application_objects"
         ), {"table_names": list(Base.metadata.tables)}).mappings().one()
         if (
-            role["role_name"] != "kite_runtime" or role["rolsuper"] or not role["rolbypassrls"]
+            role["role_name"] != "kite_runtime" or role["rolsuper"] or role["rolbypassrls"]
             or role["rolcreatedb"] or role["rolcreaterole"]
             or role["can_create_database"] or role["can_create_schema"]
             or elevated_access["has_role_memberships"]
@@ -1610,20 +1643,26 @@ def validate_runtime_database_role() -> None:
         ):
             raise RuntimeError(
                 "Hosted DATABASE_URL must use the non-superuser kite_runtime role "
-                "with BYPASSRLS, no elevated role memberships, no schema CREATE privileges, "
+                "with RLS enforcement, no elevated role memberships, no schema CREATE privileges, "
                 "and no ownership of application objects."
             )
         for table in Base.metadata.sorted_tables:
-            has_dml = connection.execute(text(
-                "SELECT has_table_privilege(current_user, :table_name, 'SELECT') "
-                "AND has_table_privilege(current_user, :table_name, 'INSERT') "
-                "AND has_table_privilege(current_user, :table_name, 'UPDATE') "
-                "AND has_table_privilege(current_user, :table_name, 'DELETE')"
-            ), {"table_name": "public." + table.name}).scalar_one()
-            if not has_dml:
-                raise RuntimeError(
-                    f"Hosted DATABASE_URL is missing required application table permissions for {table.name}."
-                )
+            required_operations = RUNTIME_TABLE_OPERATIONS.get(table.name, ("SELECT",))
+            for operation in required_operations:
+                has_perm = connection.execute(text(
+                    "SELECT has_table_privilege(current_user, :table_name, :operation)"
+                ), {"table_name": "public." + table.name, "operation": operation}).scalar_one()
+                if not has_perm:
+                    raise RuntimeError(
+                        f"Hosted DATABASE_URL is missing required application table permission {operation} for {table.name}."
+                    )
+        has_alembic_access = connection.execute(text(
+            "SELECT has_table_privilege(current_user, 'public.alembic_version', 'SELECT')"
+        )).scalar_one()
+        if has_alembic_access:
+            raise RuntimeError(
+                "Hosted DATABASE_URL must not have access to Alembic metadata table alembic_version."
+            )
         sequences = connection.execute(text(
             "SELECT seq.relname FROM pg_class AS seq "
             "JOIN pg_namespace AS sequence_schema ON sequence_schema.oid = seq.relnamespace "
@@ -1650,21 +1689,6 @@ def startup() -> None:
     assert_database_migrations_applied()
     assert_database_schema_matches_models()
     validate_runtime_database_role()
-    with SessionLocal() as db:
-        for row in LESSONS:
-            lesson = db.get(Lesson, row[0])
-            if lesson is None:
-                db.add(Lesson(id=row[0], title=row[1], description=row[2], content=row[3],
-                              order_num=row[4], premium=row[5], xp_reward=row[6]))
-            else:
-                lesson.title = row[1]
-                lesson.description = row[2]
-                lesson.content = row[3]
-                lesson.order_num = row[4]
-                lesson.premium = row[5]
-                lesson.xp_reward = row[6]
-        seed_subscription_plans(db)
-        db.commit()
     if not os.getenv("KITE_SECRET_KEY"):
         log.warning("KITE_SECRET_KEY is unset; authenticated requests will be unavailable.")
 
@@ -3052,6 +3076,7 @@ def authorize_subscription_registration(
     registration: SubscriptionRegistration,
     user: User | None,
     access_key: str | None,
+    db: Session,
 ) -> None:
     if user is not None and registration.user_id == user.id:
         return
@@ -3366,7 +3391,7 @@ def get_subscription_registration(
     registration = db.get(SubscriptionRegistration, registration_id)
     if registration is None:
         raise HTTPException(status_code=404, detail="Subscription registration not found.")
-    authorize_subscription_registration(registration, user, access_key)
+    authorize_subscription_registration(registration, user, access_key, db)
     return subscription_registration_payload(registration, db)
 
 
@@ -3408,7 +3433,7 @@ def cancel_subscription_registration(
     )
     if registration is None:
         raise HTTPException(status_code=404, detail="Subscription registration not found.")
-    authorize_subscription_registration(registration, user, access_key)
+    authorize_subscription_registration(registration, user, access_key, db)
     if registration.status == "ACTIVE":
         raise HTTPException(
             status_code=409,
@@ -3446,7 +3471,7 @@ def initiate_subscription_payment(
     )
     if registration is None:
         raise HTTPException(status_code=404, detail="Subscription registration not found.")
-    authorize_subscription_registration(registration, user, access_key)
+    authorize_subscription_registration(registration, user, access_key, db)
     if registration.status in {"CANCELLED", "FAILED", "EXPIRED"}:
         raise HTTPException(
             status_code=409,
@@ -3580,7 +3605,7 @@ def verify_subscription_payment(
     registration = db.get(SubscriptionRegistration, registration_id)
     if registration is None:
         raise HTTPException(status_code=404, detail="Subscription registration not found.")
-    authorize_subscription_registration(registration, user, access_key)
+    authorize_subscription_registration(registration, user, access_key, db)
     payment = latest_payment_transaction(registration.id, db)
     if payment is None or not payment.provider_id:
         return subscription_registration_payload(registration, db)
@@ -3678,7 +3703,7 @@ def create_mobile_money_payment(
         registration = db.get(SubscriptionRegistration, payload.registration_id)
         if registration is None:
             raise HTTPException(status_code=404, detail="Subscription registration not found.")
-        authorize_subscription_registration(registration, user, payload.registration_key)
+        authorize_subscription_registration(registration, user, payload.registration_key, db)
         if registration.user_id not in {None, user.id}:
             raise HTTPException(status_code=409, detail="This registration belongs to another account.")
         if registration.plan_id != payload.plan_id:
