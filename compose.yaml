@@ -6,7 +6,7 @@ services:
     env_file: .env
     environment:
       KITE_ENV: ${KITE_ENV:-production}
-      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/kite.db}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the restricted PostgreSQL runtime connection}
       RUNNER_URL: http://runner:8010
     ports:
       - "8000:8000"

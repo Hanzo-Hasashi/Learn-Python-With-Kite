@@ -115,24 +115,50 @@ def upgrade() -> None:
     )).scalars())
     client_roles = [preparer.quote(role) for role in sorted(existing_roles)]
     grantees.extend(client_roles)
+    default_privilege_owners = {bind.execute(sa.text("SELECT current_user")).scalar_one()}
+    default_privilege_owners.update(bind.execute(sa.text(
+        "SELECT DISTINCT default_owner.rolname "
+        "FROM pg_default_acl AS defaults "
+        "JOIN pg_namespace AS object_schema ON object_schema.oid = defaults.defaclnamespace "
+        "JOIN pg_roles AS default_owner ON default_owner.oid = defaults.defaclrole "
+        "CROSS JOIN LATERAL aclexplode(defaults.defaclacl) AS acl "
+        "WHERE object_schema.nspname = 'public' "
+        "AND defaults.defaclobjtype IN ('r', 'S', 'f') "
+        "AND (acl.grantee = 0 OR acl.grantee IN ("
+        "SELECT oid FROM pg_roles WHERE rolname = ANY(:client_roles)"
+        "))"
+    ), {"client_roles": sorted(existing_roles)}).scalars())
+    for owner_role in sorted(default_privilege_owners):
+        can_alter_defaults = bind.execute(sa.text(
+            "SELECT migration_role.rolsuper OR owner.rolname = current_user "
+            "OR pg_has_role(migration_role.oid, owner.oid, 'MEMBER') "
+            "FROM pg_roles AS migration_role "
+            "JOIN pg_roles AS owner ON owner.rolname = :owner_role "
+            "WHERE migration_role.rolname = current_user"
+        ), {"owner_role": owner_role}).scalar_one()
+        if not can_alter_defaults:
+            raise RuntimeError(
+                "The migration role cannot change public default privileges owned by "
+                + owner_role
+                + ". Clean those defaults as their owner or grant the migration role "
+                "the required membership before retrying."
+            )
 
     bind.exec_driver_sql("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
     bind.exec_driver_sql("GRANT USAGE ON SCHEMA public TO " + runtime_identifier)
     bind.exec_driver_sql("REVOKE CREATE ON SCHEMA public FROM " + runtime_identifier)
-    bind.exec_driver_sql(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC"
-    )
-    bind.exec_driver_sql(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC"
-    )
-    for role in sorted(existing_roles):
+    default_grantees = ", ".join(grantees)
+    for owner_role in sorted(default_privilege_owners):
+        owner_identifier = preparer.quote(owner_role)
+        for object_type in ("TABLES", "SEQUENCES", "FUNCTIONS"):
+            bind.exec_driver_sql(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE " + owner_identifier
+                + " IN SCHEMA public REVOKE ALL ON " + object_type
+                + " FROM " + default_grantees
+            )
         bind.exec_driver_sql(
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM "
-            + preparer.quote(role)
-        )
-        bind.exec_driver_sql(
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM "
-            + preparer.quote(role)
+            "ALTER DEFAULT PRIVILEGES FOR ROLE " + owner_identifier
+            + " REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
         )
     bind.exec_driver_sql(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
