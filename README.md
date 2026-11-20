@@ -118,13 +118,13 @@ Set these in the Render dashboard's environment settings, not in Git or the fron
 | `KITE_SECRET_KEY` | A stable, private random value of at least 32 characters. Keep it unchanged: rotation invalidates sessions and makes existing encrypted phone numbers unreadable. |
 | `SUPABASE_URL` | The HTTPS Project URL from the Supabase project settings. |
 | `SUPABASE_ANON_KEY` | The project's publishable key (or legacy anon key); this is the variable name the backend currently reads. Never put a service-role/secret key here. |
-| `PUBLIC_APP_URL` | The frontend HTTPS origin (no path), e.g. `https://learn-python-with-kite.vercel.app`. |
+| `PUBLIC_APP_URL` | The frontend HTTPS origin (no path), e.g. `https://learnpythonwithkite.vercel.app`. |
 | `PUBLIC_API_URL` | The browser-visible API origin. Use the same Vercel origin when `KITE_VERCEL_PROXY=true`; otherwise use the API origin under the shared custom domain. |
 | `KITE_COOKIE_SITE` | Required only without the Vercel proxy: the shared registrable custom domain, e.g. `example.com`; both public origins must be that domain or one of its subdomains. |
 | `KITE_VERCEL_PROXY` | Set to `true` when Vercel proxies `/api/*` to Render. The backend then requires the proxy secret and matching `PUBLIC_APP_URL`/`PUBLIC_API_URL`. |
 | `KITE_PROXY_SECRET` | A private random value of at least 32 characters, configured identically in Render and as a server-side Vercel environment variable used by the Vercel request-header transform. Never expose it to browser code. |
 | `KITE_PROXY_SECRET_PREVIOUS` | Optional Render-only overlap secret during rotation. Remove it after Vercel has switched to the new `KITE_PROXY_SECRET`. |
-| `KITE_CORS_ORIGINS` | Exact frontend origin, e.g. `https://learn-python-with-kite.vercel.app`; add only other exact origins actually used. Never use `*` with credentialed requests. |
+| `KITE_CORS_ORIGINS` | Exact frontend origin, e.g. `https://learnpythonwithkite.vercel.app`; add only other exact origins actually used. Never use `*` with credentialed requests. |
 | `KITE_COOKIE_SECURE` | `true` |
 | `KITE_COOKIE_SAMESITE` | `lax`; use a same-origin proxy or origins under the same registrable custom domain. |
 

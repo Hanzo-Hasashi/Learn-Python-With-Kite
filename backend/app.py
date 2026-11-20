@@ -84,14 +84,29 @@ def vercel_proxy_mode() -> bool:
     return os.getenv("KITE_VERCEL_PROXY", "").strip().lower() in {"1", "true", "yes"}
 
 
+CONFIRMED_PRODUCTION_FRONTEND_ORIGIN = "https://learnpythonwithkite.vercel.app"
+DEFAULT_DEVELOPMENT_CORS_ORIGINS = (
+    "http://localhost",
+    "https://localhost",
+    "capacitor://localhost",
+    CONFIRMED_PRODUCTION_FRONTEND_ORIGIN,
+)
+
+
 def configured_cors_origins() -> list[str]:
-    return [
-        origin.strip()
-        for origin in os.getenv(
-            "KITE_CORS_ORIGINS", "http://localhost,https://localhost,capacitor://localhost"
-        ).split(",")
-        if origin.strip()
-    ]
+    raw = os.getenv("KITE_CORS_ORIGINS")
+    if is_hosted_environment():
+        if raw is not None and raw.strip():
+            origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+        else:
+            origins = [CONFIRMED_PRODUCTION_FRONTEND_ORIGIN]
+        if CONFIRMED_PRODUCTION_FRONTEND_ORIGIN not in origins:
+            origins.append(CONFIRMED_PRODUCTION_FRONTEND_ORIGIN)
+        return origins
+
+    if raw is not None and raw.strip():
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return list(DEFAULT_DEVELOPMENT_CORS_ORIGINS)
 
 
 def validate_postgres_ssl_url(value: str, setting_name: str) -> None:
@@ -186,6 +201,10 @@ def validate_runtime_configuration() -> None:
             or parsed_origin.path or parsed_origin.query or parsed_origin.fragment
         ):
             raise RuntimeError("Hosted KITE_CORS_ORIGINS entries must be exact HTTPS or Capacitor origins.")
+        if parsed_origin.hostname in {"localhost", "127.0.0.1", "::1"} or (
+            parsed_origin.hostname and parsed_origin.hostname.endswith(".localhost")
+        ):
+            raise RuntimeError("Localhost origins are restricted to development environments.")
     if vercel_proxy_mode():
         if app_origin != parsed_api_url.scheme + "://" + parsed_api_url.netloc:
             raise RuntimeError(
@@ -1497,7 +1516,7 @@ app.mount("/assets", StaticFiles(directory=Path(__file__).parent.parent / "web" 
 
 @app.middleware("http")
 async def enforce_proxy_and_browser_origin(request: Request, call_next):
-    if vercel_proxy_mode() and request.url.path != "/health":
+    if vercel_proxy_mode() and request.url.path not in {"/health", "/health/ready"}:
         expected = os.getenv("KITE_PROXY_SECRET", "").strip()
         previous = os.getenv("KITE_PROXY_SECRET_PREVIOUS", "").strip()
         supplied = request.headers.get("x-kite-proxy-secret", "")
@@ -1696,6 +1715,16 @@ def startup() -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def health_ready(db: Session = Depends(get_db)) -> dict[str, str]:
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "ready", "database": "connected"}
+    except Exception as exc:
+        log.warning("Database readiness probe failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database connection unavailable")
 
 
 @app.get("/")

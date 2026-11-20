@@ -226,11 +226,11 @@ class KiteApiTests(unittest.TestCase):
             "KITE_SECRET_KEY": "test-only-secret-key-with-at-least-32-characters",
             "SUPABASE_URL": "https://kite-project.supabase.co",
             "SUPABASE_ANON_KEY": "sb_publishable_test",
-            "PUBLIC_APP_URL": "https://learn-python-with-kite.vercel.app",
-            "PUBLIC_API_URL": "https://learn-python-with-kite.vercel.app",
+            "PUBLIC_APP_URL": "https://learnpythonwithkite.vercel.app",
+            "PUBLIC_API_URL": "https://learnpythonwithkite.vercel.app",
             "KITE_VERCEL_PROXY": "true",
             "KITE_PROXY_SECRET": "proxy-secret-for-tests-that-is-at-least-32",
-            "KITE_CORS_ORIGINS": "https://learn-python-with-kite.vercel.app",
+            "KITE_CORS_ORIGINS": "https://learnpythonwithkite.vercel.app",
             "KITE_COOKIE_SECURE": "true",
             "KITE_COOKIE_SAMESITE": "lax",
             "KITE_ALLOW_LOCAL_AUTH": "false",
@@ -646,6 +646,56 @@ class KiteApiTests(unittest.TestCase):
             response.headers.get("access-control-allow-origin"),
             "https://attacker.example",
         )
+
+    def test_confirmed_production_frontend_origin_is_allowed_by_cors(self):
+        response = self.client.options(
+            "/api/me",
+            headers={
+                "Origin": "https://learnpythonwithkite.vercel.app",
+                "Access-Control-Request-Method": "PATCH",
+                "Access-Control-Request-Headers": "x-kite-csrf",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://learnpythonwithkite.vercel.app",
+        )
+        self.assertEqual(
+            response.headers.get("access-control-allow-credentials"),
+            "true",
+        )
+        allowed_headers = response.headers.get("access-control-allow-headers", "").lower()
+        self.assertIn("x-kite-csrf", allowed_headers)
+
+    def test_hosted_runtime_rejects_localhost_cors_origin(self):
+        hosted_config = {
+            "RENDER": "true",
+            "DATABASE_URL": "postgresql://kite_runtime:password@db.example.test/postgres?sslmode=require",
+            "KITE_SECRET_KEY": "test-only-secret-key-with-at-least-32-characters",
+            "SUPABASE_URL": "https://kite-project.supabase.co",
+            "SUPABASE_ANON_KEY": "sb_publishable_test",
+            "PUBLIC_APP_URL": "https://learnpythonwithkite.vercel.app",
+            "PUBLIC_API_URL": "https://learnpythonwithkite.vercel.app",
+            "KITE_VERCEL_PROXY": "true",
+            "KITE_PROXY_SECRET": "proxy-secret-for-tests-that-is-at-least-32",
+            "KITE_CORS_ORIGINS": "https://learnpythonwithkite.vercel.app,https://localhost",
+            "KITE_COOKIE_SECURE": "true",
+            "KITE_COOKIE_SAMESITE": "lax",
+            "KITE_ALLOW_LOCAL_AUTH": "false",
+        }
+        with patch.dict(os.environ, hosted_config, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "Localhost origins are restricted"):
+                validate_runtime_configuration()
+
+    def test_health_and_readiness_endpoints(self):
+        health = self.client.get("/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json(), {"status": "ok"})
+
+        ready = self.client.get("/health/ready")
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.json(), {"status": "ready", "database": "connected"})
 
     def test_serverless_postgres_pool_is_compatible_with_transaction_pooling(self):
         options = database_engine_options(
