@@ -52,7 +52,7 @@ Render supports both **Native Python Web Services** and **Docker-based Web Servi
 | Setting | Value | Notes |
 | :--- | :--- | :--- |
 | **Service Type** | Web Service | Selected during service creation in Render Dashboard. |
-| **Name** | `kite-backend` | Subdomain will be `https://kite-backend.onrender.com`. |
+| **Name** | `kite-backend` | Assigned production URL: `https://kite-backend-958r.onrender.com`. |
 | **Region** | Frankfurt (EU Central) | Lowest latency to Supabase `eu-west-1` (Ireland). |
 | **Branch** | `main` | Production branch. |
 | **Root Directory** | *(leave blank)* | Builds and runs from the repository root. |
@@ -146,7 +146,7 @@ Browsers enforce strict cross-site cookie boundaries between `vercel.app` and `o
 * **Vercel Rewrite:** Configured in `web/vercel.json` routing `/api` and `/api/:match*` to `/api/proxy`.
 * **Vercel Environment Variables (Configure in Vercel Dashboard):**
   * `KITE_PROXY_SECRET`: Shared secret string of at least 32 characters (must match Render).
-  * `KITE_BACKEND_URL`: `https://kite-backend.onrender.com` (Render service HTTPS origin).
+  * `KITE_BACKEND_URL`: `https://kite-backend-958r.onrender.com` (Render service HTTPS origin).
 * **Render Environment Variables (Configure in Render Dashboard):**
   * `KITE_VERCEL_PROXY`: `true`
   * `PUBLIC_API_URL`: `https://learnpythonwithkite.vercel.app`
@@ -206,15 +206,19 @@ If using a custom registrable domain (e.g. `learnpythonwithkite.com`):
 
 ---
 
-## 11. External Keep-Alive via cron-job.org
+## 11. Automated Keep-Alive via GitHub Actions & cron-job.org
 
 Render Free Web Services automatically spin down ("sleep") after 15 minutes of inbound HTTP inactivity. To keep the service responsive during active hours:
 
-1. **Create an Account:** Register at [cron-job.org](https://cron-job.org).
-2. **Create a New Cron Job:**
-   * **Title:** `Kite Backend Health Ping`
-   * **URL:** `https://<render-service-name>.onrender.com/health`
-   * **Execution Schedule:** Every 12 minutes (`*/12 * * * *`).
+1. **GitHub Actions Scheduled Keep-Alive (Included in Repository):**
+   * Workflow file: `.github/workflows/keep-alive.yml`
+   * **Schedule:** Every 10 minutes (`*/10 * * * *`)
+   * **Target Endpoint:** `https://kite-backend-958r.onrender.com/health`
+   * Automatically executes on GitHub hosted runners to ping the liveness endpoint, preventing idle sleep.
+
+2. **Optional External Ping via cron-job.org:**
+   * **URL:** `https://kite-backend-958r.onrender.com/health`
+   * **Execution Schedule:** Every 10-12 minutes (`*/10 * * * *`).
    * **Request Method:** `GET`.
    * **Failure Notification:** Enable email alerts if the endpoint fails 3 consecutive times.
 3. **Critical Limitations of External Pings:**
