@@ -4434,11 +4434,17 @@
           tell(doc, "Lesson progress is stored on this device only until you sign in.", false);
         }
       }
-      if (route === "launch" && target.textContent.trim() === "Start with a free lesson") {
+      if (route === "launch" && (
+        target.textContent.trim() === "Start with a free lesson" ||
+        target.textContent.trim() === "Explore 101 Python Lessons" ||
+        target.textContent.trim() === "Browse Python Lessons" ||
+        target.textContent.trim() === "Continue to your lessons" ||
+        target.textContent.trim() === "Continue to your first lesson"
+      )) {
         event.preventDefault();
         event.stopImmediatePropagation();
         sessionStorage.setItem("kite.lessonId", "python-variables");
-        navigate("lesson");
+        navigate("learn");
       }
       if (route === "notifications" && target.dataset.id) {
         event.stopImmediatePropagation();
@@ -5034,6 +5040,11 @@
       }
       if (route === "leaderboard" && /^t-[wma]$/.test(target.id)) {
         var period = target.id === "t-m" ? "month" : target.id === "t-a" ? "all" : "week";
+        Array.prototype.forEach.call(doc.querySelectorAll("[data-k]"), function (tab) {
+          var on = tab.id === target.id;
+          tab.setAttribute("aria-selected", String(on));
+          tab.tabIndex = on ? 0 : -1;
+        });
         setTimeout(function () { hydrateLeaderboard(doc, period); }, 0);
       }
       if (route === "progress" && target.id === "t-progress") {
