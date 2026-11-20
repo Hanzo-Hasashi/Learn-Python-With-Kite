@@ -140,11 +140,18 @@ Configure these in the Render Dashboard under:
 
 ### Architectural Integration Mode (Choose Option A or Option B)
 
-#### Option A: Vercel Same-Origin Proxy Mode (Recommended for default domains)
-Browsers enforce strict cross-site cookie boundaries between `vercel.app` and `onrender.com` (both are on the Public Suffix List). Vercel Proxy Mode routes `/api/*` requests through Vercel's serverless edge directly to Render with a shared secret header, keeping all cookies first-party on `learnpythonwithkite.vercel.app`:
-* `KITE_VERCEL_PROXY`: `true`
-* `PUBLIC_API_URL`: `https://learnpythonwithkite.vercel.app`
-* `KITE_PROXY_SECRET`: Shared secret string of at least 32 characters.
+#### Option A: Vercel Same-Origin Serverless Proxy Mode (Implemented & Recommended)
+Browsers enforce strict cross-site cookie boundaries between `vercel.app` and `onrender.com` (both are on the Public Suffix List). Vercel Proxy Mode routes `/api/*` requests through Vercel's serverless proxy function (`web/api/proxy.js`) to Render, injecting the private `x-kite-proxy-secret` header server-side:
+* **Proxy Handler:** Implemented in `web/api/proxy.js` (and mirrored in `api/proxy.js`).
+* **Vercel Rewrite:** Configured in `web/vercel.json` routing `/api` and `/api/:match*` to `/api/proxy`.
+* **Vercel Environment Variables (Configure in Vercel Dashboard):**
+  * `KITE_PROXY_SECRET`: Shared secret string of at least 32 characters (must match Render).
+  * `KITE_BACKEND_URL`: `https://kite-backend.onrender.com` (Render service HTTPS origin).
+* **Render Environment Variables (Configure in Render Dashboard):**
+  * `KITE_VERCEL_PROXY`: `true`
+  * `PUBLIC_API_URL`: `https://learnpythonwithkite.vercel.app`
+  * `KITE_PROXY_SECRET`: Identical shared secret string of at least 32 characters.
+* **Cookie Security:** Cookies (`kite_access`, `kite_session`) remain strictly host-only on `learnpythonwithkite.vercel.app` with `HttpOnly; Secure; SameSite=Lax`. The browser never sees or handles `KITE_PROXY_SECRET`.
 
 #### Option B: Direct Cross-Origin Mode with Custom Domain
 If using a custom registrable domain (e.g. `learnpythonwithkite.com`):
