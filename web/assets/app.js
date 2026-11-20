@@ -4436,7 +4436,7 @@
       }
       if (route === "launch" && (
         target.textContent.trim() === "Start with a free lesson" ||
-        target.textContent.trim() === "Explore 101 Python Lessons" ||
+        target.textContent.trim() === "Explore Python Lessons" ||
         target.textContent.trim() === "Browse Python Lessons" ||
         target.textContent.trim() === "Continue to your lessons" ||
         target.textContent.trim() === "Continue to your first lesson"
