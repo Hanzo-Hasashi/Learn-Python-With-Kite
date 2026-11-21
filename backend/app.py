@@ -889,7 +889,7 @@ def supabase_error(path: str, method: str, status: int, response: httpx.Response
     if path.startswith("/token?grant_type=pkce"):
         return HTTPException(
             status_code=401,
-            detail="Google sign-in expired or could not be completed. Please try again.",
+            detail="The sign-in or password-reset link expired or could not be completed. Please try again.",
         )
     if path.startswith("/token?grant_type=refresh_token"):
         return HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
@@ -1358,11 +1358,18 @@ class SettingsIn(BaseModel):
 
 class ResetRequestIn(BaseModel):
     email: EmailStr
+    code_challenge: str | None = Field(default=None, min_length=43, max_length=128)
+    code_challenge_method: str | None = Field(default=None, pattern="^s256$")
 
 
 class ResetCompleteIn(BaseModel):
     token: str = Field(min_length=16, max_length=4096)
     password: str = Field(min_length=8, max_length=128)
+
+
+class RecoveryCodeIn(BaseModel):
+    code: str = Field(min_length=1, max_length=2048)
+    code_verifier: str = Field(min_length=43, max_length=128)
 
 
 class RunIn(BaseModel):
@@ -2022,7 +2029,11 @@ def request_password_reset(payload: ResetRequestIn, request: Request, db: Sessio
     enforce_auth_rate_limit(request, "password-reset", email, 4, 3600)
     if supabase_configured():
         redirect = os.getenv("PUBLIC_APP_URL", "http://localhost:8000").rstrip("/") + "/#reset"
-        supabase_request("/recover?redirect_to=" + quote(redirect, safe=""), method="POST", data={"email": email})
+        recovery_data: dict[str, Any] = {"email": email}
+        if payload.code_challenge and payload.code_challenge_method:
+            recovery_data["code_challenge"] = payload.code_challenge
+            recovery_data["code_challenge_method"] = payload.code_challenge_method
+        supabase_request("/recover?redirect_to=" + quote(redirect, safe=""), method="POST", data=recovery_data)
         return {"message": "If that address has an account, password reset instructions will be sent."}
     require_auth_provider()
     if not os.getenv("SMTP_HOST"):
@@ -2040,6 +2051,23 @@ def request_password_reset(payload: ResetRequestIn, request: Request, db: Sessio
             log.exception("Unable to deliver password reset email")
             raise HTTPException(status_code=503, detail="Password reset email could not be sent. Try again later.")
     return {"message": "If that address has an account, password reset instructions will be sent."}
+
+
+@app.post("/api/auth/recovery/exchange")
+def exchange_recovery_code(payload: RecoveryCodeIn, request: Request):
+    enforce_auth_rate_limit(request, "recovery-exchange", "", 10, 900)
+    if not supabase_configured():
+        raise HTTPException(status_code=503, detail="Password recovery is unavailable.")
+    result = supabase_request("/token?grant_type=pkce", method="POST", data={
+        "auth_code": payload.code,
+        "code_verifier": payload.code_verifier,
+    })
+    access_token = result.get("access_token")
+    refresh_token = result.get("refresh_token")
+    auth_user = result.get("user") or {}
+    if not access_token or not auth_user.get("id"):
+        raise HTTPException(status_code=401, detail="This password-reset link is invalid or expired.")
+    return {"access_token": access_token, "refresh_token": refresh_token}
 
 
 @app.post("/api/auth/password-reset/complete")

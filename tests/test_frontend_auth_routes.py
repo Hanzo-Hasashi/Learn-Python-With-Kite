@@ -148,6 +148,84 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
             self.frame_eval("Boolean(document.querySelector('form[data-kite-reset]'))")
         )
 
+    def test_supabase_root_recovery_fragment_opens_new_password_form(self):
+        self.open("#access_token=audit-placeholder-token&refresh_token=audit-refresh&type=recovery")
+        self.wait_for_heading("Choose a new password")
+        self.page.wait_for_timeout(150)
+        self.assertTrue(
+            self.frame_eval("Boolean(document.querySelector('form[data-kite-reset]'))")
+        )
+
+    def test_supabase_pkce_recovery_code_is_exchanged_before_reset_form(self):
+        self.page.add_init_script(
+            "sessionStorage.setItem('kite.recoveryCodeVerifier', '"
+            + ("V" * 43)
+            + "')"
+        )
+        self.page.route(
+            "**/api/auth/recovery/exchange",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "access_token": "audit-recovery-access-token",
+                    "refresh_token": "audit-recovery-refresh-token",
+                }),
+            ),
+        )
+        self.open("#reset?code=audit-recovery-code&type=recovery")
+        self.wait_for_heading("Choose a new password")
+        self.page.wait_for_timeout(150)
+        self.assertTrue(
+            self.frame_eval("Boolean(document.querySelector('form[data-kite-reset]'))")
+        )
+
+    def test_password_reset_requires_matching_passwords_and_completes(self):
+        requests = []
+        self.page.route(
+            "**/api/auth/password-reset/complete",
+            lambda route: (
+                requests.append(route.request.url),
+                route.fulfill(status=200, content_type="application/json", body="{}"),
+            ),
+        )
+        frame = self.open("#reset?token=audit-placeholder-token")
+        self.wait_for_heading("Choose a new password")
+        frame.locator("#kite-reset-password").fill("StrongPass123!")
+        frame.locator("#kite-reset-confirm").fill("DifferentPass123!")
+        frame.get_by_role("button", name="Update password").click()
+        self.assertEqual(self.frame_eval("document.getElementById('err').textContent"),
+                         "Passwords do not match.")
+        self.assertEqual(requests, [])
+
+        frame.locator("#kite-reset-confirm").fill("StrongPass123!")
+        frame.get_by_role("button", name="Update password").click()
+        self.wait_for_heading("Password updated")
+        self.assertEqual(len(requests), 1)
+        self.assertIsNone(self.page.evaluate(
+            "sessionStorage.getItem('kite.passwordResetToken')"
+        ))
+
+    def test_expired_supabase_recovery_code_shows_error(self):
+        self.page.add_init_script(
+            "sessionStorage.setItem('kite.recoveryCodeVerifier', '"
+            + ("V" * 43)
+            + "')"
+        )
+        self.page.route(
+            "**/api/auth/recovery/exchange",
+            lambda route: route.fulfill(
+                status=401,
+                content_type="application/json",
+                body=json.dumps({"detail": "This password-reset link is invalid or expired."}),
+            ),
+        )
+        self.open("#reset?code=expired-recovery-code&type=recovery")
+        self.page.wait_for_function(
+            "() => { const error = document.getElementById('f').contentDocument"
+            ".querySelector('#err'); return error && error.textContent.length > 0; }"
+        )
+
     def test_switching_between_sign_up_and_log_in_stays_stable(self):
         frame = self.open("#sign-up")
         self.wait_for_heading("Create your account")

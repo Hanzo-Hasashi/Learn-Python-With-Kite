@@ -1252,6 +1252,50 @@ class KiteApiTests(unittest.TestCase):
         self.assertEqual(request.call_args.args[0], "/resend?redirect_to=https%3A%2F%2Fkite.example.app%2F")
         self.assertEqual(request.call_args.kwargs["data"]["type"], "signup")
 
+    def test_supabase_password_reset_uses_reset_redirect_and_pkce_challenge(self):
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+            "PUBLIC_APP_URL": "https://learnpythonwithkite.vercel.app",
+        }
+        challenge = "A" * 43
+        with patch.dict(os.environ, env), patch("backend.app.supabase_request", return_value={}) as request:
+            response = self.client.post("/api/auth/password-reset", json={
+                "email": self.email,
+                "code_challenge": challenge,
+                "code_challenge_method": "s256",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            request.call_args.args[0],
+            "/recover?redirect_to=https%3A%2F%2Flearnpythonwithkite.vercel.app%2F%23reset",
+        )
+        self.assertEqual(request.call_args.kwargs["data"]["email"], self.email)
+        self.assertEqual(request.call_args.kwargs["data"]["code_challenge"], challenge)
+        self.assertEqual(request.call_args.kwargs["data"]["code_challenge_method"], "s256")
+
+    def test_supabase_recovery_code_exchange_returns_reset_token(self):
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+        }
+        provider_result = {
+            "access_token": "recovery-access-token",
+            "refresh_token": "recovery-refresh-token",
+            "user": {"id": "supabase-recovery-user", "email": self.email},
+        }
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", return_value=provider_result
+        ) as request:
+            response = self.client.post("/api/auth/recovery/exchange", json={
+                "code": "recovery-code",
+                "code_verifier": "V" * 43,
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["access_token"], "recovery-access-token")
+        self.assertEqual(request.call_args.args[0], "/token?grant_type=pkce")
+        self.assertEqual(request.call_args.kwargs["data"]["auth_code"], "recovery-code")
+
     def test_local_password_recovery_fails_closed_without_smtp(self):
         with patch.dict(os.environ, {
             "SUPABASE_URL": "",

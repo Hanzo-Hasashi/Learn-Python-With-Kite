@@ -12,6 +12,9 @@
   var subscriptionPaymentIdempotencyKey = "kite.subscriptionPaymentIdempotencyKey";
   var subscriptionReturnKey = "kite.subscriptionReturn";
   var googleVerifierKey = "kite.googleCodeVerifier";
+  var recoveryVerifierKey = "kite.recoveryCodeVerifier";
+  var recoveryTokenKey = "kite.passwordResetToken";
+  var recoveryErrorKey = "kite.passwordResetError";
   var authDestinationKey = "kite.authDestination";
   var authModeKey = "kite.authMode";
   var rememberMeKey = "kite.rememberMe";
@@ -666,7 +669,7 @@
     function finish(error) {
       [tokenKey, refreshKey, pendingPlanKey, subscriptionReturnKey, authDestinationKey, authModeKey,
         rememberMeKey, pendingPlaygroundCodeKey, pendingChallengeCodeKey, pendingQuizAnswersKey,
-        googleVerifierKey]
+        googleVerifierKey, recoveryVerifierKey, recoveryTokenKey, recoveryErrorKey]
         .forEach(function (key) { sessionStorage.removeItem(key); });
       clearAuthTokens();
       if (doc && doc.getElementById("sbody")) {
@@ -692,24 +695,57 @@
     var hashParams = new URLSearchParams(window.location.hash.slice(1));
     var queryParams = new URLSearchParams(window.location.search);
     var type = hashParams.get("type") || queryParams.get("type");
+    var recoveryVerifier = sessionStorage.getItem(recoveryVerifierKey);
+    var recoveryHashText = window.location.hash.slice(1).replace(/^reset(?:[?#&])?/i, "");
+    var recoveryHashParams = new URLSearchParams(recoveryHashText.replace(/[?#]/g, "&"));
+    var isRecovery = type === "recovery" ||
+      recoveryHashParams.get("type") === "recovery" ||
+      Boolean(recoveryVerifier && queryParams.get("code"));
+    if (isRecovery) type = "recovery";
     var oauthError = queryParams.get("error_description") || queryParams.get("error") ||
       hashParams.get("error_description") || hashParams.get("error");
     if (oauthError) {
       sessionStorage.removeItem(googleVerifierKey);
       cleanAuthCallbackUrl();
       if (type === "recovery") {
-        navigate("reset");
-        setTimeout(function () {
-          tell(doc, "This password-reset link is invalid or expired. Request a new one and try again.", true);
-        }, 0);
+        tell(doc, "This password-reset link is invalid or expired. Request a new one and try again.", true);
       } else {
         var callbackFlow = type === "signup" || type === "email_change" ? "verify" : "google";
         tell(doc, friendlyAuthMessage(new Error(oauthError), callbackFlow), true);
       }
       return true;
     }
-    if (type === "recovery") return false;
-    var accessToken = hashParams.get("access_token");
+    var code = queryParams.get("code") || recoveryHashParams.get("code");
+    if (type === "recovery" && code && recoveryVerifier) {
+      if (oauthCallbackStarted) return true;
+      oauthCallbackStarted = true;
+      api("/api/auth/recovery/exchange", {
+        code: code,
+        code_verifier: recoveryVerifier
+      }).then(function (data) {
+        sessionStorage.removeItem(recoveryVerifierKey);
+        if (!data.access_token) throw new Error("This password-reset link is invalid or expired.");
+        sessionStorage.setItem(recoveryTokenKey, data.access_token);
+        cleanAuthCallbackUrl();
+        showPasswordReset(doc, data.access_token);
+      }).catch(function (error) {
+        sessionStorage.removeItem(recoveryVerifierKey);
+        cleanAuthCallbackUrl();
+        tell(doc, friendlyAuthMessage(error, "reset"), true);
+      });
+      return true;
+    }
+    if (type === "recovery") {
+      if (code) {
+        sessionStorage.removeItem(recoveryVerifierKey);
+        cleanAuthCallbackUrl();
+        tell(doc, "This password-reset link is invalid or expired. Request a new one and try again.", true);
+        return true;
+      }
+      return false;
+    }
+    var accessToken = hashParams.get("access_token") ||
+      recoveryHashParams.get("access_token");
     if (accessToken) {
       cleanAuthCallbackUrl();
       if (["signup", "email_change", "magiclink", "invite"].indexOf(type) < 0) {
@@ -727,7 +763,6 @@
       });
       return true;
     }
-    var code = queryParams.get("code");
     var verifier = sessionStorage.getItem(googleVerifierKey);
     if (!code) return false;
     if (!verifier) {
@@ -903,15 +938,14 @@
     doc.documentElement.kiteVerificationView = null;
   }
   function resetToken() {
+    var stored = sessionStorage.getItem(recoveryTokenKey);
+    if (stored) return stored;
     var query = new URLSearchParams(window.location.search);
     if (query.get("token")) return query.get("token");
     // Accepts "#reset?token=…" (Kite email), plus Supabase recovery redirects to "/#reset", which may
     // append their parameters as "#reset&access_token=…" or "#reset#access_token=…".
-    var hash = window.location.hash.slice(1);
-    var separator = hash.search(/[?#&]/);
-    var head = separator >= 0 ? hash.slice(0, separator) : hash;
-    var paramText = head.indexOf("=") >= 0 ? hash : (separator >= 0 ? hash.slice(separator + 1) : "");
-    var fragment = new URLSearchParams(paramText.replace(/[?#]/g, "&"));
+    var hash = window.location.hash.slice(1).replace(/^reset(?:[?#&])?/i, "");
+    var fragment = new URLSearchParams(hash.replace(/[?#]/g, "&"));
     if (fragment.get("token")) return fragment.get("token");
     if (fragment.get("type") === "recovery") return fragment.get("access_token");
     return null;
@@ -950,6 +984,8 @@
         token: reset,
         password: password.value
       }).then(function () {
+        sessionStorage.removeItem(recoveryTokenKey);
+        sessionStorage.removeItem(recoveryVerifierKey);
         body.innerHTML = "<h2>Password updated</h2><p class=\"sub\">You can now log in with your new password.</p><button class=\"b p\" type=\"button\" data-kite-login>Log in</button>";
         body.querySelector("[data-kite-login]").addEventListener("click", function () {
           window.history.replaceState(null, "", window.location.pathname);
@@ -4673,7 +4709,26 @@
           fields.em.focus();
           return;
         }
-        operation = api("/api/auth/password-reset", { email: fields.em.value.trim() });
+        if (!window.crypto || !window.crypto.subtle) {
+          tell(doc, "Secure password recovery is unavailable in this browser.", true);
+          return;
+        }
+        var recoveryRandom = new Uint8Array(32);
+        window.crypto.getRandomValues(recoveryRandom);
+        var recoveryVerifier = base64UrlEncode(recoveryRandom);
+        sessionStorage.setItem(recoveryVerifierKey, recoveryVerifier);
+        operation = window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(recoveryVerifier))
+          .then(function (digest) {
+            return api("/api/auth/password-reset", {
+              email: fields.em.value.trim(),
+              code_challenge: base64UrlEncode(digest),
+              code_challenge_method: "s256"
+            });
+          })
+          .catch(function (error) {
+            sessionStorage.removeItem(recoveryVerifierKey);
+            throw error;
+          });
       }
       else return;
       var submit = form.querySelector('button[type="submit"]');
@@ -5157,10 +5212,18 @@
         navigate("log-in");
       }
       var passwordResetCredential = resetToken();
-      var callbackType = new URLSearchParams(window.location.hash.slice(1)).get("type");
+      var callbackType = new URLSearchParams(window.location.hash.slice(1)).get("type") ||
+        new URLSearchParams(window.location.hash.slice(1)
+          .replace(/^reset(?:[?#&])?/i, "").replace(/[?#]/g, "&")).get("type");
       if (passwordResetCredential) {
+        sessionStorage.setItem(recoveryTokenKey, passwordResetCredential);
         cleanAuthCallbackUrl();
         showPasswordReset(doc, passwordResetCredential);
+      } else if (sessionStorage.getItem(recoveryErrorKey)) {
+        var recoveryError = sessionStorage.getItem(recoveryErrorKey);
+        sessionStorage.removeItem(recoveryErrorKey);
+        cleanAuthCallbackUrl();
+        tell(doc, recoveryError, true);
       } else if (callbackType === "recovery") {
         cleanAuthCallbackUrl();
         navigate("reset");
