@@ -42,6 +42,18 @@ class KiteRunnerApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422)
 
+    def test_ready_endpoint_requires_secret_and_linux(self):
+        with patch.dict(os.environ, {"RUNNER_SHARED_SECRET": "runner-test-secret-at-least-32-chars"}):
+            with patch("runner.app.sys.platform", "linux"):
+                response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ready")
+
+    def test_ready_endpoint_rejects_missing_secret(self):
+        with patch.dict(os.environ, {"RUNNER_SHARED_SECRET": ""}):
+            response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 503)
+
     def test_cancel_requires_shared_secret_and_kills_the_registered_process(self):
         execution_id = "a" * 32
         process = Mock()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import ipaddress
@@ -4043,15 +4044,33 @@ async def call_runner(code: str, challenge_id: str | None = None,
     secret = os.getenv("RUNNER_SHARED_SECRET", "")
     if not secret:
         raise HTTPException(status_code=503, detail="The isolated Python runner is not configured.")
-    try:
-        payload: dict[str, str] = {"code": code}
-        if execution_id:
-            payload["execution_id"] = execution_id
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(f"{runner_url}/run", json=payload,
-                                         headers={"X-Kite-Runner-Key": secret})
-    except httpx.HTTPError:
-        log.exception("Isolated runner request failed")
+    payload: dict[str, str] = {"code": code}
+    if execution_id:
+        payload["execution_id"] = execution_id
+    response = None
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(20.0, connect=10.0),
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    f"{runner_url.rstrip('/')}/run",
+                    json=payload,
+                    headers={"X-Kite-Runner-Key": secret},
+                )
+            if response.status_code not in {502, 503, 504} or attempt == 1:
+                break
+            await asyncio.sleep(1)
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt == 1:
+                break
+            await asyncio.sleep(1)
+    if response is None:
+        if last_error is not None:
+            log.warning("Isolated runner request failed after retries: %s", type(last_error).__name__)
         raise HTTPException(status_code=503, detail="The isolated Python runner is unavailable.")
     if response.status_code == 503:
         raise HTTPException(status_code=503, detail="Python execution is temporarily unavailable.")

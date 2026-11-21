@@ -145,6 +145,16 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/health/ready")
+def health_ready():
+    secret = os.getenv("RUNNER_SHARED_SECRET", "").strip()
+    if len(secret) < 32:
+        raise HTTPException(status_code=503, detail="Runner shared secret is not configured.")
+    if sys.platform != "linux":
+        raise HTTPException(status_code=503, detail="The isolated runner requires Linux.")
+    return {"status": "ready", "isolation": "uid+seccomp"}
+
+
 @app.post("/cancel/{execution_id}")
 def cancel_execution(execution_id: str, x_kite_runner_key: Annotated[str | None, Header()] = None):
     require_key(x_kite_runner_key)

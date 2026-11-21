@@ -52,3 +52,20 @@ services:
         sync: false
       - key: KITE_COOKIE_SITE
         sync: false
+      - key: RUNNER_URL
+        sync: false
+      - key: RUNNER_SHARED_SECRET
+        sync: false
+
+  - type: web
+    name: kite-playground
+    runtime: docker
+    dockerfilePath: ./runner/Dockerfile
+    dockerContext: .
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: RUNNER_SHARED_SECRET
+        sync: false

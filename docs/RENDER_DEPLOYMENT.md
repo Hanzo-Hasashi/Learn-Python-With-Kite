@@ -153,6 +153,20 @@ Browsers enforce strict cross-site cookie boundaries between `vercel.app` and `o
   * `KITE_PROXY_SECRET`: Identical shared secret string of at least 32 characters.
 * **Cookie Security:** Cookies (`kite_access`, `kite_session`) remain strictly host-only on `learnpythonwithkite.vercel.app` with `HttpOnly; Secure; SameSite=Lax`. The browser never sees or handles `KITE_PROXY_SECRET`.
 
+### Separate Python Playground Service
+The repository includes a separate `kite-playground` Docker Web Service in `render.yaml`.
+
+* **Service:** `kite-playground`
+* **Dockerfile:** `runner/Dockerfile`
+* **Docker context:** repository root
+* **Health endpoint:** `/health`
+* **Readiness endpoint:** `/health/ready`
+* **Required secret:** `RUNNER_SHARED_SECRET`, at least 32 characters
+* **Main-backend secret:** Set `RUNNER_SHARED_SECRET` to the exact same value on `kite-backend`
+* **Main-backend URL:** Set `RUNNER_URL` to the deployed playground HTTPS origin
+
+The browser continues to call only `/api/execution/*` on the main backend. The main backend forwards the request to the separate playground service. Do not expose `RUNNER_SHARED_SECRET` to Vercel or browser code.
+
 #### Option B: Direct Cross-Origin Mode with Custom Domain
 If using a custom registrable domain (e.g. `learnpythonwithkite.com`):
 * `KITE_VERCEL_PROXY`: `false`
