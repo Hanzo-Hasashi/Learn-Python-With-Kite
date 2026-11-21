@@ -386,7 +386,7 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
         logout_button.click()
         self.page.wait_for_function(
             "() => { const d = document.getElementById('f').contentDocument;"
-            " return d && d.body && d.body.textContent.includes('server-side revocation'); }"
+            " return d && d.body && d.body.textContent.includes(\"couldn't complete sign-out\"); }"
         )
 
         self.assertTrue(logout_button.is_visible())
@@ -401,6 +401,69 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
         frame.get_by_role("link", name="Create an account").click(timeout=3000)
         self.wait_for_heading("Create your account")
         self.assert_form_enhanced_once("up")
+
+    def test_failed_login_uses_contextual_safe_message(self):
+        def handle_api(route):
+            path = route.request.url.split("?", 1)[0]
+            if path.endswith("/api/auth/login"):
+                route.fulfill(
+                    status=401,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "detail": "Email or password is incorrect.",
+                        "error": {"code": "unauthorized", "message": "Email or password is incorrect."},
+                    }),
+                )
+            else:
+                route.fulfill(status=200, content_type="application/json", body="{}")
+
+        self.context.route("**/api/**", handle_api)
+        frame = self.open("#log-in")
+        frame.locator('input[name="em"]').fill("learner@example.test")
+        frame.locator('input[name="pw"]').fill("incorrect-password")
+        frame.locator('form[data-f="in"] button[type="submit"]').click()
+        self.page.wait_for_timeout(1500)
+        body_text = self.page.evaluate(
+            "() => document.getElementById('f').contentDocument.body.textContent"
+        )
+        self.assertIn("couldn't sign you in", body_text)
+        self.assertNotIn("Supabase", body_text)
+        self.assertNotIn("HTTP 401", body_text)
+
+    def test_learning_load_failure_uses_safe_retry_message_not_backend_details(self):
+        def handle_api(route):
+            path = route.request.url.split("?", 1)[0]
+            if path.endswith("/api/lessons"):
+                route.fulfill(
+                    status=503,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "detail": "Database connection failed; SQL SELECT * unavailable",
+                        "error": {
+                            "code": "database_unavailable",
+                            "message": "Database connection failed",
+                        },
+                    }),
+                )
+            elif path.endswith("/api/me"):
+                route.fulfill(status=401, content_type="application/json",
+                              body=json.dumps({"detail": "Sign in to continue."}))
+            else:
+                route.fulfill(status=200, content_type="application/json", body="{}")
+
+        self.context.route("**/api/**", handle_api)
+        self.open("#learn")
+        self.page.wait_for_function(
+            "() => { const d = document.getElementById('f').contentDocument;"
+            " return d && d.body && d.body.textContent.includes('Retry'); }",
+            timeout=10000,
+        )
+        body_text = self.page.evaluate(
+            "() => document.getElementById('f').contentDocument.body.textContent"
+        )
+        self.assertNotIn("Database", body_text)
+        self.assertNotIn("SQL", body_text)
+        self.assertNotIn("backend", body_text.lower())
 
     def test_done_route_is_not_normalized_to_launch(self):
         self.open("#done")

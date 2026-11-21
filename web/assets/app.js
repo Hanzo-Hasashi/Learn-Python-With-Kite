@@ -163,6 +163,12 @@
       var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
       var timeoutId;
       var settings = Object.assign({ credentials: "include" }, options || {});
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        var offline = new Error("Please check your internet connection and try again.");
+        offline.networkFailure = true;
+        offline.status = 0;
+        return Promise.reject(offline);
+      }
       if (controller) settings.signal = controller.signal;
       var request = fetch(apiUrl(path), settings).catch(function (cause) {
         var failure = new Error("Kite couldn't reach its server. Check your connection and try again.");
@@ -209,7 +215,7 @@
     function fetchCurrentSession() {
       if (restorationVersion !== authStateVersion) return Promise.resolve(authUser);
       return apiFetch("/api/auth/session", { method: "GET" }, sessionRequestTimeout)
-        .then(responseData).then(function (data) {
+        .then(function (response) { return responseData(response, "/api/auth/session"); }).then(function (data) {
         return acceptAuthSession(data, restorationVersion);
       });
     }
@@ -229,7 +235,7 @@
           refresh_token: legacyRefreshToken,
           remember_me: sessionStorage.getItem(rememberMeKey) === "true"
         })
-      }, sessionRequestTimeout).then(responseData).then(function (data) {
+      }, sessionRequestTimeout).then(function (response) { return responseData(response, "/api/auth/session"); }).then(function (data) {
         clearLegacyTokens();
         return acceptAuthSession(data, restorationVersion);
       }).catch(function (error) {
@@ -266,23 +272,106 @@
     sessionStorage.setItem(authModeKey, "login");
     navigate("log-in");
   }
-  function responseData(response) {
+  function kiteApiMessage(status, code, detail, operation) {
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      return "Please check your internet connection and try again.";
+    }
+    if (status === 429) return "Too many attempts. Please wait a little while and try again.";
+    if (status === 0) return "Please check your internet connection and try again.";
+    var lowerDetail = String(detail || "").toLowerCase();
+    if (status === 401) {
+      if (operation.indexOf("/api/auth/logout") === 0) {
+        return "We couldn't complete sign-out. Please try again.";
+      }
+      if (operation.indexOf("/api/auth/login") === 0 ||
+          lowerDetail.indexOf("email or password") >= 0) {
+        return "We couldn't sign you in. Please check your details and try again.";
+      }
+      if (operation.indexOf("/api/auth/password-reset") === 0 ||
+          lowerDetail.indexOf("reset") >= 0 || lowerDetail.indexOf("expired") >= 0) {
+        return "This link is invalid or expired. Request a new email and try again.";
+      }
+      return "Your session has expired. Please sign in again to continue.";
+    }
+    if (status === 403) return "This action is not allowed. Please review the details and try again.";
+    if (status === 404) {
+      if (operation.indexOf("/api/lessons") === 0) return "We couldn't find that lesson. It may no longer be available.";
+      if (operation.indexOf("/api/quizzes") === 0) return "We couldn't find that quiz. It may no longer be available.";
+      return "We couldn't find the requested information.";
+    }
+    if (status === 409) return "We couldn't complete that action. It may already be in progress.";
+    if (status === 402) return "This feature requires Kite Premium.";
+    if (status === 422) {
+      if (lowerDetail.indexOf("zambian") >= 0) return "Enter a valid Zambian mobile-money number.";
+      if (lowerDetail.indexOf("stronger password") >= 0) return "Choose a stronger password and try again.";
+      return "Please check the submitted details and try again.";
+    }
+    if (status === 503 || status === 504 || code === "service_unavailable" || code === "database_unavailable") {
+      if (operation.indexOf("/api/auth/logout") === 0) return "We couldn't complete sign-out. Please try again.";
+      if (operation.indexOf("/api/auth/password-reset") === 0) return "Password recovery is temporarily unavailable. Please try again shortly.";
+      if (operation.indexOf("/api/execution") === 0) return "The Python runner is unavailable right now. Please try again shortly.";
+      if (operation.indexOf("/api/auth") === 0) return "Authentication is temporarily unavailable. Please try again shortly.";
+      if (operation.indexOf("/api/plans") === 0 || operation.indexOf("/api/subscription") === 0 ||
+          operation.indexOf("/api/payment") === 0) return "We couldn't complete or verify the payment right now. Please try again.";
+      if (operation.indexOf("/api/lessons") === 0 || operation.indexOf("/api/modules") === 0) {
+        return "We couldn't load your lessons right now. Please try again.";
+      }
+      if (operation.indexOf("/api/quizzes") === 0) return "We couldn't load this quiz right now. Please try again shortly.";
+      if (operation.indexOf("/api/progress") === 0) return "We couldn't save or load your progress right now. Please try again.";
+      if (operation.indexOf("/api/leaderboard") === 0) return "We couldn't load the leaderboard right now. Please try again.";
+      if (operation.indexOf("/api/me") === 0 || operation.indexOf("/api/settings") === 0) {
+        return "We couldn't update or load your account right now. Please try again.";
+      }
+      return "We couldn't complete that action. Please try again shortly.";
+    }
+    if (operation.indexOf("/api/auth/logout") === 0 && status >= 500) {
+      return "We couldn't complete sign-out. Please try again.";
+    }
+    if (operation.indexOf("/api/progress") === 0 && status >= 500) {
+      return "Your progress couldn't be saved. Please try again.";
+    }
+    if ((operation.indexOf("/api/subscription") === 0 || operation.indexOf("/api/payment") === 0) && status >= 500) {
+      return "We couldn't complete or verify the payment right now. Please try again.";
+    }
+    if (status >= 500) return "We couldn't complete that action. Please try again shortly.";
+    if (status === 400) {
+      if (operation.indexOf("/api/auth/register") === 0) return "We couldn't complete registration. Review the details and try again.";
+      if (operation.indexOf("/api/auth/password-reset") === 0) return "We couldn't reset your password. Request a new reset link and try again.";
+      if (operation.indexOf("/api/payment") === 0 || operation.indexOf("/api/subscription") === 0) {
+        return "We couldn't complete or verify the payment. Please review the details and try again.";
+      }
+    }
+    return "We couldn't complete that action. Please try again.";
+  }
+
+  function responseData(response, operation) {
     return response.json().catch(function () {
       return {
-        detail: response.status === 404
-          ? "Kite API endpoint not found. Check the API URL and deployment configuration."
-          : "Kite API returned an unreadable response."
+        detail: "We couldn't complete that action. Please try again.",
       };
     }).then(function (data) {
-      var detail = data.detail;
+      var detail = data && data.detail;
+      var errorInfo = data && data.error;
+      var code = errorInfo && errorInfo.code;
       if (Array.isArray(detail)) {
         detail = detail.map(function (item) { return item && item.msg; }).filter(Boolean).join(" ");
       } else if (detail && typeof detail !== "string") {
         detail = detail.message;
       }
       if (!response.ok) {
-        var error = new Error(detail || "Kite API request failed.");
+        var safeMessage = kiteApiMessage(response.status, code, detail, operation || "");
+        var error = new Error(safeMessage);
         error.status = response.status;
+        error.code = code || "";
+        error.requestId = errorInfo && errorInfo.request_id ? errorInfo.request_id : "";
+        if (response.status >= 500 || code === "service_unavailable" || code === "database_unavailable") {
+          console.error("Kite API request failed.", {
+            operation: operation || "",
+            status: response.status,
+            code: error.code,
+            requestId: error.requestId,
+          });
+        }
         throw error;
       }
       return data;
@@ -292,7 +381,7 @@
     if (refreshInFlight) return refreshInFlight;
     var sessionVersion = authStateVersion;
     refreshInFlight = apiFetch("/api/auth/session", { method: "GET" }, sessionRequestTimeout)
-      .then(responseData).then(function (data) {
+      .then(function (response) { return responseData(response, "/api/auth/session"); }).then(function (data) {
         return acceptAuthSession(data, sessionVersion);
       }).then(function (user) {
       if (!user) throw new Error("Your session has expired. Sign in again.");
@@ -333,7 +422,7 @@
           if (response.status === 401 && !retried && token() && !isAuthRequest) {
             clearAuthTokens();
           }
-          return responseData(response);
+          return responseData(response, path);
         });
     }
     var ready = sessionIndependentAuth ? Promise.resolve() : (authRestoration || Promise.resolve());
@@ -365,10 +454,21 @@
     notice.setAttribute("role", "alert");
     notice.style.cssText = "margin:16px;padding:16px;border:1px solid var(--line,#dbe4f3);border-radius:14px;background:var(--card,#fff);color:var(--ink,#17233d)";
     var message = doc.createElement("p");
-    message.textContent = serviceUnavailable(error)
-      ? "Kite's learning service isn't available right now, so the " + resource +
-        " can't be shown. Please try again later."
-      : "The " + resource + " could not be loaded. Check your connection to Kite and try again.";
+    if (error && error.status === 404) {
+      message.textContent = "We couldn't find that " + resource + ". It may no longer be available.";
+    } else if (error && error.networkFailure) {
+      message.textContent = "We're having trouble connecting. Please check your internet connection and try again.";
+    } else if (error && (error.status === 503 || error.status === 504 || error.timedOut)) {
+      if (/progress/i.test(resource)) message.textContent = "Your progress couldn't be loaded. Please try again.";
+      else if (/leaderboard/i.test(resource)) message.textContent = "We couldn't load the leaderboard right now. Please try again.";
+      else if (/quiz/i.test(resource) || /assessment/i.test(resource)) message.textContent = "We couldn't load this quiz right now. Please try again shortly.";
+      else if (/subscription/i.test(resource) || /plan/i.test(resource)) message.textContent = "We couldn't load subscription information right now. Please try again.";
+      else message.textContent = "We couldn't load your lessons right now. Please try again.";
+    } else if (serviceUnavailable(error)) {
+      message.textContent = "We couldn't load " + resource + " right now. Please try again shortly.";
+    } else {
+      message.textContent = "We couldn't load " + resource + " right now. Please try again.";
+    }
     var button = doc.createElement("button");
     button.type = "button";
     button.textContent = "Retry";
@@ -402,7 +502,7 @@
     if (message.indexOf("confirm your email") >= 0) {
       return "Check your inbox and confirm your email address before signing in.";
     }
-    if (flow === "in" && status === 401) return "Email or password is incorrect. Check your details and try again.";
+    if (flow === "in" && status === 401) return "We couldn't sign you in. Please check your details and try again.";
     if (flow === "up" && (status === 400 || status === 409)) {
       return "We couldn't complete registration. If you already have an account, try signing in.";
     }
@@ -697,7 +797,7 @@
       console.error("Kite sign-out could not be revoked by the server.", error);
       logoutInFlight = false;
       tell(doc || document,
-        "Logout failed: Kite couldn't confirm server-side revocation. You're still signed in; check your connection and retry.",
+        "We couldn't complete sign-out. Please try again.",
         true);
     });
   }
@@ -1987,7 +2087,7 @@
           sessionStorage.setItem(mobileMoneyIdempotencyKey, idempotencyKey);
         }
       } catch (error) {
-        status.textContent = error.message;
+        status.textContent = "We couldn't start this payment securely. Please try again.";
         return;
       }
       pay.disabled = true;
@@ -4912,7 +5012,7 @@
           guestExecutionToken = createPlaygroundExecutionId(doc.defaultView, 32);
         }
         catch (error) {
-          tell(doc, error.message, true);
+          tell(doc, "The Python editor couldn't prepare this run. Please reload and try again.", true);
           return;
         }
         var runState = {

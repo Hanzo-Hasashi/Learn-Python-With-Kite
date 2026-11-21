@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import hmac
 import io
+import json
 import logging
 import os
 import secrets
@@ -670,6 +671,50 @@ class KiteApiTests(unittest.TestCase):
         self.assertIsNone(self.client.cookies.get("kite_access"))
         with SessionLocal() as db:
             self.assertIsNotNone(db.get(AuthSession, session_id).revoked_at)
+
+    def test_structured_validation_error_does_not_expose_internal_details(self):
+        response = self.client.post("/api/auth/login", json={"email": "not-an-email"})
+        self.assertEqual(response.status_code, 422)
+        body = response.json()
+        self.assertIn("detail", body)
+        self.assertIn("error", body)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertIn("X-Kite-Request-ID", response.headers)
+        combined = json.dumps(body).lower()
+        for forbidden in ("database", "sql", "supabase", "traceback", "stack trace", "http 422"):
+            self.assertNotIn(forbidden, combined)
+
+    def test_structured_not_found_error_does_not_expose_paths(self):
+        response = self.client.get("/api/this-route-does-not-exist")
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertEqual(body["error"]["code"], "not_found")
+        self.assertNotIn("/api/this-route-does-not-exist", body["detail"])
+        self.assertIn("X-Kite-Request-ID", response.headers)
+
+    def test_unexpected_exception_returns_generic_safe_response(self):
+        async def explode():
+            raise RuntimeError("database password=secret and SQL SELECT * leaked")
+
+        app.add_api_route(
+            "/api/test-only-unexpected-error",
+            explode,
+            methods=["GET"],
+        )
+        try:
+            response = self.client.get("/api/test-only-unexpected-error")
+        finally:
+            app.router.routes[:] = [
+                route for route in app.router.routes
+                if getattr(route, "path", None) != "/api/test-only-unexpected-error"
+            ]
+        self.assertEqual(response.status_code, 500)
+        body = response.json()
+        combined = json.dumps(body).lower()
+        self.assertEqual(body["error"]["code"], "internal_error")
+        self.assertNotIn("database password", combined)
+        self.assertNotIn("sql", combined)
+        self.assertIn("X-Kite-Request-ID", response.headers)
 
     def test_supabase_logout_rejects_expired_access_and_refresh_credentials(self):
         env = {
@@ -1876,7 +1921,10 @@ class KiteApiTests(unittest.TestCase):
         with patch.dict(os.environ, {"KITE_SECRET_KEY": ""}):
             response = self.client.post("/api/subscription/registrations", json=payload)
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["detail"], "KITE_SECRET_KEY is not configured.")
+        self.assertEqual(
+            response.json()["detail"],
+            "The service is temporarily unavailable. Please try again shortly.",
+        )
 
     def test_registration_cancel_and_unconfigured_provider_do_not_activate_premium(self):
         registration_key = secrets.token_urlsafe(32)

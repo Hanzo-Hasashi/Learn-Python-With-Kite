@@ -22,13 +22,15 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, func, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from backend.payments import (
     PaymentStatus,
@@ -1553,8 +1555,142 @@ app.add_middleware(
 app.mount("/assets", StaticFiles(directory=Path(__file__).parent.parent / "web" / "assets"), name="assets")
 
 
+def _request_id(request: Request) -> str:
+    request_id = getattr(request.state, "kite_request_id", None)
+    if not request_id:
+        request_id = uuid.uuid4().hex
+        request.state.kite_request_id = request_id
+    return request_id
+
+
+def _safe_http_detail(status_code: int, detail: Any) -> str:
+    if status_code >= 500:
+        return "The service is temporarily unavailable. Please try again shortly."
+    if status_code == 404:
+        return "The requested information could not be found."
+    if status_code == 403:
+        return "This action is not allowed."
+    if status_code == 422:
+        return "Please check the submitted details and try again."
+    if status_code == 409:
+        return "We couldn't complete that action. It may already be in progress."
+    if isinstance(detail, str):
+        lowered = detail.lower()
+        forbidden = (
+            "database", "sql", "supabase", "backend", "server",
+            "traceback", "stack trace", "exception", "http 5",
+            "internal", "infrastructure", "api request failed",
+        )
+        if not any(term in lowered for term in forbidden):
+            return detail
+    if status_code == 429:
+        return "Too many attempts. Please wait a little while and try again."
+    if status_code == 404:
+        return "The requested information could not be found."
+    if status_code == 401:
+        return "Sign in to continue."
+    if status_code == 403:
+        return "This action is not allowed."
+    if status_code == 422:
+        return "Please check the submitted details and try again."
+    if status_code == 409:
+        return "We couldn't complete that action. It may already be in progress."
+    return "We couldn't complete that action. Please try again."
+
+
+def _structured_error(
+    status_code: int,
+    code: str,
+    message: str,
+    request: Request,
+) -> JSONResponse:
+    request_id = _request_id(request)
+    payload = {
+        "detail": message,
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+        },
+    }
+    response = JSONResponse(status_code=status_code, content=payload)
+    response.headers["X-Kite-Request-ID"] = request_id
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def kite_starlette_http_exception_handler(
+    request: Request, error: StarletteHTTPException,
+) -> JSONResponse:
+    code = "not_found" if error.status_code == 404 else "http_error"
+    message = _safe_http_detail(error.status_code, error.detail)
+    return _structured_error(error.status_code, code, message, request)
+
+
+@app.exception_handler(HTTPException)
+async def kite_http_exception_handler(request: Request, error: HTTPException) -> JSONResponse:
+    code = {
+        400: "bad_request",
+        401: "unauthorized",
+        403: "forbidden",
+        404: "not_found",
+        409: "conflict",
+        422: "validation_error",
+        429: "rate_limited",
+        503: "service_unavailable",
+    }.get(error.status_code, "request_failed")
+    message = _safe_http_detail(error.status_code, error.detail)
+    response = _structured_error(error.status_code, code, message, request)
+    if error.headers:
+        for name, value in error.headers.items():
+            response.headers[name] = value
+    if error.status_code >= 500:
+        log.error("API %s %s failed [%s]: HTTP %s",
+                  request.method, request.url.path, _request_id(request), error.status_code)
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def kite_validation_exception_handler(request: Request, error: RequestValidationError) -> JSONResponse:
+    log.warning("API validation failed [%s] %s %s",
+                _request_id(request), request.method, request.url.path)
+    return _structured_error(
+        422,
+        "validation_error",
+        "Please check the submitted details and try again.",
+        request,
+    )
+
+
+@app.exception_handler(SQLAlchemyError)
+async def kite_database_exception_handler(request: Request, error: SQLAlchemyError) -> JSONResponse:
+    log.exception("Database operation failed [%s] %s %s",
+                  _request_id(request), request.method, request.url.path)
+    return _structured_error(
+        503,
+        "database_unavailable",
+        "The service is temporarily unavailable. Please try again shortly.",
+        request,
+    )
+
+
+@app.exception_handler(Exception)
+async def kite_unexpected_exception_handler(request: Request, error: Exception) -> JSONResponse:
+    log.exception("Unexpected API failure [%s] %s %s",
+                  _request_id(request), request.method, request.url.path)
+    return _structured_error(
+        500,
+        "internal_error",
+        "We couldn't complete that action. Please try again shortly.",
+        request,
+    )
+
+
 @app.middleware("http")
 async def enforce_proxy_and_browser_origin(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    request.state.kite_request_id = request_id
     if vercel_proxy_mode() and request.url.path not in {"/health", "/health/ready"}:
         expected = os.getenv("KITE_PROXY_SECRET", "").strip()
         previous = os.getenv("KITE_PROXY_SECRET_PREVIOUS", "").strip()
@@ -1566,7 +1702,7 @@ async def enforce_proxy_and_browser_origin(request: Request, call_next):
             return JSONResponse(
                 status_code=404,
                 content={"detail": "Not found"},
-                headers={"Cache-Control": "private, no-store"},
+                headers={"Cache-Control": "private, no-store", "X-Kite-Request-ID": request_id},
             )
         request.state.kite_proxy_authenticated = True
 
@@ -1581,10 +1717,30 @@ async def enforce_proxy_and_browser_origin(request: Request, call_next):
             return JSONResponse(
                 status_code=403,
                 content={"detail": "This request origin is not allowed."},
-                headers={"Cache-Control": "private, no-store"},
+                headers={"Cache-Control": "private, no-store", "X-Kite-Request-ID": request_id},
             )
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except SQLAlchemyError:
+        log.exception("Database operation failed [%s] %s %s",
+                      _request_id(request), request.method, request.url.path)
+        return _structured_error(
+            503,
+            "database_unavailable",
+            "The service is temporarily unavailable. Please try again shortly.",
+            request,
+        )
+    except Exception:
+        log.exception("Unexpected API failure [%s] %s %s",
+                      _request_id(request), request.method, request.url.path)
+        return _structured_error(
+            500,
+            "internal_error",
+            "We couldn't complete that action. Please try again shortly.",
+            request,
+        )
+    response.headers.setdefault("X-Kite-Request-ID", request_id)
     if (
         response.status_code >= 400
         and getattr(request.state, "kite_clear_auth_cookies", False)
@@ -3427,7 +3583,7 @@ def create_subscription_registration(
     try:
         phone_number = normalize_zambian_phone(payload.phone_number)
     except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
+        raise HTTPException(status_code=422, detail="Enter a valid Zambian mobile-money number.") from error
     plan = db.get(SubscriptionPlan, payload.plan_id)
     if plan is None or not plan.active or not plan.premium:
         raise HTTPException(status_code=422, detail="Choose an available Premium plan.")
@@ -3839,7 +3995,7 @@ def create_mobile_money_payment(
             try:
                 supplied_phone = normalize_zambian_phone(payload.phone_number)
             except ValueError as error:
-                raise HTTPException(status_code=422, detail=str(error)) from error
+                raise HTTPException(status_code=422, detail="Enter a valid Zambian mobile-money number.") from error
             if not hmac.compare_digest(supplied_phone, phone_number):
                 raise HTTPException(status_code=409, detail="The mobile number does not match this registration.")
         registration.user_id = user.id
@@ -3850,7 +4006,7 @@ def create_mobile_money_payment(
         try:
             phone_number = normalize_zambian_phone(payload.phone_number)
         except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail="Enter a valid Zambian mobile-money number.") from error
     phone_number = phone_number.lstrip("+")
     request_digest = hmac.new(
         token_key(),
