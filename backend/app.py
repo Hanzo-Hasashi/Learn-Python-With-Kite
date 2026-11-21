@@ -1043,6 +1043,17 @@ def set_auth_cookies(
 
 
 def clear_auth_cookies(request: Request, response: Response) -> None:
+    request.state.kite_clear_auth_cookies = True
+    cookie_names = {
+        AUTH_ACCESS_COOKIE.encode(),
+        AUTH_REFRESH_COOKIE.encode(),
+        AUTH_SESSION_COOKIE.encode(),
+    }
+    response.raw_headers = [
+        (name, value) for name, value in response.raw_headers
+        if name.lower() != b"set-cookie"
+        or value.split(b";", 1)[0].split(b"=", 1)[0].strip() not in cookie_names
+    ]
     settings = cookie_settings(request, False)
     for name in (AUTH_ACCESS_COOKIE, AUTH_REFRESH_COOKIE, AUTH_SESSION_COOKIE):
         response.delete_cookie(
@@ -1112,6 +1123,11 @@ def current_user(
     db: Session = Depends(get_db),
 ) -> User:
     credential, using_cookie = credential_token(request, authorization)
+    request.state.kite_auth_access_token = credential
+    request.state.kite_auth_refresh_token = (
+        request.cookies.get(AUTH_REFRESH_COOKIE) if using_cookie else None
+    )
+    request.state.kite_auth_using_cookie = using_cookie
     if not credential:
         raise HTTPException(status_code=401, detail="Sign in to continue.")
     session = None
@@ -1134,10 +1150,15 @@ def current_user(
                 if using_cookie:
                     clear_auth_cookies(request, response)
                 raise
-            refreshed = supabase_request(
-                "/token?grant_type=refresh_token", method="POST",
-                data={"refresh_token": refresh_token},
-            )
+            try:
+                refreshed = supabase_request(
+                    "/token?grant_type=refresh_token", method="POST",
+                    data={"refresh_token": refresh_token},
+                )
+            except HTTPException as refresh_error:
+                if using_cookie and refresh_error.status_code == 401:
+                    clear_auth_cookies(request, response)
+                raise
             credential = refreshed.get("access_token", "")
             refresh_token = refreshed.get("refresh_token") or refresh_token
             if not credential:
@@ -1149,6 +1170,16 @@ def current_user(
             user = local_user_for_supabase(refreshed_user, db)
             session.token_hash = hashlib.sha256(credential.encode()).hexdigest()
             session.last_seen_at = utcnow()
+            request.state.kite_auth_access_token = credential
+            request.state.kite_auth_refresh_token = refresh_token
+            request.state.kite_refreshed_session = {
+                "user": user,
+                "access_token": credential,
+                "refresh_token": refresh_token,
+                "expires_at": expires_at,
+                "remember_me": remember,
+                "session_id": session.id,
+            }
             set_auth_cookies(
                 request, response, db, user, credential, refresh_token,
                 remember, expires_at, session.id,
@@ -1554,6 +1585,11 @@ async def enforce_proxy_and_browser_origin(request: Request, call_next):
             )
 
     response = await call_next(request)
+    if (
+        response.status_code >= 400
+        and getattr(request.state, "kite_clear_auth_cookies", False)
+    ):
+        clear_auth_cookies(request, response)
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "private, no-store"
     return response
@@ -1938,14 +1974,42 @@ def resend_verification(payload: VerificationResendIn, request: Request):
 def logout(request: Request, response: Response,
            authorization: Annotated[str | None, Header()] = None,
            user: User = Depends(current_user), db: Session = Depends(get_db)):
-    credential, using_cookie = credential_token(request, authorization)
+    credential = getattr(request.state, "kite_auth_access_token", None)
+    if not credential:
+        credential, _ = credential_token(request, authorization)
+    using_cookie = getattr(
+        request.state, "kite_auth_using_cookie", bool(request.cookies.get(AUTH_ACCESS_COOKIE)),
+    )
     session_id = request.cookies.get(AUTH_SESSION_COOKIE) if using_cookie else None
+    session = None
     if session_id:
         session = db.get(AuthSession, session_id)
-        if session and session.user_id == user.id:
-            session.revoked_at = utcnow()
+        if session and session.user_id != user.id:
+            session = None
     if supabase_configured() and credential:
-        supabase_request("/logout", method="POST", access_token=credential)
+        try:
+            supabase_request("/logout?scope=local", method="POST", access_token=credential)
+        except HTTPException as error:
+            refreshed_session = getattr(request.state, "kite_refreshed_session", None)
+            if refreshed_session:
+                failure_response = JSONResponse(
+                    status_code=error.status_code,
+                    content={"detail": error.detail},
+                )
+                set_auth_cookies(
+                    request,
+                    failure_response,
+                    db,
+                    refreshed_session["user"],
+                    refreshed_session["access_token"],
+                    refreshed_session["refresh_token"],
+                    refreshed_session["remember_me"],
+                    refreshed_session["expires_at"],
+                    refreshed_session["session_id"],
+                )
+                db.commit()
+                return failure_response
+            raise
     elif credential:
         token_hash = hashlib.sha256(credential.encode()).hexdigest()
         try:
@@ -1956,9 +2020,13 @@ def logout(request: Request, response: Response,
         db.query(RevokedToken).filter(RevokedToken.expires_at <= utcnow()).delete(synchronize_session=False)
         if not db.get(RevokedToken, token_hash):
             db.add(RevokedToken(token_hash=token_hash, expires_at=expires_at))
+    if session:
+        session.revoked_at = utcnow()
     db.commit()
     if using_cookie:
-        clear_auth_cookies(request, response)
+        logout_response = JSONResponse({"ok": True})
+        clear_auth_cookies(request, logout_response)
+        return logout_response
     return {"ok": True}
 
 

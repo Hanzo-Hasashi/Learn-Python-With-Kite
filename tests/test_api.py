@@ -14,6 +14,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from fastapi import HTTPException
 
 DB_DIR = tempfile.TemporaryDirectory()
 logging.disable(logging.CRITICAL)
@@ -29,7 +30,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from backend.app import (
-    Activity, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, Lesson, LessonProgress,
+    Activity, AuthSession, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, Lesson, LessonProgress,
     MobileMoneyPayment, PaymentAttempt, PaymentProviderConfiguration, PaymentStatusHistory,
     PaymentTransaction, PlaygroundError, PlaygroundExecution, Subscription, MODULES, QUIZZES,
     QUIZ_METADATA, QuizAttempt, SessionLocal, SubscriptionRegistration, User, app, engine, issue_token,
@@ -464,6 +465,252 @@ class KiteApiTests(unittest.TestCase):
         response = self.client.post("/api/auth/logout", headers=self.headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.get("/api/me", headers=self.headers).status_code, 401)
+
+    def test_supabase_logout_uses_refreshed_access_token_and_clears_session_cookies(self):
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+        }
+        provider_user = {
+            "id": "supabase-logout-" + uuid.uuid4().hex,
+            "email": self.email,
+            "email_confirmed_at": "2025-01-01T00:00:00Z",
+        }
+        expired_access = "expired-access-" + uuid.uuid4().hex
+        valid_refresh = "valid-refresh-" + uuid.uuid4().hex
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", return_value=provider_user,
+        ):
+            linked = self.client.post("/api/auth/session", json={
+                "access_token": expired_access,
+                "refresh_token": valid_refresh,
+                "remember_me": True,
+            })
+        self.assertEqual(linked.status_code, 200, linked.text)
+        csrf = linked.json()["csrf_token"]
+        session_id = self.client.cookies.get("kite_session")
+        original_cookies = dict(self.client.cookies)
+
+        def supabase_request(path, *, method="GET", data=None, access_token=None):
+            if path == "/user" and access_token == expired_access:
+                raise HTTPException(status_code=401, detail="Expired access token.")
+            if path == "/token?grant_type=refresh_token":
+                self.assertEqual(data, {"refresh_token": valid_refresh})
+                return {
+                    "access_token": "refreshed-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "user": provider_user,
+                }
+            if path == "/logout?scope=local":
+                self.assertEqual(method, "POST")
+                self.assertEqual(access_token, "refreshed-access-token")
+                return {}
+            self.fail(f"Unexpected Supabase Auth request: {path}")
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", side_effect=supabase_request,
+        ) as auth_request:
+            response = self.client.post(
+                "/api/auth/logout", headers={"X-Kite-CSRF": csrf},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"ok": True})
+        paths = [call.args[0] for call in auth_request.call_args_list]
+        self.assertEqual(
+            paths,
+            ["/user", "/token?grant_type=refresh_token", "/logout?scope=local"],
+        )
+        self.assertEqual(
+            self.client.cookies.get("kite_access"), None,
+            response.headers.get_list("set-cookie"),
+        )
+        self.assertEqual(self.client.cookies.get("kite_refresh"), None)
+        self.assertEqual(self.client.cookies.get("kite_session"), None)
+
+        cleared_cookies = response.headers.get_list("set-cookie")
+        for name in ("kite_access", "kite_refresh", "kite_session"):
+            cookie = next(value for value in cleared_cookies if value.startswith(name + "="))
+            self.assertIn("path=/", cookie.lower())
+            self.assertIn("httponly", cookie.lower())
+            self.assertIn("max-age=0", cookie.lower())
+            self.assertIn("samesite=lax", cookie.lower())
+
+        with SessionLocal() as db:
+            session = db.get(AuthSession, session_id)
+            self.assertIsNotNone(session.revoked_at)
+
+        cookie_header = "; ".join(
+            name + "=" + value for name, value in original_cookies.items()
+        )
+        repeated = self.client.post(
+            "/api/auth/logout",
+            headers={"Cookie": cookie_header, "X-Kite-CSRF": csrf},
+        )
+        self.assertEqual(repeated.status_code, 401)
+        protected = self.client.get("/api/me", headers={"Cookie": cookie_header})
+        self.assertEqual(protected.status_code, 401)
+
+    def test_supabase_logout_failure_does_not_report_success_or_revoke_locally(self):
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+        }
+        provider_user = {
+            "id": "supabase-logout-failure-" + uuid.uuid4().hex,
+            "email": self.email,
+            "email_confirmed_at": "2025-01-01T00:00:00Z",
+        }
+        access_token = "logout-failure-access-" + uuid.uuid4().hex
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", return_value=provider_user,
+        ):
+            linked = self.client.post("/api/auth/session", json={
+                "access_token": access_token,
+                "refresh_token": "logout-failure-refresh-" + uuid.uuid4().hex,
+            })
+        self.assertEqual(linked.status_code, 200, linked.text)
+        session_id = self.client.cookies.get("kite_session")
+        csrf = linked.json()["csrf_token"]
+
+        def fail_logout(path, **kwargs):
+            if path == "/user":
+                return provider_user
+            if path == "/logout?scope=local":
+                raise HTTPException(status_code=503, detail="Authentication service is unavailable.")
+            self.fail(f"Unexpected Supabase Auth request: {path}")
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", side_effect=fail_logout,
+        ):
+            response = self.client.post(
+                "/api/auth/logout", headers={"X-Kite-CSRF": csrf},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertNotEqual(response.json(), {"ok": True})
+        self.assertTrue(self.client.cookies.get("kite_access"))
+        with SessionLocal() as db:
+            self.assertIsNone(db.get(AuthSession, session_id).revoked_at)
+
+    def test_failed_logout_after_token_rotation_preserves_session_for_retry(self):
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+        }
+        provider_user = {
+            "id": "supabase-logout-rotation-" + uuid.uuid4().hex,
+            "email": self.email,
+            "email_confirmed_at": "2025-01-01T00:00:00Z",
+        }
+        expired_access = "logout-rotation-access-" + uuid.uuid4().hex
+        refresh_token = "logout-rotation-refresh-" + uuid.uuid4().hex
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", return_value=provider_user,
+        ):
+            linked = self.client.post("/api/auth/session", json={
+                "access_token": expired_access,
+                "refresh_token": refresh_token,
+                "remember_me": True,
+            })
+        self.assertEqual(linked.status_code, 200, linked.text)
+        csrf = linked.json()["csrf_token"]
+        session_id = self.client.cookies.get("kite_session")
+        rotated_access = "logout-rotation-access-refreshed-" + uuid.uuid4().hex
+        rotated_refresh = "logout-rotation-refresh-refreshed-" + uuid.uuid4().hex
+        logout_attempts = 0
+
+        def supabase_request(path, *, method="GET", data=None, access_token=None):
+            nonlocal logout_attempts
+            if path == "/user" and access_token == expired_access:
+                raise HTTPException(status_code=401, detail="Expired access token.")
+            if path == "/user" and access_token == rotated_access:
+                return provider_user
+            if path == "/token?grant_type=refresh_token":
+                self.assertEqual(data, {"refresh_token": refresh_token})
+                return {
+                    "access_token": rotated_access,
+                    "refresh_token": rotated_refresh,
+                    "user": provider_user,
+                }
+            if path == "/logout?scope=local":
+                self.assertEqual(method, "POST")
+                self.assertEqual(access_token, rotated_access)
+                logout_attempts += 1
+                if logout_attempts == 1:
+                    raise HTTPException(
+                        status_code=503, detail="Authentication service is unavailable.",
+                    )
+                return {}
+            self.fail(f"Unexpected Supabase Auth request: {path}")
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", side_effect=supabase_request,
+        ):
+            failed = self.client.post(
+                "/api/auth/logout", headers={"X-Kite-CSRF": csrf},
+            )
+            self.assertEqual(failed.status_code, 503)
+            self.assertEqual(self.client.cookies.get("kite_access"), rotated_access)
+            self.assertEqual(self.client.cookies.get("kite_refresh"), rotated_refresh)
+            with SessionLocal() as db:
+                session = db.get(AuthSession, session_id)
+                self.assertEqual(
+                    session.token_hash,
+                    hashlib.sha256(rotated_access.encode()).hexdigest(),
+                )
+                self.assertIsNone(session.revoked_at)
+
+            retried = self.client.post(
+                "/api/auth/logout", headers={"X-Kite-CSRF": csrf},
+            )
+
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual(logout_attempts, 2)
+        self.assertIsNone(self.client.cookies.get("kite_access"))
+        with SessionLocal() as db:
+            self.assertIsNotNone(db.get(AuthSession, session_id).revoked_at)
+
+    def test_supabase_logout_rejects_expired_access_and_refresh_credentials(self):
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+        }
+        provider_user = {
+            "id": "supabase-expired-logout-" + uuid.uuid4().hex,
+            "email": self.email,
+            "email_confirmed_at": "2025-01-01T00:00:00Z",
+        }
+        access_token = "expired-access-" + uuid.uuid4().hex
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", return_value=provider_user,
+        ):
+            linked = self.client.post("/api/auth/session", json={
+                "access_token": access_token,
+                "refresh_token": "expired-refresh-" + uuid.uuid4().hex,
+            })
+        self.assertEqual(linked.status_code, 200, linked.text)
+        csrf = linked.json()["csrf_token"]
+
+        def expired_credentials(path, **kwargs):
+            if path in {"/user", "/token?grant_type=refresh_token"}:
+                raise HTTPException(status_code=401, detail="Session expired.")
+            self.fail(f"Unexpected Supabase Auth request: {path}")
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", side_effect=expired_credentials,
+        ) as auth_request:
+            response = self.client.post(
+                "/api/auth/logout", headers={"X-Kite-CSRF": csrf},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotEqual(response.json(), {"ok": True})
+        self.assertFalse(any(
+            call.args[0].startswith("/logout") for call in auth_request.call_args_list
+        ))
+        self.assertIsNone(self.client.cookies.get("kite_access"))
+        self.assertIsNone(self.client.cookies.get("kite_refresh"))
 
     def test_tampered_local_auth_token_is_rejected(self):
         token = self.issue_token(self.email)

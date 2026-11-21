@@ -195,11 +195,14 @@ class VercelProxyE2ETests(unittest.TestCase):
             logout_resp = client.post("/api/auth/logout", headers={"X-Kite-CSRF": csrf_token})
             self.assertEqual(logout_resp.status_code, 200, logout_resp.text)
 
-            # 6. Verify session is now invalidated
+            # 6. Verify the cookies are cleared and protected routes reject the old session.
+            self.assertNotIn("kite_access", client.cookies)
+            self.assertNotIn("kite_refresh", client.cookies)
+            self.assertNotIn("kite_session", client.cookies)
             post_logout_resp = client.get("/api/auth/session")
-            self.assertIn(post_logout_resp.status_code, (401, 200))
-            if post_logout_resp.status_code == 200:
-                self.assertIsNone(post_logout_resp.json().get("user"))
+            self.assertEqual(post_logout_resp.status_code, 401, post_logout_resp.text)
+            protected_resp = client.get("/api/me")
+            self.assertEqual(protected_resp.status_code, 401, protected_resp.text)
 
     def test_05_client_spoofed_secret_is_stripped_by_proxy(self):
         """Verify that a client supplying a fake secret header does not break proxy injection."""

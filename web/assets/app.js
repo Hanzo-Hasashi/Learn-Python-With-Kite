@@ -43,6 +43,7 @@
   var authStateVersion = 0;
   var authUser = null;
   var authCsrf = "";
+  var logoutInFlight = false;
   var busy = false;
   var oauthCallbackStarted = false;
   var activePlaygroundRun = null;
@@ -289,8 +290,11 @@
   }
   function refreshSession() {
     if (refreshInFlight) return refreshInFlight;
+    var sessionVersion = authStateVersion;
     refreshInFlight = apiFetch("/api/auth/session", { method: "GET" }, sessionRequestTimeout)
-      .then(responseData).then(acceptAuthSession).then(function (user) {
+      .then(responseData).then(function (data) {
+        return acceptAuthSession(data, sessionVersion);
+      }).then(function (user) {
       if (!user) throw new Error("Your session has expired. Sign in again.");
     }).catch(function (error) {
       if (error.status === 400 || error.status === 401) clearAuthTokens();
@@ -299,6 +303,9 @@
     return refreshInFlight;
   }
   function api(path, body, method, extraHeaders) {
+    if (logoutInFlight && path !== "/api/auth/logout") {
+      return Promise.reject(new Error("Kite is signing you out. Please wait."));
+    }
     var sessionIndependentAuth = path === "/api/auth/login" ||
       path.indexOf("/api/auth/google/") === 0;
     var requestTimeout = sessionIndependentAuth ? 30000 : defaultRequestTimeout;
@@ -310,11 +317,13 @@
       if (token() && authCsrf && (method || (body ? "POST" : "GET")) !== "GET") {
         headers["X-Kite-CSRF"] = authCsrf;
       }
-      var request = apiFetch(path, {
+      var fetchOptions = {
         method: method || (body ? "POST" : "GET"),
         headers: headers,
         body: body ? JSON.stringify(body) : undefined
-      }, requestTimeout);
+      };
+      if (path === "/api/auth/logout") fetchOptions.cache = "no-store";
+      var request = apiFetch(path, fetchOptions, requestTimeout);
       return request
         .then(function (response) {
           var isAuthRequest = path.indexOf("/api/auth/") === 0;
@@ -666,26 +675,30 @@
     showSignedIn(doc, (data.user && data.user.name) || "Kite learner");
   }
   function logOut(doc) {
-    function finish(error) {
+    function finish() {
       [tokenKey, refreshKey, pendingPlanKey, subscriptionReturnKey, authDestinationKey, authModeKey,
         rememberMeKey, pendingPlaygroundCodeKey, pendingChallengeCodeKey, pendingQuizAnswersKey,
-        googleVerifierKey, recoveryVerifierKey, recoveryTokenKey, recoveryErrorKey]
+        googleVerifierKey, recoveryVerifierKey, recoveryTokenKey, recoveryErrorKey,
+        subscriptionRegistrationAccessKey]
         .forEach(function (key) { sessionStorage.removeItem(key); });
       clearAuthTokens();
-      if (doc && doc.getElementById("sbody")) {
-        navigate("welcome");
-        if (error) setTimeout(function () { tell(doc, "Signed out on this device, but server session revocation failed.", true); }, 0);
-      } else navigate("welcome");
+      logoutInFlight = false;
+      navigate("welcome");
     }
+    if (logoutInFlight) return;
     if (!token()) {
-      finish();
+      tell(doc || document, "Kite couldn't confirm your session. Refresh the page and try again.", true);
       return;
     }
+    logoutInFlight = true;
     api("/api/auth/logout", {}, "POST").then(function () {
       finish();
     }).catch(function (error) {
       console.error("Kite sign-out could not be revoked by the server.", error);
-      finish(error);
+      logoutInFlight = false;
+      tell(doc || document,
+        "Logout failed: Kite couldn't confirm server-side revocation. You're still signed in; check your connection and retry.",
+        true);
     });
   }
   function cleanAuthCallbackUrl() {

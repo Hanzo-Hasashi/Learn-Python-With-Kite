@@ -57,14 +57,18 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
         cls.server.server_close()
 
     def setUp(self):
-        self.page = self.browser.new_page(viewport={"width": 420, "height": 860})
+        self.context = self.browser.new_context(
+            viewport={"width": 420, "height": 860},
+            service_workers="block",
+        )
+        self.page = self.context.new_page()
         self.page_errors = []
         self.crashed = []
         self.page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         self.page.on("crash", lambda: self.crashed.append(True))
 
     def tearDown(self):
-        self.page.close()
+        self.context.close()
         self.assertEqual(self.crashed, [], "the page renderer crashed")
         self.assertEqual(self.page_errors, [], "uncaught JavaScript errors")
 
@@ -73,7 +77,7 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
         self.page.wait_for_function(
             "() => { const d = document.getElementById('f').contentDocument;"
             " return Boolean(d && d.documentElement && d.documentElement.dataset.kiteBridge === 'ready'"
-            " && d.querySelector('#sbody h2')); }"
+            " && d.body); }"
         )
         return self.page.frame_locator("#f")
 
@@ -225,6 +229,169 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
             "() => { const error = document.getElementById('f').contentDocument"
             ".querySelector('#err'); return error && error.textContent.length > 0; }"
         )
+
+    def test_logout_posts_with_cookies_bypasses_cache_and_stays_signed_out_after_reload(self):
+        user = {"id": 41, "name": "Kite Learner", "email": "learner@example.test"}
+        session_requests = []
+        logout_requests = []
+        logout_succeeded = False
+
+        def handle_api(route):
+            nonlocal logout_succeeded
+            request = route.request
+            path = request.url.split("?", 1)[0]
+            if path.endswith("/api/auth/session"):
+                session_requests.append(request)
+                if logout_succeeded:
+                    route.fulfill(
+                        status=401,
+                        content_type="application/json",
+                        body=json.dumps({"detail": "Sign in to continue."}),
+                    )
+                else:
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"user": user, "csrf_token": "logout-test-csrf"}),
+                    )
+                return
+            if path.endswith("/api/me"):
+                if logout_succeeded:
+                    route.fulfill(
+                        status=401,
+                        content_type="application/json",
+                        body=json.dumps({"detail": "Sign in to continue."}),
+                    )
+                    return
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({**user, "settings": {}}),
+                )
+                return
+            if path.endswith("/api/auth/logout"):
+                logout_requests.append(request)
+                logout_succeeded = True
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"ok": True}),
+                )
+                return
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+        self.page.set_viewport_size({"width": 1100, "height": 900})
+        self.page.add_init_script("""
+          window.__kiteLogoutFetchOptions = null;
+          const originalFetch = window.fetch;
+          window.fetch = function (input, init) {
+            if (String(input).includes('/api/auth/logout')) {
+              window.__kiteLogoutFetchOptions = {
+                credentials: init && init.credentials,
+                cache: init && init.cache
+              };
+            }
+            return originalFetch.apply(this, arguments);
+          };
+        """)
+        self.page.context.add_cookies([
+            {"name": "kite_access", "value": "access-cookie", "url": self.base, "httpOnly": True},
+            {"name": "kite_refresh", "value": "refresh-cookie", "url": self.base, "httpOnly": True},
+            {"name": "kite_session", "value": "session-cookie", "url": self.base, "httpOnly": True},
+        ])
+        self.context.route("**/api/**", handle_api)
+        self.open("#home")
+        logout_button = self.page.locator("#desk-nav button.out")
+        logout_button.wait_for(state="visible")
+        self.page.evaluate("""
+          sessionStorage.setItem('kite.refreshToken', 'legacy-refresh');
+          sessionStorage.setItem('kite.passwordResetToken', 'sensitive-reset-token');
+          sessionStorage.setItem('kite.subscriptionRegistrationAccessKey', 'private-registration-key');
+        """)
+        logout_button.click()
+        self.page.wait_for_function("location.hash === '#welcome'")
+
+        self.assertEqual(len(logout_requests), 1)
+        request = logout_requests[0]
+        self.assertEqual(request.method, "POST")
+        self.assertIn("kite_access=access-cookie", request.headers.get("cookie", ""))
+        self.assertIn("kite_refresh=refresh-cookie", request.headers.get("cookie", ""))
+        self.assertIn("kite_session=session-cookie", request.headers.get("cookie", ""))
+        self.assertEqual(request.headers.get("x-kite-csrf"), "logout-test-csrf")
+        fetch_options = self.page.evaluate(
+            "() => window.__kiteLogoutFetchOptions"
+        )
+        self.assertEqual(fetch_options, {"credentials": "include", "cache": "no-store"})
+
+        transient_keys = [
+            "kite.refreshToken",
+            "kite.passwordResetToken",
+            "kite.subscriptionRegistrationAccessKey",
+        ]
+        self.assertEqual(
+            self.page.evaluate("(keys) => keys.map((key) => sessionStorage.getItem(key))", transient_keys),
+            [None, None, None],
+        )
+        stale_cookies = self.page.context.cookies(self.base)
+        self.assertTrue(any(cookie["name"] == "kite_access" for cookie in stale_cookies))
+        with self.page.expect_response("**/api/auth/session") as session_response:
+            self.page.reload(wait_until="load")
+            self.page.evaluate("location.hash = '#home'")
+        self.assertEqual(session_response.value.status, 401)
+        self.assertEqual(
+            len(session_requests), 2,
+            {"page_errors": self.page_errors},
+        )
+        self.assertIn("kite_access=", session_requests[1].headers.get("cookie", ""))
+        self.page.wait_for_function(
+            "() => !document.body.classList.contains('kite-entry-flow')"
+        )
+        self.assertFalse(self.page.locator("#desk-nav button.out").is_visible())
+
+    def test_logout_revocation_failure_keeps_the_local_session_for_retry(self):
+        user = {"id": 42, "name": "Kite Learner", "email": "learner@example.test"}
+
+        def handle_api(route):
+            path = route.request.url.split("?", 1)[0]
+            if path.endswith("/api/auth/session"):
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"user": user, "csrf_token": "logout-test-csrf"}),
+                )
+            elif path.endswith("/api/me"):
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({**user, "settings": {}}),
+                )
+            elif path.endswith("/api/auth/logout"):
+                route.fulfill(
+                    status=503,
+                    content_type="application/json",
+                    body=json.dumps({"detail": "Authentication service is unavailable."}),
+                )
+            else:
+                route.fulfill(status=200, content_type="application/json", body="{}")
+
+        self.page.set_viewport_size({"width": 1100, "height": 900})
+        self.page.context.add_cookies([
+            {"name": "kite_access", "value": "access-cookie", "url": self.base, "httpOnly": True},
+            {"name": "kite_session", "value": "session-cookie", "url": self.base, "httpOnly": True},
+        ])
+        self.context.route("**/api/**", handle_api)
+        self.open("#home")
+        logout_button = self.page.locator("#desk-nav button.out")
+        logout_button.wait_for(state="visible")
+        logout_button.click()
+        self.page.wait_for_function(
+            "() => { const d = document.getElementById('f').contentDocument;"
+            " return d && d.body && d.body.textContent.includes('server-side revocation'); }"
+        )
+
+        self.assertTrue(logout_button.is_visible())
+        self.assertEqual(self.page.evaluate("location.hash"), "#home")
+        self.assertTrue(self.page.context.cookies(self.base))
 
     def test_switching_between_sign_up_and_log_in_stays_stable(self):
         frame = self.open("#sign-up")

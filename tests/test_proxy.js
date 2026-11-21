@@ -194,10 +194,22 @@ async function runTests() {
       body: JSON.stringify({ status: 'logged_out' }),
     };
 
-    res = await makeRequest(proxyPort, '/api/auth/logout', { method: 'DELETE' });
+    const logoutCookie = 'kite_access=access-token; kite_refresh=refresh-token; kite_session=session-id';
+    const logoutCsrf = 'logout-csrf-token';
+    res = await makeRequest(proxyPort, '/api/auth/logout', {
+      method: 'POST',
+      headers: {
+        'Cookie': logoutCookie,
+        'X-Kite-CSRF': logoutCsrf,
+        'Origin': 'https://learnpythonwithkite.vercel.app',
+      },
+    });
     assert.strictEqual(res.statusCode, 200);
-    assert.strictEqual(upstreamRequests[0].method, 'DELETE');
+    assert.strictEqual(upstreamRequests[0].method, 'POST');
     assert.strictEqual(upstreamRequests[0].url, '/api/auth/logout');
+    assert.strictEqual(upstreamRequests[0].headers.cookie, logoutCookie);
+    assert.strictEqual(upstreamRequests[0].headers['x-kite-csrf'], logoutCsrf);
+    assert.strictEqual(upstreamRequests[0].headers.origin, 'https://learnpythonwithkite.vercel.app');
     console.log('✓ Test 4 passed.');
 
     // Test 5: Query string preservation (both direct and Vercel rewrite __path)
@@ -231,9 +243,9 @@ async function runTests() {
     // Test 7: Multiple Set-Cookie headers forwarding
     console.log('Test 7: Multiple Set-Cookie headers forwarding...');
     const cookiesFromBackend = [
-      'kite_auth_access=jwt.token.val; Path=/; HttpOnly; Secure; SameSite=Lax',
-      'kite_auth_refresh=refresh.val; Path=/; HttpOnly; Secure; SameSite=Lax',
-      'kite_auth_session=session_123; Path=/; HttpOnly; Secure; SameSite=Lax',
+      'kite_access=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax',
+      'kite_refresh=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax',
+      'kite_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax',
     ];
     upstreamResponseConfig = {
       statusCode: 200,
@@ -248,9 +260,13 @@ async function runTests() {
     assert.strictEqual(res.statusCode, 200);
     assert.ok(res.headers['set-cookie'], 'set-cookie header must exist');
     assert.strictEqual(res.headers['set-cookie'].length, 3, 'Must forward all 3 cookies');
-    assert.ok(res.headers['set-cookie'][0].includes('kite_auth_access=jwt.token.val'));
-    assert.ok(res.headers['set-cookie'][1].includes('kite_auth_refresh=refresh.val'));
-    assert.ok(res.headers['set-cookie'][2].includes('kite_auth_session=session_123'));
+    assert.ok(res.headers['set-cookie'][0].includes('kite_access='));
+    assert.ok(res.headers['set-cookie'][1].includes('kite_refresh='));
+    assert.ok(res.headers['set-cookie'][2].includes('kite_session='));
+    assert.ok(res.headers['set-cookie'].every((cookie) =>
+      cookie.includes('Path=/') && cookie.includes('Max-Age=0') &&
+      cookie.includes('HttpOnly') && cookie.includes('SameSite=Lax')
+    ));
     console.log('✓ Test 7 passed.');
 
     // Test 8: Backend status code passthrough (401, 403, 404, 422, 500, 503)
