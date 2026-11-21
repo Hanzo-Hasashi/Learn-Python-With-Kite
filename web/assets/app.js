@@ -155,26 +155,40 @@
   // fetch() against the configured API origin with an upper time bound, so an unreachable or
   // stalled backend produces a clear error instead of leaving screens waiting indefinitely.
   function apiFetch(path, options, timeoutMs) {
-    var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-    var timeoutId;
-    var settings = Object.assign({ credentials: "include" }, options || {});
-    if (controller) settings.signal = controller.signal;
-    var request = fetch(apiUrl(path), settings).catch(function (cause) {
-      var failure = new Error("Kite couldn't reach its server. Check your connection and try again.");
-      failure.networkFailure = true;
-      failure.cause = cause;
-      throw failure;
-    });
-    if (!timeoutMs) return request;
-    var timedOut = new Promise(function (resolve, reject) {
-      timeoutId = setTimeout(function () {
-        if (controller) controller.abort();
-        var failure = new Error("Kite took too long to respond. Check your connection and try again.");
-        failure.timedOut = true;
-        reject(failure);
-      }, timeoutMs);
-    });
-    return Promise.race([request, timedOut]).finally(function () { clearTimeout(timeoutId); });
+    function attempt(attemptNumber) {
+      var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      var timeoutId;
+      var settings = Object.assign({ credentials: "include" }, options || {});
+      if (controller) settings.signal = controller.signal;
+      var request = fetch(apiUrl(path), settings).catch(function (cause) {
+        var failure = new Error("Kite couldn't reach its server. Check your connection and try again.");
+        failure.networkFailure = true;
+        failure.cause = cause;
+        throw failure;
+      });
+      if (!timeoutMs) {
+        return request;
+      }
+      var timedOut = new Promise(function (resolve, reject) {
+        timeoutId = setTimeout(function () {
+          if (controller) controller.abort();
+          var failure = new Error("Kite took too long to respond. Check your connection and try again.");
+          failure.timedOut = true;
+          reject(failure);
+        }, timeoutMs);
+      });
+      return Promise.race([request, timedOut]).finally(function () { clearTimeout(timeoutId); })
+        .catch(function (error) {
+          var method = (options && options.method || "GET").toUpperCase();
+          if (attemptNumber < 2 && method === "GET" &&
+              (error.networkFailure || error.timedOut)) {
+            return new Promise(function (resolve) { setTimeout(resolve, 750); })
+              .then(function () { return attempt(attemptNumber + 1); });
+          }
+          throw error;
+        });
+    }
+    return attempt(1);
   }
   function restoreAuthentication() {
     if (authRestoration) return authRestoration;

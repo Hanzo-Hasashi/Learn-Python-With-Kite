@@ -16,7 +16,7 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
-const DEFAULT_BACKEND_URL = 'https://kite-backend.onrender.com';
+const DEFAULT_BACKEND_URL = 'https://kite-backend-958r.onrender.com';
 const SUPPORTED_METHODS = new Set(['GET', 'HEAD', 'POST', 'PATCH', 'DELETE', 'OPTIONS']);
 
 const HOP_BY_HOP_REQUEST = new Set([

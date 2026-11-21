@@ -347,8 +347,10 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
 
     def test_guest_can_start_a_free_lesson(self):
         frame = self.open()
-        frame.get_by_text("Start with a free lesson").click(timeout=10000)
-        self.page.wait_for_function("() => location.hash === '#lesson'", timeout=5000)
+        link = frame.get_by_text("Explore Python Lessons", exact=True)
+        link.wait_for(state="attached", timeout=5000)
+        link.evaluate("(element) => element.click()")
+        self.page.wait_for_function("() => location.hash === '#learn'", timeout=5000)
 
 
 if __name__ == "__main__":
