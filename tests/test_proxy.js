@@ -63,6 +63,7 @@ async function runTests() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ status: 'ok' }),
   };
+  let retryScenario = false;
 
   // 1. Start mock upstream backend
   const upstreamServer = http.createServer((req, res) => {
@@ -77,8 +78,11 @@ async function runTests() {
         body: rawBody,
       });
 
-      res.writeHead(upstreamResponseConfig.statusCode, upstreamResponseConfig.headers);
-      res.end(upstreamResponseConfig.body);
+      const responseConfig = retryScenario && upstreamRequests.length === 1
+        ? { statusCode: 503, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ detail: 'Starting up.' }) }
+        : upstreamResponseConfig;
+      res.writeHead(responseConfig.statusCode, responseConfig.headers);
+      res.end(responseConfig.body);
     });
   });
 
@@ -117,6 +121,25 @@ async function runTests() {
     assert.strictEqual(upstreamRequests[0].url, '/api/lessons');
     assert.strictEqual(upstreamRequests[0].headers['x-kite-proxy-secret'], TEST_SECRET);
     console.log('✓ Test 1 passed.');
+
+    // Test 1b: transient GET 503 is retried once
+    console.log('Test 1b: Transient GET 503 retry...');
+    upstreamRequests = [];
+    retryScenario = true;
+    upstreamResponseConfig = {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lessons: ['recovered'] }),
+    };
+
+    res = await makeRequest(proxyPort, '/api/retry');
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(res.json, { lessons: ['recovered'] });
+    assert.strictEqual(upstreamRequests.length, 2);
+    assert.strictEqual(upstreamRequests[0].url, '/api/retry');
+    assert.strictEqual(upstreamRequests[1].url, '/api/retry');
+    retryScenario = false;
+    console.log('✓ Test 1b passed.');
 
     // Test 2: POST with JSON body
     console.log('Test 2: Forwarding POST with JSON body...');

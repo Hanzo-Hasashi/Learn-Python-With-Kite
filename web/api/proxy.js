@@ -184,69 +184,88 @@ async function handler(req, res) {
     delete forwardedHeaders['content-length'];
   }
 
-  // Perform request to upstream backend
+  // Perform the upstream request. GET/HEAD requests may be retried once so Render cold
+  // starts and transient network failures do not immediately become frontend errors.
   const isHttps = backendUrl.protocol === 'https:';
   const transport = isHttps ? https : http;
+  let attempt = 0;
+  let retryScheduled = false;
 
-  const requestOptions = {
-    protocol: backendUrl.protocol,
-    hostname: backendUrl.hostname,
-    port: backendUrl.port || (isHttps ? 443 : 80),
-    path: backendUrl.pathname + backendUrl.search,
-    method: method,
-    headers: forwardedHeaders,
-    timeout: 30000, // 30-second upstream timeout
-  };
+  function sendUpstream() {
+    attempt += 1;
+    const retryableMethod = method === 'GET' || method === 'HEAD';
 
-  const upstreamReq = transport.request(requestOptions, (upstreamRes) => {
-    // Forward status code
-    res.statusCode = upstreamRes.statusCode || 502;
+    const requestOptions = {
+      protocol: backendUrl.protocol,
+      hostname: backendUrl.hostname,
+      port: backendUrl.port || (isHttps ? 443 : 80),
+      path: backendUrl.pathname + backendUrl.search,
+      method: method,
+      headers: forwardedHeaders,
+      timeout: 30000,
+    };
 
-    // Forward response headers
-    for (const [key, value] of Object.entries(upstreamRes.headers)) {
-      const lowerKey = key.toLowerCase();
-      if (HOP_BY_HOP_RESPONSE.has(lowerKey)) {
-        continue;
+    const upstreamReq = transport.request(requestOptions, (upstreamRes) => {
+      const upstreamStatus = upstreamRes.statusCode || 502;
+      if (retryableMethod && attempt === 1 &&
+          (upstreamStatus === 502 || upstreamStatus === 503 || upstreamStatus === 504)) {
+        upstreamRes.resume();
+        setTimeout(sendUpstream, 1000);
+        return;
       }
-      if (lowerKey === 'set-cookie') {
-        // Forward multiple Set-Cookie headers as an array
-        res.setHeader('Set-Cookie', value);
-      } else if (value !== undefined) {
-        res.setHeader(key, value);
+
+      res.statusCode = upstreamStatus;
+
+      for (const [key, value] of Object.entries(upstreamRes.headers)) {
+        const lowerKey = key.toLowerCase();
+        if (HOP_BY_HOP_RESPONSE.has(lowerKey)) continue;
+        if (lowerKey === 'set-cookie') {
+          res.setHeader('Set-Cookie', value);
+        } else if (value !== undefined) {
+          res.setHeader(key, value);
+        }
       }
-    }
 
-    // Always enforce private, no-store on all API proxy responses
-    res.setHeader('Cache-Control', 'private, no-store');
-
-    // Pipe upstream response body to client response
-    upstreamRes.pipe(res);
-  });
-
-  upstreamReq.on('timeout', () => {
-    upstreamReq.destroy();
-    if (!res.headersSent) {
-      res.statusCode = 504;
-      res.setHeader('Content-Type', 'application/json');
       res.setHeader('Cache-Control', 'private, no-store');
-      res.end(JSON.stringify({ detail: 'Kite backend request timed out.' }));
-    }
-  });
+      upstreamRes.pipe(res);
+    });
 
-  upstreamReq.on('error', (err) => {
-    if (!res.headersSent) {
-      res.statusCode = 502;
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Cache-Control', 'private, no-store');
-      res.end(JSON.stringify({ detail: 'Kite backend is currently unreachable. Please try again shortly.' }));
-    }
-  });
+    upstreamReq.on('timeout', () => {
+      upstreamReq.destroy();
+      if (retryableMethod && attempt === 1 && !retryScheduled) {
+        retryScheduled = true;
+        setTimeout(sendUpstream, 1000);
+        return;
+      }
+      if (!res.headersSent) {
+        res.statusCode = 504;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.end(JSON.stringify({ detail: 'Kite backend request timed out.' }));
+      }
+    });
 
-  // Send request body if applicable
-  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && bodyBuffer.length > 0) {
-    upstreamReq.write(bodyBuffer);
+    upstreamReq.on('error', (err) => {
+      if (retryableMethod && attempt === 1 && !retryScheduled) {
+        retryScheduled = true;
+        setTimeout(sendUpstream, 1000);
+        return;
+      }
+      if (!res.headersSent) {
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.end(JSON.stringify({ detail: 'Kite backend is currently unreachable. Please try again shortly.' }));
+      }
+    });
+
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && bodyBuffer.length > 0) {
+      upstreamReq.write(bodyBuffer);
+    }
+    upstreamReq.end();
   }
-  upstreamReq.end();
+
+  sendUpstream();
 }
 
 module.exports = handler;

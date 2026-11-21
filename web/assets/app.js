@@ -147,8 +147,8 @@
     setMoreMenuAuthState(Boolean(authUser));
     return authUser;
   }
-  var sessionRequestTimeout = 15000;
-  var defaultRequestTimeout = 45000;
+  var sessionRequestTimeout = 20000;
+  var defaultRequestTimeout = 60000;
   function apiUrl(path) {
     return String(window.KITE_API_BASE || "").replace(/\/+$/, "") + path;
   }
@@ -178,6 +178,15 @@
         }, timeoutMs);
       });
       return Promise.race([request, timedOut]).finally(function () { clearTimeout(timeoutId); })
+        .then(function (response) {
+          var method = (options && options.method || "GET").toUpperCase();
+          if (attemptNumber < 2 && method === "GET" &&
+              [502, 503, 504].indexOf(response.status) >= 0) {
+            return new Promise(function (resolve) { setTimeout(resolve, 1000); })
+              .then(function () { return attempt(attemptNumber + 1); });
+          }
+          return response;
+        })
         .catch(function (error) {
           var method = (options && options.method || "GET").toUpperCase();
           if (attemptNumber < 2 && method === "GET" &&
@@ -5214,7 +5223,12 @@
       if (error.status !== 404) {
         tell(doc, "Kite couldn't confirm your saved session. Check your connection and try again.", true);
       }
-      if (route !== "launch") hydrateRouteData(null);
+      if (route === "progress") {
+        showContentUnavailable(doc, doc.querySelector(".scroll"), "progress data",
+          function () { window.location.reload(); }, error);
+      } else if (route !== "launch") {
+        hydrateRouteData(null);
+      }
     });
     ["b-terms", "b-priv", "b-con"].forEach(function (id) {
       var button = doc.getElementById(id);
