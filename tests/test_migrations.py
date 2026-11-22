@@ -17,7 +17,7 @@ from backend.db_schema import validate_existing_schema_baseline
 
 ROOT = Path(__file__).parent.parent
 BASELINE_REVISION = "d9f9f9ebbced"
-HEAD_REVISION = "e85bcc461ab0"
+HEAD_REVISION = "f4c2a1b8d7e1"
 
 
 def migration_environment(database_url: str) -> dict[str, str]:
@@ -65,6 +65,63 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(revision, HEAD_REVISION)
             finally:
                 engine.dispose()
+
+    def test_account_deletion_migration_downgrades_and_reupgrades_on_isolated_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_url = "sqlite:///" + (Path(directory) / "upgrade-downgrade.db").as_posix()
+            with patch.dict(os.environ, migration_environment(database_url), clear=True):
+                config = alembic_config()
+                command.upgrade(config, "head")
+                command.downgrade(config, "e85bcc461ab0")
+
+                engine = create_engine(database_url)
+                try:
+                    self.assertNotIn("account_deletions", inspect(engine).get_table_names())
+                    with engine.connect() as connection:
+                        revision = connection.execute(
+                            text("SELECT version_num FROM alembic_version")
+                        ).scalar_one()
+                    self.assertEqual(revision, "e85bcc461ab0")
+                finally:
+                    engine.dispose()
+
+                command.upgrade(config, "head")
+                command.check(config)
+
+    def test_account_deletion_downgrade_refuses_to_drop_persisted_audit_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_url = "sqlite:///" + (Path(directory) / "preserve-audit.db").as_posix()
+            with patch.dict(os.environ, migration_environment(database_url), clear=True):
+                config = alembic_config()
+                command.upgrade(config, "head")
+                engine = create_engine(database_url)
+                try:
+                    with engine.begin() as connection:
+                        connection.execute(text(
+                            "INSERT INTO account_deletions "
+                            "(id, user_id, state, provider_reconciled, local_deleted, created_at, updated_at) "
+                            "VALUES ('audit-preserved', 42, 'COMPLETED', 1, 1, "
+                            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                        ))
+
+                    with self.assertRaisesRegex(RuntimeError, "audit/outbox records exist"):
+                        command.downgrade(config, "e85bcc461ab0")
+
+                    with engine.connect() as connection:
+                        audit_count = connection.execute(
+                            text("SELECT count(*) FROM account_deletions")
+                        ).scalar_one()
+                        revision = connection.execute(
+                            text("SELECT version_num FROM alembic_version")
+                        ).scalar_one()
+                    self.assertEqual(audit_count, 1)
+                    self.assertEqual(revision, HEAD_REVISION)
+
+                    with engine.begin() as connection:
+                        connection.execute(text("DELETE FROM account_deletions"))
+                    command.downgrade(config, "e85bcc461ab0")
+                finally:
+                    engine.dispose()
 
     def test_existing_schema_can_be_stamped_without_losing_data(self):
         with tempfile.TemporaryDirectory() as directory:

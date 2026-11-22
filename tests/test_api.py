@@ -10,12 +10,15 @@ import tempfile
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from threading import Event, Thread
 from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
 from fastapi import HTTPException
+from sqlalchemy import select
+import httpx
 
 DB_DIR = tempfile.TemporaryDirectory()
 logging.disable(logging.CRITICAL)
@@ -29,9 +32,11 @@ os.environ["RUNNER_SHARED_SECRET"] = "test-runner-secret"
 
 from fastapi.testclient import TestClient
 from starlette.requests import Request
+from sqlalchemy.exc import SQLAlchemyError
+import backend.app as backend_app
 
 from backend.app import (
-    Activity, AuthSession, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, Lesson, LessonProgress,
+    AccountDeletion, Activity, AuthSession, Base, CHALLENGES, GuestPlaygroundExecution, LESSONS, Lesson, LessonProgress,
     MobileMoneyPayment, PaymentAttempt, PaymentProviderConfiguration, PaymentStatusHistory,
     PaymentTransaction, PlaygroundError, PlaygroundExecution, Subscription, MODULES, QUIZZES,
     QUIZ_METADATA, QuizAttempt, SessionLocal, SubscriptionRegistration, User, app, engine, issue_token,
@@ -39,6 +44,9 @@ from backend.app import (
     validate_runtime_configuration,
     validate_postgres_ssl_url,
     auth_attempts,
+    encrypt_account_deletion_subject,
+    reconcile_pending_local_account_deletions,
+    stop_account_deletion_reconciliation_worker,
 )
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
 from backend.payments import PaymentStatus, ProviderPaymentResult, normalize_zambian_phone
@@ -59,6 +67,12 @@ class KiteApiTests(unittest.TestCase):
         DB_DIR.cleanup()
 
     def setUp(self):
+        stop_account_deletion_reconciliation_worker()
+        with SessionLocal() as db:
+            db.query(AccountDeletion).filter(
+                AccountDeletion.local_deleted.is_(False)
+            ).delete(synchronize_session=False)
+            db.commit()
         auth_attempts.clear()
         self.email = f"user-{uuid.uuid4().hex}@example.com"
         response = self.client.post("/api/auth/register", json={
@@ -762,6 +776,489 @@ class KiteApiTests(unittest.TestCase):
         tampered = token[:-1] + ("a" if token[-1] != "a" else "b")
         response = self.client.get("/api/me", headers={"Authorization": "Bearer " + tampered})
         self.assertEqual(response.status_code, 401)
+
+    def test_account_deletion_requires_confirmation_and_removes_owned_data(self):
+        with SessionLocal() as db:
+            account_id = db.scalar(select(User.id).where(User.email == self.email))
+        wrong = self.client.request(
+            "DELETE", "/api/me",
+            content=json.dumps({"confirmation": "NO"}),
+            headers={**self.headers, "Content-Type": "application/json"},
+        )
+        self.assertEqual(wrong.status_code, 422)
+        with SessionLocal() as db:
+            self.assertIsNotNone(db.get(User, account_id))
+
+        self.client.post("/api/lessons/python-variables/complete", headers=self.headers)
+        with SessionLocal() as db:
+            other_user = User(
+                email=f"other-delete-{uuid.uuid4().hex}@example.com",
+                name="Other Learner",
+                password_hash="test-hash",
+            )
+            db.add(other_user)
+            db.flush()
+            other_user_id = other_user.id
+            db.add(Activity(
+                user_id=other_user_id,
+                kind="lesson",
+                item_id="python-variables",
+            ))
+            db.add(AccountDeletion(
+                id=uuid.uuid4().hex,
+                user_id=account_id,
+                provider_subject_hash=None,
+                state="COMPLETED",
+                provider_reconciled=True,
+                local_deleted=True,
+            ))
+            db.commit()
+        deleted = self.client.request(
+            "DELETE", "/api/me",
+            content=json.dumps({"confirmation": "DELETE"}),
+            headers={**self.headers, "Content-Type": "application/json"},
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertTrue(deleted.json()["ok"])
+
+        with SessionLocal() as db:
+            self.assertIsNone(
+                db.get(User, account_id),
+                deleted.text,
+            )
+            self.assertIsNotNone(db.get(User, other_user_id))
+            self.assertIsNotNone(db.scalar(
+                select(Activity).where(Activity.user_id == other_user_id)
+            ))
+            self.assertEqual(
+                db.scalar(select(LessonProgress).where(LessonProgress.user_id == account_id)),
+                None,
+            )
+            audits = db.scalars(
+                select(AccountDeletion).where(AccountDeletion.user_id == account_id)
+            ).all()
+            self.assertGreaterEqual(len(audits), 2)
+            self.assertTrue(all(audit.state == "COMPLETED" for audit in audits))
+            self.assertTrue(all(audit.local_deleted for audit in audits))
+        protected = self.client.get("/api/me", headers=self.headers)
+        self.assertEqual(protected.status_code, 401)
+
+    def test_pending_local_account_deletion_is_reconciled_on_startup(self):
+        email = f"pending-delete-{uuid.uuid4().hex}@example.com"
+        registered = self.client.post("/api/auth/register", json={
+            "name": "Pending Deletion",
+            "email": email,
+            "password": "secure-example-password",
+        })
+        self.assertEqual(registered.status_code, 201, registered.text)
+        with SessionLocal() as db:
+            account_id = db.scalar(select(User.id).where(User.email == email))
+            existing = db.scalars(
+                select(AccountDeletion).where(
+                    AccountDeletion.user_id == account_id,
+                    AccountDeletion.local_deleted.is_(False),
+                )
+            ).all()
+            for record in existing:
+                db.delete(record)
+            deletion_id = uuid.uuid4().hex
+            db.add(AccountDeletion(
+                id=deletion_id,
+                user_id=account_id,
+                provider_subject_hash=None,
+                state="PENDING_LOCAL",
+                provider_reconciled=True,
+                local_deleted=False,
+            ))
+            other_user = User(
+                email=f"other-pending-{uuid.uuid4().hex}@example.com",
+                name="Other Learner",
+                password_hash="test-hash",
+            )
+            db.add(other_user)
+            db.flush()
+            other_user_id = other_user.id
+            db.commit()
+
+        reconcile_pending_local_account_deletions()
+
+        with SessionLocal() as db:
+            self.assertIsNone(db.get(User, account_id))
+            self.assertIsNotNone(db.get(User, other_user_id))
+            audit = db.get(AccountDeletion, deletion_id)
+            self.assertEqual(audit.state, "COMPLETED")
+            self.assertTrue(audit.local_deleted)
+
+    def test_provider_deletion_recovers_after_local_commit_failure_and_restart(self):
+        subject = "provider-recovery-" + uuid.uuid4().hex
+        other_email = f"other-recovery-{uuid.uuid4().hex}@example.com"
+        with SessionLocal() as db:
+            user = db.query(User).filter_by(email=self.email).one()
+            user.auth_subject = subject
+            deletion_id = uuid.uuid4().hex
+            db.add(AccountDeletion(
+                id=deletion_id,
+                user_id=user.id,
+                provider_subject_hash=hashlib.sha256(subject.encode()).hexdigest(),
+                provider_subject_ciphertext=encrypt_account_deletion_subject(subject),
+                state="PENDING_PROVIDER",
+                provider_reconciled=False,
+                local_deleted=False,
+            ))
+            other_user = User(
+                email=other_email,
+                name="Other Account",
+                password_hash="test-hash",
+            )
+            db.add(other_user)
+            db.flush()
+            other_user_id = other_user.id
+            db.add(Activity(
+                user_id=other_user_id,
+                kind="lesson",
+                item_id="python-variables",
+            ))
+            db.commit()
+            account_id = user.id
+
+        provider_statuses = iter((204, 404))
+        provider_calls = []
+
+        def provider_request(method, url, headers):
+            provider_calls.append((method, url, headers))
+            status = next(provider_statuses)
+            return httpx.Response(
+                status,
+                request=httpx.Request(method, url),
+            )
+
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+            "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
+        }
+        original_commit = SessionLocal.class_.commit
+        failed_once = False
+
+        def fail_first_commit(session):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise SQLAlchemyError("injected local commit failure")
+            return original_commit(session)
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.httpx.Client"
+        ) as client_class, patch.object(
+            SessionLocal.class_, "commit", new=fail_first_commit,
+        ):
+            client_class.return_value.__enter__.return_value.request.side_effect = provider_request
+            reconcile_pending_local_account_deletions()
+
+        with SessionLocal() as db:
+            audit = db.get(AccountDeletion, deletion_id)
+            self.assertEqual(audit.state, "FAILED")
+            self.assertFalse(audit.provider_reconciled)
+            self.assertFalse(audit.local_deleted)
+            self.assertIsNotNone(db.get(User, account_id))
+
+        # A fresh application startup dispatches recovery using only the persisted outbox.
+        stop_account_deletion_reconciliation_worker()
+        reconciled = Event()
+
+        def startup_reconciliation(stop_event):
+            reconcile_pending_local_account_deletions(stop_event)
+            reconciled.set()
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.httpx.Client"
+        ) as client_class, patch(
+            "backend.app.reconcile_pending_account_deletions",
+            side_effect=startup_reconciliation,
+        ):
+            client_class.return_value.__enter__.return_value.request.side_effect = provider_request
+            startup()
+            try:
+                self.assertTrue(reconciled.wait(timeout=10))
+            finally:
+                stop_account_deletion_reconciliation_worker()
+
+        self.assertEqual(len(provider_calls), 2)
+        self.assertEqual(provider_calls[0][0], "DELETE")
+        self.assertEqual(provider_calls[1][0], "DELETE")
+        self.assertEqual(provider_calls[0][2]["Authorization"], "Bearer test-service-role-key")
+        with SessionLocal() as db:
+            self.assertIsNone(db.get(User, account_id))
+            self.assertIsNotNone(db.get(User, other_user_id))
+            self.assertIsNotNone(db.scalar(
+                select(Activity).where(Activity.user_id == other_user_id)
+            ))
+            audit = db.get(AccountDeletion, deletion_id)
+            self.assertEqual(audit.state, "COMPLETED")
+            self.assertTrue(audit.provider_reconciled)
+            self.assertTrue(audit.local_deleted)
+
+    def test_concurrent_account_deletion_reconciliation_is_idempotent(self):
+        subject = "provider-concurrent-" + uuid.uuid4().hex
+        with SessionLocal() as db:
+            user = db.query(User).filter_by(email=self.email).one()
+            user.auth_subject = subject
+            deletion_id = uuid.uuid4().hex
+            db.add(AccountDeletion(
+                id=deletion_id,
+                user_id=user.id,
+                provider_subject_hash=hashlib.sha256(subject.encode()).hexdigest(),
+                provider_subject_ciphertext=encrypt_account_deletion_subject(subject),
+                state="PENDING_PROVIDER",
+                provider_reconciled=False,
+                local_deleted=False,
+            ))
+            other_user = User(
+                email=f"other-concurrent-{uuid.uuid4().hex}@example.com",
+                name="Other Learner",
+                password_hash="test-hash",
+            )
+            db.add(other_user)
+            db.flush()
+            other_user_id = other_user.id
+            db.add(Activity(
+                user_id=other_user_id,
+                kind="lesson",
+                item_id="python-variables",
+            ))
+            db.commit()
+
+        provider_started = Event()
+        allow_provider_to_finish = Event()
+        provider_calls = []
+
+        def provider_request(method, url, headers):
+            provider_calls.append((method, url, headers))
+            provider_started.set()
+            if not allow_provider_to_finish.wait(timeout=10):
+                raise AssertionError("provider test request timed out")
+            return httpx.Response(204, request=httpx.Request(method, url))
+
+        errors = []
+
+        def reconcile():
+            try:
+                reconcile_pending_local_account_deletions()
+            except Exception as error:
+                errors.append(error)
+
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+            "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
+        }
+        with patch.dict(os.environ, env), patch(
+            "backend.app.httpx.Client"
+        ) as client_class:
+            client_class.return_value.__enter__.return_value.request.side_effect = provider_request
+            first = Thread(target=reconcile)
+            first.start()
+            self.assertTrue(provider_started.wait(timeout=10))
+            reconcile_pending_local_account_deletions()
+            allow_provider_to_finish.set()
+            first.join(timeout=10)
+
+        self.assertFalse(first.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(provider_calls), 1)
+        with SessionLocal() as db:
+            audit = db.get(AccountDeletion, deletion_id)
+            self.assertEqual(audit.state, "COMPLETED")
+            self.assertTrue(audit.local_deleted)
+            self.assertIsNone(db.scalar(select(User).where(User.auth_subject == subject)))
+            self.assertIsNotNone(db.get(User, other_user_id))
+            self.assertIsNotNone(db.scalar(
+                select(Activity).where(Activity.user_id == other_user_id)
+            ))
+
+    def test_worker_starts_async_once_and_stops_cleanly(self):
+        stop_account_deletion_reconciliation_worker()
+        reconciliation_started = Event()
+        allow_reconciliation_to_finish = Event()
+        startup_finished = Event()
+        startup_errors = []
+
+        def blocked_reconciliation(stop_event):
+            reconciliation_started.set()
+            allow_reconciliation_to_finish.wait(timeout=10)
+
+        def run_startup():
+            try:
+                startup()
+            except Exception as error:
+                startup_errors.append(error)
+            else:
+                startup_finished.set()
+
+        with patch("backend.app.validate_runtime_configuration"), patch(
+            "backend.app.assert_database_migrations_applied"
+        ), patch("backend.app.assert_database_schema_matches_models"), patch(
+            "backend.app.validate_runtime_database_role"
+        ), patch(
+            "backend.app.reconcile_pending_account_deletions",
+            side_effect=blocked_reconciliation,
+        ) as reconcile:
+            startup_thread = Thread(target=run_startup)
+            startup_thread.start()
+            try:
+                self.assertTrue(startup_finished.wait(timeout=2))
+                self.assertTrue(reconciliation_started.wait(timeout=2))
+                startup()
+                self.assertEqual(reconcile.call_count, 1)
+            finally:
+                allow_reconciliation_to_finish.set()
+                startup_thread.join(timeout=2)
+                stop_account_deletion_reconciliation_worker()
+
+        self.assertFalse(startup_thread.is_alive())
+        self.assertEqual(startup_errors, [])
+        self.assertIsNone(backend_app.account_reconciliation_thread)
+
+    def test_missing_service_or_encryption_key_keeps_provider_deletion_pending(self):
+        subject = "provider-credentials-" + uuid.uuid4().hex
+        with SessionLocal() as db:
+            user = db.query(User).filter_by(email=self.email).one()
+            user.auth_subject = subject
+            deletion_id = uuid.uuid4().hex
+            db.add(AccountDeletion(
+                id=deletion_id,
+                user_id=user.id,
+                provider_subject_hash=hashlib.sha256(subject.encode()).hexdigest(),
+                provider_subject_ciphertext=encrypt_account_deletion_subject(subject),
+                state="PENDING_PROVIDER",
+                provider_reconciled=False,
+                local_deleted=False,
+            ))
+            account_id = user.id
+            db.commit()
+
+        base_env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+        }
+        with patch.dict(os.environ, base_env, clear=False), patch(
+            "backend.app.httpx.Client"
+        ) as client_class:
+            os.environ.pop("SUPABASE_SERVICE_ROLE_KEY", None)
+            reconcile_pending_local_account_deletions()
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"] = "test-service-role-key"
+            os.environ["KITE_SECRET_KEY"] = ""
+            reconcile_pending_local_account_deletions()
+
+        client_class.assert_not_called()
+        with SessionLocal() as db:
+            audit = db.get(AccountDeletion, deletion_id)
+            self.assertEqual(audit.state, "PENDING_PROVIDER")
+            self.assertFalse(audit.provider_reconciled)
+            self.assertFalse(audit.local_deleted)
+            self.assertIsNotNone(db.get(User, account_id))
+
+    def test_reconciliation_rejects_provider_subject_hash_mismatch(self):
+        stored_subject = "provider-stored-" + uuid.uuid4().hex
+        encrypted_subject = "provider-other-" + uuid.uuid4().hex
+        with SessionLocal() as db:
+            user = db.query(User).filter_by(email=self.email).one()
+            user.auth_subject = stored_subject
+            deletion_id = uuid.uuid4().hex
+            db.add(AccountDeletion(
+                id=deletion_id,
+                user_id=user.id,
+                provider_subject_hash=hashlib.sha256(stored_subject.encode()).hexdigest(),
+                provider_subject_ciphertext=encrypt_account_deletion_subject(encrypted_subject),
+                state="PENDING_PROVIDER",
+                provider_reconciled=False,
+                local_deleted=False,
+            ))
+            account_id = user.id
+            db.commit()
+
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+            "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
+        }
+        with patch.dict(os.environ, env), patch(
+            "backend.app.httpx.Client"
+        ) as client_class:
+            reconcile_pending_local_account_deletions()
+
+        client_class.assert_not_called()
+        with SessionLocal() as db:
+            audit = db.get(AccountDeletion, deletion_id)
+            self.assertEqual(audit.state, "FAILED")
+            self.assertFalse(audit.provider_reconciled)
+            self.assertFalse(audit.local_deleted)
+            self.assertIsNotNone(db.get(User, account_id))
+
+    def test_account_deletion_uses_refreshed_supabase_credential(self):
+        env = {
+            "SUPABASE_URL": "https://kite.example",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+            "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
+        }
+        provider_user = {
+            "id": "provider-delete-" + uuid.uuid4().hex,
+            "email": self.email,
+            "email_confirmed_at": "2025-01-01T00:00:00Z",
+        }
+        expired_access = "expired-delete-" + uuid.uuid4().hex
+        refresh_token = "delete-refresh-" + uuid.uuid4().hex
+        refreshed_access = "refreshed-delete-" + uuid.uuid4().hex
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", return_value=provider_user,
+        ):
+            linked = self.client.post("/api/auth/session", json={
+                "access_token": expired_access,
+                "refresh_token": refresh_token,
+            })
+        self.assertEqual(linked.status_code, 200, linked.text)
+
+        def supabase_request(path, *, method="GET", data=None, access_token=None):
+            if path == "/user" and access_token == expired_access:
+                raise HTTPException(status_code=401, detail="Expired access token.")
+            if path == "/token?grant_type=refresh_token":
+                return {
+                    "access_token": refreshed_access,
+                    "refresh_token": "rotated-delete-refresh-" + uuid.uuid4().hex,
+                    "user": provider_user,
+                }
+            if path == "/logout?scope=global":
+                self.assertEqual(access_token, refreshed_access)
+                return {}
+            self.fail(f"Unexpected Supabase Auth request: {path}")
+
+        provider_deleted = []
+        provider_delete_response = httpx.Response(
+            204, request=httpx.Request("DELETE", "https://kite.example/auth/v1/admin/users/test"),
+        )
+
+        with patch.dict(os.environ, env), patch(
+            "backend.app.supabase_request", side_effect=supabase_request,
+        ), patch("backend.app.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value.request.side_effect = (
+                lambda method, url, headers: provider_deleted.append((method, url, headers))
+                or provider_delete_response
+            )
+            deleted = self.client.request(
+                "DELETE", "/api/me",
+                content=json.dumps({"confirmation": "DELETE"}),
+                headers={
+                    "X-Kite-CSRF": linked.json()["csrf_token"],
+                    "Content-Type": "application/json",
+                },
+            )
+
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(len(provider_deleted), 1, deleted.text)
+        self.assertEqual(provider_deleted[0][0], "DELETE")
+        self.assertIn("Authorization", provider_deleted[0][2])
+        self.assertNotIn("test-service-role-key", deleted.text)
 
     def test_profile_email_password_and_settings_changes_persist(self):
         profile = self.client.patch("/api/me", headers=self.headers, json={"name": "Updated Kite Learner"})

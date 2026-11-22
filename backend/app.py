@@ -9,10 +9,10 @@ import logging
 import os
 import secrets
 import smtplib
-import time
 import base64
+import time
 import uuid
-from threading import Lock
+from threading import Event, Lock, Thread, current_thread
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, func, select, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, func, select, text, delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
@@ -70,6 +70,10 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("kite")
 auth_attempts: dict[str, list[float]] = {}
 auth_attempts_lock = Lock()
+account_reconciliation_lock = Lock()
+account_reconciliation_lifecycle_lock = Lock()
+account_reconciliation_stop = Event()
+account_reconciliation_thread: Thread | None = None
 
 
 class Base(DeclarativeBase):
@@ -314,6 +318,28 @@ class AuthSession(Base):
     remember_me: Mapped[bool] = mapped_column(Boolean, default=False)
     user_agent: Mapped[str] = mapped_column(String(200), default="Browser")
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AccountDeletion(Base):
+    __tablename__ = "account_deletions"
+    __table_args__ = (
+        Index(
+            "uq_account_deletions_active_user",
+            "user_id",
+            unique=True,
+            sqlite_where=text("local_deleted = false"),
+            postgresql_where=text("local_deleted = false"),
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    provider_subject_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_subject_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str] = mapped_column(String(24), default="PENDING_PROVIDER")
+    provider_reconciled: Mapped[bool] = mapped_column(Boolean, default=False)
+    local_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class Lesson(Base):
@@ -1261,6 +1287,23 @@ def decrypt_purchase_token(value: str) -> str:
     return AESGCM(key).decrypt(raw[:12], raw[12:], b"kite-subscription-v1").decode()
 
 
+def encrypt_account_deletion_subject(value: str) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    key = hashlib.sha256(token_key() + b"kite-account-deletion-subject").digest()
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(key).encrypt(nonce, value.encode(), b"kite-account-deletion-v1")
+    return base64.urlsafe_b64encode(nonce + ciphertext).decode()
+
+
+def decrypt_account_deletion_subject(value: str) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    raw = base64.urlsafe_b64decode(value.encode())
+    key = hashlib.sha256(token_key() + b"kite-account-deletion-subject").digest()
+    return AESGCM(key).decrypt(raw[:12], raw[12:], b"kite-account-deletion-v1").decode()
+
+
 def user_payload(user: User, db: Session) -> dict[str, Any]:
     return {
         "id": user.id,
@@ -1372,6 +1415,10 @@ class LoginIn(BaseModel):
 
 class ProfileIn(BaseModel):
     name: str = Field(min_length=1, max_length=80)
+
+
+class DeleteAccountIn(BaseModel):
+    confirmation: str = Field(min_length=6, max_length=20)
 
 
 class EmailUpdateIn(BaseModel):
@@ -1752,27 +1799,28 @@ async def enforce_proxy_and_browser_origin(request: Request, call_next):
 
 
 RUNTIME_TABLE_OPERATIONS: dict[str, tuple[str, ...]] = {
-    "activity": ("SELECT", "INSERT"),
+    "account_deletions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "activity": ("SELECT", "INSERT", "DELETE"),
     "auth_sessions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "guest_playground_executions": ("SELECT", "INSERT", "DELETE"),
-    "lesson_progress": ("SELECT", "INSERT", "UPDATE"),
+    "lesson_progress": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "lessons": ("SELECT",),
-    "mobile_money_payments": ("SELECT", "INSERT", "UPDATE"),
+    "mobile_money_payments": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "notifications": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "password_resets": ("SELECT", "INSERT", "UPDATE", "DELETE"),
-    "payment_attempts": ("SELECT", "INSERT", "UPDATE"),
+    "payment_attempts": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "payment_provider_configurations": ("SELECT",),
-    "payment_status_history": ("SELECT", "INSERT"),
-    "payment_transactions": ("SELECT", "INSERT", "UPDATE"),
-    "playground_errors": ("SELECT", "INSERT", "UPDATE"),
+    "payment_status_history": ("SELECT", "INSERT", "DELETE"),
+    "payment_transactions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "playground_errors": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "playground_executions": ("SELECT", "INSERT", "DELETE"),
-    "quiz_attempts": ("SELECT", "INSERT"),
-    "quiz_results": ("SELECT", "INSERT", "UPDATE"),
+    "quiz_attempts": ("SELECT", "INSERT", "DELETE"),
+    "quiz_results": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "revoked_tokens": ("SELECT", "INSERT", "DELETE"),
     "subscription_plans": ("SELECT",),
-    "subscription_registrations": ("SELECT", "INSERT", "UPDATE"),
-    "subscriptions": ("SELECT", "INSERT", "UPDATE"),
-    "users": ("SELECT", "INSERT", "UPDATE"),
+    "subscription_registrations": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "subscriptions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "users": ("SELECT", "INSERT", "UPDATE", "DELETE"),
 }
 
 
@@ -1902,14 +1950,226 @@ def validate_runtime_database_role() -> None:
                 )
 
 
+def reconcile_pending_account_deletions(stop_event: Event | None = None) -> None:
+    if not account_reconciliation_lock.acquire(blocking=False):
+        return
+    try:
+        with SessionLocal() as discovery_db:
+            pending_ids = discovery_db.scalars(
+                select(AccountDeletion.id).where(
+                    AccountDeletion.state.in_(("PENDING_PROVIDER", "PENDING_LOCAL", "FAILED")),
+                    AccountDeletion.local_deleted.is_(False),
+                )
+            ).all()
+
+        service_role = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+        for deletion_id in pending_ids:
+            if stop_event is not None and stop_event.is_set():
+                break
+            try:
+                with SessionLocal() as db:
+                    deletion = db.scalar(
+                        select(AccountDeletion)
+                        .where(AccountDeletion.id == deletion_id)
+                        .with_for_update()
+                    )
+                    if (
+                        deletion is None
+                        or deletion.state not in ("PENDING_PROVIDER", "PENDING_LOCAL", "FAILED")
+                        or deletion.local_deleted
+                    ):
+                        continue
+
+                    if not deletion.provider_reconciled:
+                        if deletion.provider_subject_hash:
+                            if not deletion.provider_subject_ciphertext:
+                                log.error(
+                                    "Pending account deletion has no encrypted provider subject for user_id=%s.",
+                                    deletion.user_id,
+                                )
+                                deletion.state = "FAILED"
+                                deletion.updated_at = utcnow()
+                                db.commit()
+                                continue
+                            if not supabase_configured() or not service_role:
+                                continue
+                            if len(os.getenv("KITE_SECRET_KEY", "").strip()) < 32:
+                                log.error(
+                                    "Cannot reconcile pending account deletion without a valid KITE_SECRET_KEY."
+                                )
+                                continue
+                            try:
+                                auth_subject = decrypt_account_deletion_subject(
+                                    deletion.provider_subject_ciphertext
+                                )
+                            except Exception:
+                                log.exception(
+                                    "Could not decrypt pending account-deletion provider subject for user_id=%s.",
+                                    deletion.user_id,
+                                )
+                                deletion.state = "FAILED"
+                                deletion.updated_at = utcnow()
+                                db.commit()
+                                continue
+                            subject_hash = hashlib.sha256(auth_subject.encode()).hexdigest()
+                            if not hmac.compare_digest(
+                                subject_hash,
+                                deletion.provider_subject_hash,
+                            ):
+                                log.error(
+                                    "Pending account deletion provider subject failed integrity validation for user_id=%s.",
+                                    deletion.user_id,
+                                )
+                                deletion.state = "FAILED"
+                                deletion.updated_at = utcnow()
+                                db.commit()
+                                continue
+                            with httpx.Client(timeout=12) as client:
+                                provider_response = client.request(
+                                    "DELETE",
+                                    supabase_url + "/auth/v1/admin/users/" + quote(auth_subject, safe=""),
+                                    headers={
+                                        "apikey": service_role,
+                                        "Authorization": "Bearer " + service_role,
+                                    },
+                                )
+                            if provider_response.status_code not in {200, 202, 204, 404}:
+                                deletion.state = "FAILED"
+                                deletion.updated_at = utcnow()
+                                db.commit()
+                                continue
+
+                        deletion.provider_reconciled = True
+                        deletion.state = "PENDING_LOCAL"
+                        deletion.updated_at = utcnow()
+
+                    user = db.get(User, deletion.user_id)
+                    if user is not None:
+                        for table in reversed(Base.metadata.sorted_tables):
+                            if table is AccountDeletion.__table__:
+                                continue
+                            if "user_id" in table.c:
+                                db.execute(delete(table).where(table.c.user_id == user.id))
+                        db.delete(user)
+
+                    deletion.local_deleted = True
+                    deletion.state = "COMPLETED"
+                    deletion.updated_at = utcnow()
+                    db.commit()
+            except httpx.HTTPError as error:
+                log.warning(
+                    "Pending account-deletion provider request failed for deletion_id=%s (%s).",
+                    deletion_id,
+                    type(error).__name__,
+                )
+                try:
+                    with SessionLocal() as failed_db:
+                        failed = failed_db.scalar(
+                            select(AccountDeletion)
+                            .where(AccountDeletion.id == deletion_id)
+                            .with_for_update()
+                        )
+                        if failed is not None and not failed.local_deleted:
+                            failed.state = "FAILED"
+                            failed.updated_at = utcnow()
+                            failed_db.commit()
+                except SQLAlchemyError:
+                    log.exception(
+                        "Could not record provider failure for deletion_id=%s.",
+                        deletion_id,
+                    )
+            except SQLAlchemyError:
+                log.exception(
+                    "Could not reconcile pending account deletion for deletion_id=%s.",
+                    deletion_id,
+                )
+                try:
+                    with SessionLocal() as failed_db:
+                        failed = failed_db.scalar(
+                            select(AccountDeletion)
+                            .where(AccountDeletion.id == deletion_id)
+                            .with_for_update()
+                        )
+                        if failed is not None and not failed.local_deleted:
+                            failed.state = "FAILED"
+                            failed.updated_at = utcnow()
+                            failed_db.commit()
+                except SQLAlchemyError:
+                    log.exception(
+                        "Could not record reconciliation failure for deletion_id=%s.",
+                        deletion_id,
+                    )
+    finally:
+        account_reconciliation_lock.release()
+
+
+reconcile_pending_local_account_deletions = reconcile_pending_account_deletions
+
+
+def account_deletion_reconciliation_worker(stop_event: Event) -> None:
+    while not stop_event.is_set():
+        try:
+            reconcile_pending_account_deletions(stop_event)
+        except SQLAlchemyError:
+            log.exception("Account-deletion reconciliation cycle failed.")
+        if stop_event.wait(300):
+            return
+
+
+def start_account_deletion_reconciliation_worker() -> Thread:
+    global account_reconciliation_thread
+    with account_reconciliation_lifecycle_lock:
+        if account_reconciliation_thread and account_reconciliation_thread.is_alive():
+            return account_reconciliation_thread
+        account_reconciliation_stop.clear()
+        worker = Thread(
+            target=account_deletion_reconciliation_worker,
+            args=(account_reconciliation_stop,),
+            name="kite-account-deletion-reconciliation",
+            daemon=True,
+        )
+        account_reconciliation_thread = worker
+        try:
+            worker.start()
+        except RuntimeError:
+            account_reconciliation_thread = None
+            raise
+        return worker
+
+
+def stop_account_deletion_reconciliation_worker() -> None:
+    global account_reconciliation_thread
+    with account_reconciliation_lifecycle_lock:
+        worker = account_reconciliation_thread
+        if worker is None:
+            return
+        account_reconciliation_stop.set()
+    if worker is not current_thread():
+        worker.join(timeout=15)
+    if worker.is_alive():
+        log.error("Account-deletion reconciliation worker did not stop within 15 seconds.")
+        return
+    with account_reconciliation_lifecycle_lock:
+        if account_reconciliation_thread is worker:
+            account_reconciliation_thread = None
+        account_reconciliation_stop.clear()
+
+
 @app.on_event("startup")
 def startup() -> None:
     validate_runtime_configuration()
     assert_database_migrations_applied()
     assert_database_schema_matches_models()
     validate_runtime_database_role()
+    start_account_deletion_reconciliation_worker()
     if not os.getenv("KITE_SECRET_KEY"):
         log.warning("KITE_SECRET_KEY is unset; authenticated requests will be unavailable.")
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    stop_account_deletion_reconciliation_worker()
 
 
 @app.get("/health")
@@ -2336,6 +2596,162 @@ def update_me(payload: ProfileIn, user: User = Depends(current_user), db: Sessio
     user.name = payload.name.strip()
     db.commit()
     return user_payload(user, db)
+
+
+@app.delete("/api/me")
+def delete_me(
+    payload: DeleteAccountIn,
+    request: Request,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    if payload.confirmation.strip().upper() != "DELETE":
+        raise HTTPException(status_code=422, detail="Enter DELETE to confirm account deletion.")
+
+    credential = getattr(request.state, "kite_auth_access_token", None)
+    if not credential:
+        credential, _ = credential_token(request, authorization)
+    using_cookie = getattr(
+        request.state, "kite_auth_using_cookie",
+        bool(request.cookies.get(AUTH_ACCESS_COOKIE)),
+    )
+    enforce_auth_rate_limit(request, "account-delete", user.email, 3, 900)
+    service_role = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if supabase_configured() and user.auth_subject and not service_role:
+        raise HTTPException(
+            status_code=503,
+            detail="Account deletion is temporarily unavailable. Please use the deletion-request page.",
+        )
+
+    provider_subject_hash = (
+        hashlib.sha256(user.auth_subject.encode()).hexdigest()
+        if supabase_configured() and user.auth_subject else None
+    )
+    provider_subject_ciphertext = (
+        encrypt_account_deletion_subject(user.auth_subject)
+        if supabase_configured() and user.auth_subject else None
+    )
+    deletion = db.scalar(
+        select(AccountDeletion)
+        .where(
+            AccountDeletion.user_id == user.id,
+            AccountDeletion.local_deleted.is_(False),
+        )
+        .order_by(AccountDeletion.created_at.desc())
+        .limit(1)
+    )
+    if deletion is None:
+        deletion = AccountDeletion(
+            id=uuid.uuid4().hex,
+            user_id=user.id,
+            provider_subject_hash=provider_subject_hash,
+            provider_subject_ciphertext=provider_subject_ciphertext,
+            state="PENDING_PROVIDER" if provider_subject_hash else "PENDING_LOCAL",
+            provider_reconciled=not bool(provider_subject_hash),
+            local_deleted=False,
+        )
+        db.add(deletion)
+    elif provider_subject_ciphertext and not deletion.provider_subject_ciphertext:
+        deletion.provider_subject_ciphertext = provider_subject_ciphertext
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        log.exception("Could not persist account-deletion state for user_id=%s.", user.id)
+        raise HTTPException(
+            status_code=503,
+            detail="We couldn't start account deletion right now. No account data was removed.",
+        )
+
+    deletion = db.scalar(
+        select(AccountDeletion)
+        .where(AccountDeletion.id == deletion.id)
+        .with_for_update()
+    )
+    if deletion is None:
+        raise HTTPException(
+            status_code=503,
+            detail="We couldn't confirm account deletion right now. Please try again.",
+        )
+    if deletion.local_deleted:
+        if using_cookie:
+            clear_auth_cookies(request, response)
+        return {"ok": True, "message": "Account and associated app data deleted."}
+
+    if supabase_configured() and credential:
+        try:
+            supabase_request("/logout?scope=global", method="POST", access_token=credential)
+        except HTTPException as error:
+            if error.status_code >= 500:
+                deletion.state = "FAILED"
+                deletion.updated_at = utcnow()
+                db.commit()
+                raise HTTPException(
+                    status_code=503,
+                    detail="We couldn't confirm account deletion right now. Please try again.",
+                ) from error
+            deletion.state = "FAILED"
+            deletion.updated_at = utcnow()
+            db.commit()
+            raise
+
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    if supabase_configured() and service_role and user.auth_subject:
+        try:
+            with httpx.Client(timeout=12) as client:
+                provider_response = client.request(
+                    "DELETE",
+                    supabase_url + "/auth/v1/admin/users/" + quote(user.auth_subject, safe=""),
+                    headers={
+                        "apikey": service_role,
+                        "Authorization": "Bearer " + service_role,
+                    },
+                )
+            if provider_response.status_code not in {200, 202, 204, 404}:
+                deletion.state = "FAILED"
+                deletion.updated_at = utcnow()
+                db.commit()
+                raise HTTPException(
+                    status_code=503,
+                    detail="We couldn't confirm account deletion right now. Please try again.",
+                )
+            deletion.provider_reconciled = True
+            deletion.state = "PENDING_LOCAL"
+            deletion.updated_at = utcnow()
+        except httpx.HTTPError as error:
+            log.warning("Supabase account deletion request failed (%s).", type(error).__name__)
+            deletion.state = "FAILED"
+            deletion.updated_at = utcnow()
+            db.commit()
+            raise HTTPException(
+                status_code=503,
+                detail="We couldn't confirm account deletion right now. Please try again.",
+            ) from error
+
+    for table in reversed(Base.metadata.sorted_tables):
+        if table is AccountDeletion.__table__:
+            continue
+        if "user_id" in table.c:
+            db.execute(delete(table).where(table.c.user_id == user.id))
+    db.delete(user)
+    deletion.local_deleted = True
+    deletion.state = "COMPLETED"
+    deletion.updated_at = utcnow()
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        log.exception("Account database deletion failed after provider reconciliation for user_id=%s.", user.id)
+        raise HTTPException(
+            status_code=503,
+            detail="We couldn't complete account deletion right now. No confirmation was recorded.",
+        )
+
+    if using_cookie:
+        clear_auth_cookies(request, response)
+    return {"ok": True, "message": "Account and associated app data deleted."}
 
 
 @app.patch("/api/me/email")

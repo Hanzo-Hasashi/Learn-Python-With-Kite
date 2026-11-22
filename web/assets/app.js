@@ -1542,7 +1542,7 @@
         {
           title: "7. Your choices and privacy rights",
           paragraphs: [
-            "You can update supported account details and settings in the app. Depending on the privacy law that applies to you, you may also have rights to request access, correction, deletion, restriction, portability or objection, or to withdraw consent where processing relies on consent. The app does not currently provide self-service export or account deletion. Send a request using the Contact Us details; we may need to verify your identity and may retain information where required or permitted by law."
+            "You can update supported account details and settings in the app. Depending on the privacy law that applies to you, you may also have rights to request access, correction, deletion, restriction, portability or objection, or to withdraw consent where processing relies on consent. You can use the public Account and Data Deletion page or Contact Us to request deletion. We may need to verify your identity and may retain information where required or permitted by law."
           ]
         },
         {
@@ -1613,6 +1613,22 @@
         sheet.appendChild(subheading);
         section.paragraphs.forEach(function (text) { appendLegalParagraph(doc, sheet, text); });
       });
+      if (buttonId === "b-priv") {
+        var privacyLink = doc.createElement("a");
+        privacyLink.href = "/privacy.html";
+        privacyLink.target = "_blank";
+        privacyLink.rel = "noopener";
+        privacyLink.textContent = "View public privacy policy";
+        privacyLink.style.cssText = "display:block;margin:16px 0;color:var(--blue);font-weight:700";
+        sheet.appendChild(privacyLink);
+        var deletionLink = doc.createElement("a");
+        deletionLink.href = "/account-deletion.html";
+        deletionLink.target = "_blank";
+        deletionLink.rel = "noopener";
+        deletionLink.textContent = "Account and data deletion";
+        deletionLink.style.cssText = "display:block;margin:8px 0 16px;color:var(--blue);font-weight:700";
+        sheet.appendChild(deletionLink);
+      }
     }
     var actions = doc.createElement("div");
     actions.className = "two";
@@ -4321,8 +4337,42 @@
         var match = (doc.getElementById("cnt") || {}).textContent.match(/(\d+)\s*\/\s*(\d+)/);
         return match ? Number(match[1]) - 1 : -1;
       }
+      function ensureAccountDeletionAction(doc) {
+        if (doc.getElementById("kite-delete-account")) return;
+        var container = doc.querySelector(".scroll") || doc.getElementById("sbody") || doc.body;
+        if (!container) return;
+        var deleteButton = doc.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.id = "kite-delete-account";
+        deleteButton.textContent = "Delete account";
+        deleteButton.style.cssText = "display:block;width:calc(100% - 32px);min-height:44px;margin:16px;border:1px solid var(--red,#d64545);border-radius:12px;background:transparent;color:var(--red,#d64545);font:700 14px system-ui";
+        deleteButton.addEventListener("click", function () {
+          var confirmation = doc.defaultView.prompt(
+            "This permanently deletes your Kite account and app data. Type DELETE to continue."
+          );
+          if (!confirmation || confirmation.trim().toUpperCase() !== "DELETE") {
+            tell(doc, "Account deletion was cancelled.", false);
+            return;
+          }
+          deleteButton.disabled = true;
+          deleteButton.textContent = "Deleting account…";
+          api("/api/me", { confirmation: "DELETE" }, "DELETE").then(function () {
+            [tokenKey, refreshKey, rememberMeKey].forEach(function (key) {
+              sessionStorage.removeItem(key);
+            });
+            clearAuthTokens();
+            navigate("welcome");
+          }).catch(function (error) {
+            deleteButton.disabled = false;
+            deleteButton.textContent = "Delete account";
+            tell(doc, error.message, true);
+          });
+        });
+        container.appendChild(deleteButton);
+      }
       function hydratePreferences(doc) {
         if (!token()) return;
+        ensureAccountDeletionAction(doc);
         api("/api/me").then(function (me) {
           setText(doc, "#a-mail .l", me.email);
           var notifications = doc.getElementById("sw");

@@ -22,14 +22,14 @@ Kite uses a decoupled, modern cloud architecture designed for zero recurring inf
        ▼
 [ Render Web Service ] ─── (FastAPI on Python 3.12, Uvicorn ASGI on 0.0.0.0:$PORT)
        │
-       │ TLS (sslmode=require) via Transaction Pooler (:5432)
+       │ TLS (sslmode=require) via Session Pooler (:5432)
        ▼
-[ Supabase PostgreSQL 17.11 ] ─── (Restricted kite_runtime role, 21 application tables)
+[ Supabase PostgreSQL 17.11 ] ─── (Restricted kite_runtime role; 21 baseline tables, 22 after f4c2a1b8d7e1)
 ```
 
 * **Frontend:** Hosted statically on Vercel with automated global CDN edge caching.
 * **Backend:** Hosted on Render as a Web Service running FastAPI with an asynchronous Uvicorn ASGI server.
-* **Database:** Hosted on Supabase (PostgreSQL 17.11, AWS `eu-west-1` Ireland). Connects using the restricted `kite_runtime` database role with TLS forced (`sslmode=require`).
+* **Database:** Hosted on Supabase (PostgreSQL 17.11, AWS `eu-west-1` Ireland). Connects using the restricted `kite_runtime` database role with TLS forced (`sslmode=require`); use the Session Pooler for the persistent Render service.
 * **Security & Authorization:** Application-level authorization is enforced by FastAPI (`current_user`, `optional_user`, `playground_user`). Direct Supabase client access (PostgREST / Data API) has all table and sequence grants revoked.
 
 ---
@@ -128,11 +128,12 @@ Configure these in the Render Dashboard under:
 | `KITE_ENV` | `production` | Enforces production security checks, HTTPS cookies, and PostgreSQL. |
 | `PYTHON_VERSION` | `3.12.8` | Pins Render's native Python runtime version. |
 | `LOG_LEVEL` | `INFO` | Standard production logging level. |
-| `KITE_SECRET_KEY` | *(64-character random hex string)* | Signs session tokens and CSRF tokens. Generate with `python -c "import secrets; print(secrets.token_hex(32))"`. |
+| `KITE_SECRET_KEY` | *(64-character random hex string)* | Signs session/CSRF tokens and encrypts registered phone numbers and pending account-deletion provider subjects. Keep stable across restarts. Generate with `python -c "import secrets; print(secrets.token_hex(32))"`. |
 | `KITE_ALLOW_LOCAL_AUTH` | `false` | Disables insecure fallback authentication. |
 | `DATABASE_URL` | `postgresql+psycopg://kite_runtime.izdtxorekfpasdkgasvs:[PASSWORD]@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require` | Restricted runtime user connection string. Must include `sslmode=require`. |
 | `SUPABASE_URL` | `https://izdtxorekfpasdkgasvs.supabase.co` | Supabase project origin. |
 | `SUPABASE_ANON_KEY` | *(publishable anon key)* | Supabase client anon key (from Project Settings -> API). |
+| `SUPABASE_SERVICE_ROLE_KEY` | *(backend secret)* | Required for provider-backed account deletion and recovery. Store only in Render's backend secret settings; never in Vercel/browser code. |
 | `PUBLIC_APP_URL` | `https://learnpythonwithkite.vercel.app` | Confirmed production frontend HTTPS origin. |
 | `KITE_CORS_ORIGINS` | `https://learnpythonwithkite.vercel.app` | Exact allowed CORS origin. Wildcard `*` and `localhost` are rejected in production. |
 | `KITE_COOKIE_SECURE` | `true` | Enforces `Secure` flag on all session cookies. |
@@ -184,10 +185,18 @@ If using a custom registrable domain (e.g. `learnpythonwithkite.com`):
 
 * **Role:** Must connect exclusively as `kite_runtime` (user `kite_runtime.izdtxorekfpasdkgasvs`).
 * **Privileges:** `kite_runtime` has strict least-privilege permissions (no DDL, no superuser, no bypass RLS, read-only on reference data, denied access to `alembic_version`).
-* **Connection Pooling:** Use Supabase's AWS connection pooler hostname:
-  `aws-0-eu-west-1.pooler.supabase.com` on port `5432` (or transaction pooler port `6543`).
+* **Connection Pooling:** Use Supabase's AWS Session Pooler hostname:
+  `aws-0-eu-west-1.pooler.supabase.com` on port `5432`. Do not use the transaction pooler for this persistent service.
 * **SSL Requirement:** The connection string must include `?sslmode=require`. The application will refuse to start if SSL mode is missing or insecure.
 * **Startup Safety:** Ordinary application startup (`startup()`) does **not** run DDL migrations and does **not** seed reference data. It verifies catalog schema matching using system catalogs.
+
+### Account-deletion migration and rollout
+
+The matching backend expects Alembic revision `f4c2a1b8d7e1`. Apply it before deploying that backend, from a trusted one-off environment using `MIGRATION_DATABASE_URL` with the migration/owner role; run `alembic upgrade head` and then `alembic check`. Keep `MIGRATION_DATABASE_URL` out of the Render web-service environment. Do not have the service run migrations at startup.
+
+The migration adds the `account_deletions` audit/outbox table, its partial active-user index, and runtime permissions; it does not delete or rewrite existing application rows. The new backend will refuse startup if the table is missing. If the backend rollout fails after the migration, leave the additive migration applied and roll back or repair the application release. The prior backend ignores unknown reflected tables and does not use this outbox. Do not downgrade when any deletion audit/outbox row exists; the downgrade explicitly refuses to discard it.
+
+Set a stable `KITE_SECRET_KEY` before enabling recovery and keep it unchanged while encrypted provider subjects exist. Configure `SUPABASE_SERVICE_ROLE_KEY` only as a Render backend secret. If this key is missing or provider access fails, deletion records remain pending/failed for a later retry; never put the key in Vercel or browser configuration.
 
 ---
 

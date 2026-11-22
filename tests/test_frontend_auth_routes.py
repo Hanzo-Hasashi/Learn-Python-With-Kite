@@ -393,6 +393,36 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.evaluate("location.hash"), "#home")
         self.assertTrue(self.page.context.cookies(self.base))
 
+    def test_preferences_exposes_confirmation_gated_delete_account_action(self):
+        user = {"id": 43, "name": "Kite Learner", "email": "learner@example.test"}
+
+        def handle_api(route):
+            path = route.request.url.split("?", 1)[0]
+            if path.endswith("/api/auth/session"):
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"user": user, "csrf_token": "delete-test-csrf"}),
+                )
+            elif path.endswith("/api/me"):
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({**user, "settings": {"theme": "system"}}),
+                )
+            else:
+                route.fulfill(status=200, content_type="application/json", body="{}")
+
+        self.context.route("**/api/**", handle_api)
+        frame = self.open("#preferences")
+        delete_button = frame.locator("#kite-delete-account")
+        delete_button.wait_for(state="attached")
+        self.assertTrue(delete_button.is_visible())
+        self.page.once("dialog", lambda dialog: dialog.dismiss())
+        delete_button.click()
+        self.assertTrue(delete_button.is_enabled())
+        self.assertEqual(delete_button.text_content(), "Delete account")
+
     def test_switching_between_sign_up_and_log_in_stays_stable(self):
         frame = self.open("#sign-up")
         self.wait_for_heading("Create your account")
