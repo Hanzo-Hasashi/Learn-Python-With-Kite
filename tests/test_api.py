@@ -17,18 +17,27 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 import httpx
 
 DB_DIR = tempfile.TemporaryDirectory()
-logging.disable(logging.CRITICAL)
-os.environ["DATABASE_URL"] = "sqlite:///" + Path(DB_DIR.name, "test.db").as_posix()
-os.environ.pop("MIGRATION_DATABASE_URL", None)
-os.environ["KITE_SECRET_KEY"] = "test-only-secret-key-with-at-least-32-characters"
-os.environ["KITE_ALLOW_LOCAL_AUTH"] = "true"
-os.environ["SUPABASE_URL"] = ""
-os.environ["SUPABASE_ANON_KEY"] = ""
-os.environ["RUNNER_SHARED_SECRET"] = "test-runner-secret"
+_ORIGINAL_ENVIRONMENT = os.environ.copy()
+TEST_ENVIRONMENT = {
+    "DATABASE_URL": "sqlite:///" + Path(DB_DIR.name, "test.db").as_posix(),
+    "KITE_ENV": "development",
+    "KITE_VERCEL_PROXY": "false",
+    "KITE_SECRET_KEY": "test-only-secret-key-with-at-least-32-characters",
+    "KITE_ALLOW_LOCAL_AUTH": "true",
+    "SUPABASE_URL": "",
+    "SUPABASE_ANON_KEY": "",
+    "RUNNER_SHARED_SECRET": "test-runner-secret",
+}
+BOOTSTRAP_ENVIRONMENT = dict(TEST_ENVIRONMENT, DATABASE_URL="sqlite://")
+_ORIGINAL_LOGGING_DISABLE = logging.root.manager.disable
+os.environ.update(BOOTSTRAP_ENVIRONMENT)
+for _key in ("MIGRATION_DATABASE_URL", "RENDER", "VERCEL", "VERCEL_ENV"):
+    os.environ.pop(_key, None)
 
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -51,20 +60,64 @@ from backend.app import (
 from backend.curriculum import NEW_CHALLENGE_DATA, NEW_QUIZ_DATA
 from backend.payments import PaymentStatus, ProviderPaymentResult, normalize_zambian_phone
 
+os.environ.clear()
+os.environ.update(_ORIGINAL_ENVIRONMENT)
+logging.disable(_ORIGINAL_LOGGING_DISABLE)
+
+
+def setUpModule():
+    global _environment_patcher
+    _environment_patcher = patch.dict(os.environ, TEST_ENVIRONMENT, clear=False)
+    _environment_patcher.start()
+    for key in ("MIGRATION_DATABASE_URL", "RENDER", "VERCEL", "VERCEL_ENV"):
+        os.environ.pop(key, None)
+
+
+def tearDownModule():
+    _environment_patcher.stop()
+    DB_DIR.cleanup()
+
 
 class KiteApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.addClassCleanup(cls.cleanup_resources)
+        global engine, SessionLocal
+        cls.previous_engine = backend_app.engine
+        cls.previous_session_factory = backend_app.SessionLocal
+        cls.test_engine = create_engine(
+            os.environ["DATABASE_URL"],
+            **database_engine_options(os.environ["DATABASE_URL"], serverless=False),
+        )
+        backend_app.engine = cls.test_engine
+        backend_app.SessionLocal = sessionmaker(
+            bind=cls.test_engine,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        engine = cls.test_engine
+        SessionLocal = backend_app.SessionLocal
         command.upgrade(Config(str(Path(__file__).parent.parent / "alembic.ini")), "head")
         cls.client_context = TestClient(app)
         cls.client = cls.client_context.__enter__()
 
     @classmethod
-    def tearDownClass(cls):
-        cls.client_context.__exit__(None, None, None)
-        Base.metadata.drop_all(engine)
-        engine.dispose()
-        DB_DIR.cleanup()
+    def cleanup_resources(cls):
+        global engine, SessionLocal
+        try:
+            if hasattr(cls, "client_context"):
+                cls.client_context.__exit__(None, None, None)
+            if hasattr(cls, "test_engine"):
+                try:
+                    Base.metadata.drop_all(cls.test_engine)
+                finally:
+                    cls.test_engine.dispose()
+        finally:
+            if hasattr(cls, "previous_engine"):
+                backend_app.engine = cls.previous_engine
+                backend_app.SessionLocal = cls.previous_session_factory
+                engine = cls.previous_engine
+                SessionLocal = cls.previous_session_factory
 
     def setUp(self):
         stop_account_deletion_reconciliation_worker()

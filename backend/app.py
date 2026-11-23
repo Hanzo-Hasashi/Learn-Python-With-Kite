@@ -12,6 +12,7 @@ import smtplib
 import base64
 import time
 import uuid
+from contextlib import nullcontext
 from threading import Event, Lock, Thread, current_thread
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -30,6 +31,7 @@ from pydantic import BaseModel, EmailStr, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, func, select, text, delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from backend.payments import (
@@ -263,12 +265,18 @@ def validate_runtime_configuration() -> None:
 
 
 def database_engine_options(url: str, *, serverless: bool) -> dict[str, Any]:
+    connect_args: dict[str, Any] = {}
+    if url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+    elif url.startswith("postgresql+psycopg://"):
+        connect_args["connect_timeout"] = 5
+
     options: dict[str, Any] = {
-        "connect_args": {"check_same_thread": False} if url.startswith("sqlite") else {},
+        "connect_args": connect_args,
         "pool_pre_ping": True,
     }
     if serverless and url.startswith("postgresql+psycopg://"):
-        options["connect_args"] = {"prepare_threshold": None}
+        connect_args["prepare_threshold"] = None
         options["pool_size"] = 1
         options["max_overflow"] = 0
     return options
@@ -1712,8 +1720,8 @@ async def kite_validation_exception_handler(request: Request, error: RequestVali
 
 @app.exception_handler(SQLAlchemyError)
 async def kite_database_exception_handler(request: Request, error: SQLAlchemyError) -> JSONResponse:
-    log.exception("Database operation failed [%s] %s %s",
-                  _request_id(request), request.method, request.url.path)
+    log.error("Database operation failed [%s] %s %s (%s).",
+              _request_id(request), request.method, request.url.path, type(error).__name__)
     return _structured_error(
         503,
         "database_unavailable",
@@ -1724,8 +1732,8 @@ async def kite_database_exception_handler(request: Request, error: SQLAlchemyErr
 
 @app.exception_handler(Exception)
 async def kite_unexpected_exception_handler(request: Request, error: Exception) -> JSONResponse:
-    log.exception("Unexpected API failure [%s] %s %s",
-                  _request_id(request), request.method, request.url.path)
+    log.error("Unexpected API failure [%s] %s %s (%s).",
+              _request_id(request), request.method, request.url.path, type(error).__name__)
     return _structured_error(
         500,
         "internal_error",
@@ -1769,18 +1777,18 @@ async def enforce_proxy_and_browser_origin(request: Request, call_next):
 
     try:
         response = await call_next(request)
-    except SQLAlchemyError:
-        log.exception("Database operation failed [%s] %s %s",
-                      _request_id(request), request.method, request.url.path)
+    except SQLAlchemyError as error:
+        log.error("Database operation failed [%s] %s %s (%s).",
+                  _request_id(request), request.method, request.url.path, type(error).__name__)
         return _structured_error(
             503,
             "database_unavailable",
             "The service is temporarily unavailable. Please try again shortly.",
             request,
         )
-    except Exception:
-        log.exception("Unexpected API failure [%s] %s %s",
-                      _request_id(request), request.method, request.url.path)
+    except Exception as error:
+        log.error("Unexpected API failure [%s] %s %s (%s).",
+                  _request_id(request), request.method, request.url.path, type(error).__name__)
         return _structured_error(
             500,
             "internal_error",
@@ -1824,7 +1832,7 @@ RUNTIME_TABLE_OPERATIONS: dict[str, tuple[str, ...]] = {
 }
 
 
-def assert_database_migrations_applied() -> None:
+def assert_database_migrations_applied(connection: Connection | None = None) -> None:
     from alembic.config import Config
     from alembic.runtime.migration import MigrationContext
     from alembic.script import ScriptDirectory
@@ -1835,15 +1843,16 @@ def assert_database_migrations_applied() -> None:
     heads = script.get_heads()
     if len(heads) != 1:
         raise RuntimeError("The database migration history must have exactly one head.")
-    with engine.connect() as connection:
-        if connection.dialect.name == "postgresql":
-            has_alembic_access = connection.execute(text(
+    connection_context = engine.connect() if connection is None else nullcontext(connection)
+    with connection_context as active_connection:
+        if active_connection.dialect.name == "postgresql":
+            has_alembic_access = active_connection.execute(text(
                 "SELECT has_table_privilege(current_user, 'public.alembic_version', 'SELECT')"
             )).scalar_one()
             if not has_alembic_access:
                 # The restricted runtime role intentionally has no access to Alembic metadata
                 return
-        current = MigrationContext.configure(connection).get_current_revision()
+        current = MigrationContext.configure(active_connection).get_current_revision()
     if current != heads[0]:
         raise RuntimeError(
             f"Database schema revision is {current or 'uninitialized'}; "
@@ -1851,11 +1860,12 @@ def assert_database_migrations_applied() -> None:
         )
 
 
-def assert_database_schema_matches_models() -> None:
+def assert_database_schema_matches_models(connection: Connection | None = None) -> None:
     from backend.db_schema import compare_schema
 
-    with engine.connect() as connection:
-        differences = compare_schema(connection, Base.metadata)
+    connection_context = engine.connect() if connection is None else nullcontext(connection)
+    with connection_context as active_connection:
+        differences = compare_schema(active_connection, Base.metadata)
     if differences:
         raise RuntimeError(
             "The database schema does not match the application models. "
@@ -1864,21 +1874,22 @@ def assert_database_schema_matches_models() -> None:
         )
 
 
-def validate_runtime_database_role() -> None:
+def validate_runtime_database_role(connection: Connection | None = None) -> None:
     integration_test = os.getenv("KITE_POSTGRES_INTEGRATION_TESTS") == "1"
     if (
         (not is_hosted_environment() and not integration_test)
         or engine.dialect.name != "postgresql"
     ):
         return
-    with engine.connect() as connection:
-        role = connection.execute(text(
+    connection_context = engine.connect() if connection is None else nullcontext(connection)
+    with connection_context as active_connection:
+        role = active_connection.execute(text(
             "SELECT current_user AS role_name, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, "
             "has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_database, "
             "has_schema_privilege(current_user, 'public', 'CREATE') AS can_create_schema "
             "FROM pg_roles WHERE rolname = current_user"
         )).mappings().one()
-        elevated_access = connection.execute(text(
+        elevated_access = active_connection.execute(text(
             "SELECT "
             "EXISTS (SELECT 1 FROM pg_auth_members "
             "WHERE member = (SELECT oid FROM pg_roles WHERE rolname = current_user)) "
@@ -1913,41 +1924,51 @@ def validate_runtime_database_role() -> None:
                 "with RLS enforcement, no elevated role memberships, no schema CREATE privileges, "
                 "and no ownership of application objects."
             )
-        for table in Base.metadata.sorted_tables:
-            required_operations = RUNTIME_TABLE_OPERATIONS.get(table.name, ("SELECT",))
-            for operation in required_operations:
-                has_perm = connection.execute(text(
-                    "SELECT has_table_privilege(current_user, :table_name, :operation)"
-                ), {"table_name": "public." + table.name, "operation": operation}).scalar_one()
-                if not has_perm:
-                    raise RuntimeError(
-                        f"Hosted DATABASE_URL is missing required application table permission {operation} for {table.name}."
-                    )
-        has_alembic_access = connection.execute(text(
+        required_table_privileges = [
+            (table.name, operation)
+            for table in Base.metadata.sorted_tables
+            for operation in RUNTIME_TABLE_OPERATIONS.get(table.name, ("SELECT",))
+        ]
+        missing_table_privileges = active_connection.execute(text(
+            "SELECT required.table_name, required.operation "
+            "FROM unnest(CAST(:table_names AS text[]), CAST(:operations AS text[])) "
+            "AS required(table_name, operation) "
+            "WHERE NOT has_table_privilege("
+            "current_user, 'public.' || quote_ident(required.table_name), required.operation)"
+        ), {
+            "table_names": [table_name for table_name, _ in required_table_privileges],
+            "operations": [operation for _, operation in required_table_privileges],
+        }).mappings().all()
+        if missing_table_privileges:
+            missing = missing_table_privileges[0]
+            raise RuntimeError(
+                "Hosted DATABASE_URL is missing required application table permission "
+                f"{missing['operation']} for {missing['table_name']}."
+            )
+        has_alembic_access = active_connection.execute(text(
             "SELECT has_table_privilege(current_user, 'public.alembic_version', 'SELECT')"
         )).scalar_one()
         if has_alembic_access:
             raise RuntimeError(
                 "Hosted DATABASE_URL must not have access to Alembic metadata table alembic_version."
             )
-        sequences = connection.execute(text(
+        missing_sequences = active_connection.execute(text(
             "SELECT seq.relname FROM pg_class AS seq "
             "JOIN pg_namespace AS sequence_schema ON sequence_schema.oid = seq.relnamespace "
             "JOIN pg_depend AS dependency ON dependency.objid = seq.oid "
             "AND dependency.deptype IN ('a', 'i') "
             "JOIN pg_class AS application_table ON application_table.oid = dependency.refobjid "
             "WHERE seq.relkind = 'S' AND sequence_schema.nspname = 'public' "
-            "AND application_table.relname = ANY(:table_names)"
+            "AND application_table.relname = ANY(:table_names) "
+            "AND (NOT has_sequence_privilege(current_user, seq.oid, 'USAGE') "
+            "OR NOT has_sequence_privilege(current_user, seq.oid, 'SELECT'))"
         ), {"table_names": list(Base.metadata.tables)}).scalars().all()
-        for sequence_name in sequences:
-            has_sequence_access = connection.execute(text(
-                "SELECT has_sequence_privilege(current_user, :sequence_name, 'USAGE') "
-                "AND has_sequence_privilege(current_user, :sequence_name, 'SELECT')"
-            ), {"sequence_name": "public." + sequence_name}).scalar_one()
-            if not has_sequence_access:
-                raise RuntimeError(
-                    f"Hosted DATABASE_URL is missing required sequence permissions for {sequence_name}."
-                )
+        if missing_sequences:
+            raise RuntimeError(
+                "Hosted DATABASE_URL is missing required sequence permissions for "
+                + ", ".join(sorted(missing_sequences))
+                + "."
+            )
 
 
 def reconcile_pending_account_deletions(stop_event: Event | None = None) -> None:
@@ -2003,10 +2024,12 @@ def reconcile_pending_account_deletions(stop_event: Event | None = None) -> None
                                 auth_subject = decrypt_account_deletion_subject(
                                     deletion.provider_subject_ciphertext
                                 )
-                            except Exception:
-                                log.exception(
-                                    "Could not decrypt pending account-deletion provider subject for user_id=%s.",
-                                    deletion.user_id,
+                            except Exception as error:
+                                log.error(
+                                    "Could not decrypt pending account-deletion provider subject "
+                                    "for deletion_id=%s (%s).",
+                                    deletion.id,
+                                    type(error).__name__,
                                 )
                                 deletion.state = "FAILED"
                                 deletion.updated_at = utcnow()
@@ -2074,15 +2097,17 @@ def reconcile_pending_account_deletions(stop_event: Event | None = None) -> None
                             failed.state = "FAILED"
                             failed.updated_at = utcnow()
                             failed_db.commit()
-                except SQLAlchemyError:
-                    log.exception(
-                        "Could not record provider failure for deletion_id=%s.",
+                except SQLAlchemyError as error:
+                    log.error(
+                        "Could not record provider failure for deletion_id=%s (%s).",
                         deletion_id,
+                        type(error).__name__,
                     )
-            except SQLAlchemyError:
-                log.exception(
-                    "Could not reconcile pending account deletion for deletion_id=%s.",
+            except SQLAlchemyError as error:
+                log.error(
+                    "Could not reconcile pending account deletion for deletion_id=%s (%s).",
                     deletion_id,
+                    type(error).__name__,
                 )
                 try:
                     with SessionLocal() as failed_db:
@@ -2095,10 +2120,11 @@ def reconcile_pending_account_deletions(stop_event: Event | None = None) -> None
                             failed.state = "FAILED"
                             failed.updated_at = utcnow()
                             failed_db.commit()
-                except SQLAlchemyError:
-                    log.exception(
-                        "Could not record reconciliation failure for deletion_id=%s.",
+                except SQLAlchemyError as error:
+                    log.error(
+                        "Could not record reconciliation failure for deletion_id=%s (%s).",
                         deletion_id,
+                        type(error).__name__,
                     )
     finally:
         account_reconciliation_lock.release()
@@ -2111,8 +2137,11 @@ def account_deletion_reconciliation_worker(stop_event: Event) -> None:
     while not stop_event.is_set():
         try:
             reconcile_pending_account_deletions(stop_event)
-        except SQLAlchemyError:
-            log.exception("Account-deletion reconciliation cycle failed.")
+        except SQLAlchemyError as error:
+            log.error(
+                "Account-deletion reconciliation cycle failed (%s).",
+                type(error).__name__,
+            )
         if stop_event.wait(300):
             return
 
@@ -2159,9 +2188,16 @@ def stop_account_deletion_reconciliation_worker() -> None:
 @app.on_event("startup")
 def startup() -> None:
     validate_runtime_configuration()
-    assert_database_migrations_applied()
-    assert_database_schema_matches_models()
-    validate_runtime_database_role()
+    try:
+        with engine.connect() as connection:
+            assert_database_migrations_applied(connection)
+            assert_database_schema_matches_models(connection)
+            validate_runtime_database_role(connection)
+    except SQLAlchemyError as error:
+        log.error("Startup database validation failed (%s).", type(error).__name__)
+        raise RuntimeError(
+            "Database startup validation failed; check connectivity and database privileges."
+        ) from None
     start_account_deletion_reconciliation_worker()
     if not os.getenv("KITE_SECRET_KEY"):
         log.warning("KITE_SECRET_KEY is unset; authenticated requests will be unavailable.")
@@ -2182,9 +2218,12 @@ def health_ready(db: Session = Depends(get_db)) -> dict[str, str]:
     try:
         db.execute(text("SELECT 1"))
         return {"status": "ready", "database": "connected"}
-    except Exception as exc:
-        log.warning("Database readiness probe failed: %s", exc)
-        raise HTTPException(status_code=503, detail="Database connection unavailable")
+    except SQLAlchemyError as exc:
+        log.warning("Database readiness probe failed (%s).", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="The service is temporarily unavailable. Please try again shortly.",
+        ) from None
 
 
 @app.get("/")
@@ -2657,9 +2696,9 @@ def delete_me(
         deletion.provider_subject_ciphertext = provider_subject_ciphertext
     try:
         db.commit()
-    except SQLAlchemyError:
+    except SQLAlchemyError as error:
         db.rollback()
-        log.exception("Could not persist account-deletion state for user_id=%s.", user.id)
+        log.error("Could not persist account-deletion state (%s).", type(error).__name__)
         raise HTTPException(
             status_code=503,
             detail="We couldn't start account deletion right now. No account data was removed.",
@@ -2741,9 +2780,12 @@ def delete_me(
     deletion.updated_at = utcnow()
     try:
         db.commit()
-    except SQLAlchemyError:
+    except SQLAlchemyError as error:
         db.rollback()
-        log.exception("Account database deletion failed after provider reconciliation for user_id=%s.", user.id)
+        log.error(
+            "Account database deletion failed after provider reconciliation (%s).",
+            type(error).__name__,
+        )
         raise HTTPException(
             status_code=503,
             detail="We couldn't complete account deletion right now. No confirmation was recorded.",
@@ -5177,14 +5219,6 @@ def submit_quiz(quiz_id: str, payload: QuizIn, user: User | None = Depends(optio
                 return json.loads(existing_attempt.result_json)
         raise
     return result
-
-
-@app.exception_handler(Exception)
-async def log_unhandled(request: Request, exc: Exception):
-    log.exception("Unhandled server error for %s %s", request.method, request.url.path, exc_info=exc)
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(status_code=500, content={"detail": "An unexpected server error occurred."})
 
 
 if __name__ == "__main__":

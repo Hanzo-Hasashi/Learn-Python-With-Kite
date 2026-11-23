@@ -1,17 +1,14 @@
 "use strict";
 
-const CACHE_NAME = "kite-shell-v9";
+const CACHE_NAME = "kite-shell-v11";
 const CACHE_PREFIX = "kite-shell-";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
-  "/assets/app.js?v=password-recovery-21",
-  "/assets/config.js",
-  "/assets/playground-shortcut.js",
-  "/assets/playground-shortcut.css",
+  "/assets/app.js?v=loading-state-23",
+  "/assets/config.js?v=config-1",
   "/assets/pwa.js?v=pwa-2",
   "/assets/pwa.css?v=pwa-2",
-  "/assets/python_logo.webp",
   "/assets/icons/kite.svg",
   "/assets/icons/kite-192.png",
   "/assets/icons/kite-512.png",
@@ -20,10 +17,10 @@ const APP_SHELL = [
 ];
 const PUBLIC_ASSETS = new Set([
   "/manifest.webmanifest",
-  "/assets/app.js?v=password-recovery-21",
-  "/assets/config.js",
-  "/assets/playground-shortcut.js",
-  "/assets/playground-shortcut.css",
+  "/assets/app.js?v=loading-state-23",
+  "/assets/config.js?v=config-1",
+  "/assets/playground-shortcut.js?v=playground-shortcut-1",
+  "/assets/playground-shortcut.css?v=playground-shortcut-1",
   "/assets/pwa.js?v=pwa-2",
   "/assets/pwa.css?v=pwa-2",
   "/assets/python_logo.webp",

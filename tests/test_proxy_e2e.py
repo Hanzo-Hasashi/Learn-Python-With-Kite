@@ -8,30 +8,55 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 import httpx
 import uvicorn
 import threading
 
 TEST_PROXY_SECRET = "e2e-proxy-test-secret-that-is-at-least-32-chars-long"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DB_DIR = tempfile.TemporaryDirectory()
 
-os.environ["KITE_ENV"] = "development"
-os.environ["DATABASE_URL"] = "sqlite:///" + Path(DB_DIR.name, "test_proxy.db").as_posix()
-os.environ.pop("MIGRATION_DATABASE_URL", None)
-os.environ["KITE_VERCEL_PROXY"] = "true"
-os.environ["KITE_PROXY_SECRET"] = TEST_PROXY_SECRET
-os.environ["KITE_SECRET_KEY"] = "e2e-test-secret-key-at-least-32-characters"
-os.environ["PUBLIC_APP_URL"] = "https://learnpythonwithkite.vercel.app"
-os.environ["PUBLIC_API_URL"] = "https://learnpythonwithkite.vercel.app"
-os.environ["KITE_CORS_ORIGINS"] = "https://learnpythonwithkite.vercel.app"
-os.environ["KITE_ALLOW_LOCAL_AUTH"] = "true"
-os.environ["SUPABASE_URL"] = ""
-os.environ["SUPABASE_ANON_KEY"] = ""
+_ORIGINAL_ENVIRONMENT = os.environ.copy()
+os.environ.update({
+    "KITE_ENV": "development",
+    "DATABASE_URL": "sqlite://",
+    "KITE_VERCEL_PROXY": "true",
+    "KITE_PROXY_SECRET": TEST_PROXY_SECRET,
+    "KITE_SECRET_KEY": "e2e-proxy-bootstrap-secret-key-at-least-32",
+    "PUBLIC_APP_URL": "https://learnpythonwithkite.vercel.app",
+    "PUBLIC_API_URL": "https://learnpythonwithkite.vercel.app",
+    "KITE_CORS_ORIGINS": "https://learnpythonwithkite.vercel.app",
+    "KITE_ALLOW_LOCAL_AUTH": "true",
+    "SUPABASE_URL": "",
+    "SUPABASE_ANON_KEY": "",
+})
+for _key in ("MIGRATION_DATABASE_URL", "RENDER", "VERCEL", "VERCEL_ENV"):
+    os.environ.pop(_key, None)
 
 from alembic import command
 from alembic.config import Config
-from backend.app import app, startup, auth_attempts, Base, engine
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+import backend.app as backend_app
+from backend.app import app, startup, auth_attempts, Base
+
+os.environ.clear()
+os.environ.update(_ORIGINAL_ENVIRONMENT)
+
+
+TEST_ENVIRONMENT = {
+    "KITE_ENV": "development",
+    "DATABASE_URL": "sqlite://",
+    "KITE_VERCEL_PROXY": "true",
+    "KITE_PROXY_SECRET": TEST_PROXY_SECRET,
+    "KITE_SECRET_KEY": "e2e-test-secret-key-at-least-32-characters",
+    "PUBLIC_APP_URL": "https://learnpythonwithkite.vercel.app",
+    "PUBLIC_API_URL": "https://learnpythonwithkite.vercel.app",
+    "KITE_CORS_ORIGINS": "https://learnpythonwithkite.vercel.app",
+    "KITE_ALLOW_LOCAL_AUTH": "true",
+    "SUPABASE_URL": "",
+    "SUPABASE_ANON_KEY": "",
+}
 
 
 def find_free_port() -> int:
@@ -46,6 +71,29 @@ class VercelProxyE2ETests(unittest.TestCase):
         cls.node_path = shutil.which("node")
         if not cls.node_path:
             raise unittest.SkipTest("Node.js is not installed on this system.")
+
+        cls.addClassCleanup(cls.cleanup_resources)
+        cls._environment_patcher = patch.dict(os.environ, TEST_ENVIRONMENT, clear=False)
+        cls._environment_patcher.start()
+        cls.db_directory = tempfile.TemporaryDirectory()
+        cls.database_url = "sqlite:///" + str(
+            Path(cls.db_directory.name, "test_proxy.db")
+        ).replace("\\", "/")
+        os.environ["DATABASE_URL"] = cls.database_url
+        for key in ("MIGRATION_DATABASE_URL", "RENDER", "VERCEL", "VERCEL_ENV"):
+            os.environ.pop(key, None)
+        cls.previous_engine = backend_app.engine
+        cls.previous_session_factory = backend_app.SessionLocal
+        cls.test_engine = create_engine(
+            cls.database_url,
+            **backend_app.database_engine_options(cls.database_url, serverless=False),
+        )
+        backend_app.engine = cls.test_engine
+        backend_app.SessionLocal = sessionmaker(
+            bind=cls.test_engine,
+            autoflush=False,
+            expire_on_commit=False,
+        )
 
         cls.backend_port = find_free_port()
         cls.proxy_port = find_free_port()
@@ -107,18 +155,31 @@ class VercelProxyE2ETests(unittest.TestCase):
             raise RuntimeError(f"Node.js proxy failed to start on port {cls.proxy_port}")
 
     @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "server"):
-            cls.server.should_exit = True
-        if hasattr(cls, "proxy_process"):
-            cls.proxy_process.kill()
-            cls.proxy_process.wait()
+    def cleanup_resources(cls):
         try:
-            Base.metadata.drop_all(engine)
-            engine.dispose()
-            DB_DIR.cleanup()
-        except Exception:
-            pass
+            if hasattr(cls, "server"):
+                cls.server.should_exit = True
+                if hasattr(cls, "backend_thread"):
+                    cls.backend_thread.join(timeout=10)
+            if hasattr(cls, "proxy_process") and cls.proxy_process.poll() is None:
+                cls.proxy_process.kill()
+                cls.proxy_process.wait()
+            if hasattr(cls, "test_engine"):
+                try:
+                    if not hasattr(cls, "backend_thread") or not cls.backend_thread.is_alive():
+                        Base.metadata.drop_all(cls.test_engine)
+                finally:
+                    cls.test_engine.dispose()
+            if hasattr(cls, "previous_engine"):
+                backend_app.stop_account_deletion_reconciliation_worker()
+        finally:
+            if hasattr(cls, "previous_engine"):
+                backend_app.engine = cls.previous_engine
+                backend_app.SessionLocal = cls.previous_session_factory
+            if hasattr(cls, "db_directory"):
+                cls.db_directory.cleanup()
+            if hasattr(cls, "_environment_patcher"):
+                cls._environment_patcher.stop()
 
     def test_01_direct_access_to_fastapi_without_secret_is_blocked_with_404(self):
         """Verify that direct requests to FastAPI without x-kite-proxy-secret return 404."""

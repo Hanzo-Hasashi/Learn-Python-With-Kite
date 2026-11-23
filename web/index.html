@@ -81,12 +81,16 @@ body{padding-left:240px}
 }
 body.kite-entry-flow{padding-left:0}
 body.kite-entry-flow .desk-nav{display:none}
+#kite-backend-status{position:fixed;z-index:20;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));display:flex;align-items:center;justify-content:space-between;gap:12px;max-width:620px;margin:0 auto;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);box-shadow:0 8px 28px rgba(14,27,54,.18);font-size:14px;line-height:1.4;pointer-events:none}
+#kite-backend-status[hidden]{display:none}
+#kite-backend-status button{flex:none;border:0;border-radius:9px;padding:8px 12px;background:var(--blue);color:#fff;font:600 13px system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;pointer-events:auto}
+@media(min-width:1000px){#kite-backend-status{left:252px;right:12px}}
 </style>
-<link rel="stylesheet" href="/assets/playground-shortcut.css">
 <link rel="stylesheet" href="/assets/pwa.css?v=pwa-2">
 </head>
 <body>
 <iframe id="f" title="Learn Python with Kite"></iframe>
+<div id="kite-backend-status" role="status" aria-live="polite" data-state="shell-ready" hidden></div>
 <nav class="desk-nav" id="desk-nav" aria-label="Primary navigation">
 <h1>Kite<span>.</span></h1>
 <div class="desk-nav-list">
@@ -214,13 +218,21 @@ function goBack(){
  navigateTo(fallback[route()]||"home")
 }
 window.kiteGoBack=goBack;
+window.kiteSetBackendStatus=function(state,message,retry){
+ var status=document.getElementById("kite-backend-status");if(!status)return;
+ status.dataset.state=state;status.replaceChildren();status.hidden=!message;
+ if(!message)return;
+ var text=document.createElement("span");text.textContent=message;status.appendChild(text);
+ if(typeof retry==="function"){var button=document.createElement("button");button.type="button";button.textContent="Retry";button.addEventListener("click",retry);status.appendChild(button)}
+};
 function show(){
  var r=route();if(r===cur)return;cur=r;closeMore();
+ if(window.kiteEnsurePlaygroundShortcut)window.kiteEnsurePlaygroundShortcut(r);
  document.body.classList.toggle("kite-entry-flow",isEntryRoute(r));
  deskNav.querySelectorAll("[data-r]").forEach(function(b){if(b.getAttribute("data-r")===r)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current")});syncDeskGroup();
  var t=theme(),root=document.documentElement;if(t==="system")root.removeAttribute("data-theme");else root.setAttribute("data-theme",t);
  f.style.opacity=0;
- setTimeout(function(){var h=DOCS[r];if(t!=="system")h=h.replace('<html lang="en">','<html lang="en" data-theme="'+t+'">');h=h.replace("<body","<body data-kite-screen=\""+r+"\"");h=h.replace("</head>","<style>"+RESPONSIVE_CSS+"</style></head>");f.srcdoc=h},120)}
+ setTimeout(function(){var h=DOCS[r];if(t!=="system")h=h.replace('<html lang="en">','<html lang="en" data-theme="'+t+'">');h=h.replace("<body","<body data-kite-screen=\""+r+"\"");h=h.replace("</head>","<style>"+RESPONSIVE_CSS+"</style></head>");h=h.replace(/<link rel="stylesheet" href="(https:\/\/fonts\.googleapis\.com\/css2\?[^"]+)">/g,function(_,href){return '<link rel="preload" as="style" href="'+href+'" onload="this.onload=null;this.rel=\'stylesheet\'">'});h=h.replace("</body>","<script>parent.postMessage({kite:'document-ready',r:'"+r+"'},'*')<\\/script></body>");f.srcdoc=h},120)}
 function syncEmbeddedLayout(){var b=f.contentDocument&&f.contentDocument.body;if(!b)return;if(window.matchMedia("(min-width:740px)").matches)b.setAttribute("data-kite-wide-nav","true");else b.removeAttribute("data-kite-wide-nav")}
 f.addEventListener("load",function(){syncEmbeddedLayout();f.style.opacity=1;try{f.contentWindow.focus()}catch(e){}});
 window.addEventListener("resize",syncEmbeddedLayout);
@@ -236,7 +248,18 @@ try{if(localStorage.getItem(deskMoreKey)==="0")setDeskGroup(false)}catch(e){}
 deskNav.addEventListener("click",function(e){if(e.target.closest(".desk-nav-toggle")){setDeskGroup(deskMore.hidden);return}var b=e.target.closest("[data-r]");if(b)navigateTo(b.getAttribute("data-r"))});
 document.addEventListener("keydown",function(e){if(e.key==="Escape")closeMore()});
 window.addEventListener("message",function(e){
- if(e.source!==f.contentWindow||!e.data||!e.data.kite)return;var r=e.data.r;
+ if(e.source!==f.contentWindow||!e.data||!e.data.kite)return;
+ if(e.data.kite==="document-ready"){
+  if(e.data.r!==cur)return;
+  var readyDoc=f.contentDocument;
+  if(readyDoc&&readyDoc.body&&readyDoc.body.getAttribute("data-kite-screen")===e.data.r){
+   syncEmbeddedLayout();f.style.opacity=1;
+   if(typeof window.kiteInstallFrameDocument==="function")window.kiteInstallFrameDocument(e.data.r);
+   else window.kitePendingFrameRoute=e.data.r
+  }
+  return
+ }
+ var r=e.data.r;
  if(r==="back"){goBack();return}
  if(r==="more"){openMore();return}
  if(DOCS[r])navigateTo(r)});
@@ -244,9 +267,8 @@ initializeRouteHistory();
 show();
 })();
 </script>
-<script src="/assets/config.js"></script>
-<script src="/assets/app.js?v=password-recovery-21" defer></script>
-<script src="/assets/playground-shortcut.js" defer></script>
+<script src="/assets/config.js?v=config-1" defer></script>
+<script src="/assets/app.js?v=loading-state-23" defer></script>
 <script src="/assets/pwa.js?v=pwa-2" defer></script>
 </body>
 </html>

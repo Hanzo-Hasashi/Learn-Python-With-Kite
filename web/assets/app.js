@@ -49,12 +49,57 @@
   var activePlaygroundRun = null;
   var routeUser = null;
   var shellUserRequest = null;
+  var playgroundShortcutRequested = false;
 
   function routeKeyFromHash(hashValue) {
     var raw = (hashValue || "").replace(/^#/, "");
     var queryIndex = raw.indexOf("?");
     return queryIndex >= 0 ? raw.slice(0, queryIndex) : raw;
   }
+
+  function setBackendStatus(state, message, retry) {
+    if (typeof window.kiteSetBackendStatus === "function") {
+      window.kiteSetBackendStatus(state, message, retry);
+    }
+  }
+  function showSessionFailure(error) {
+    var starting = Boolean(error && (
+      error.timedOut || [502, 503, 504].indexOf(error.status) >= 0
+    ));
+    setBackendStatus(
+      starting ? "starting" : "unavailable",
+      starting
+        ? "The Kite service may be starting or temporarily unavailable. Your account data has not been loaded."
+        : "Kite is temporarily unavailable. Your account data has not been loaded; check your connection and try again.",
+      function () { window.location.reload(); }
+    );
+  }
+  function ensurePlaygroundShortcut(route) {
+    if (playgroundShortcutRequested ||
+        ["learn", "lesson", "challenge", "quiz"].indexOf(route) < 0) return;
+    playgroundShortcutRequested = true;
+
+    var stylesheet = document.createElement("link");
+    stylesheet.rel = "stylesheet";
+    stylesheet.href = "/assets/playground-shortcut.css?v=playground-shortcut-1";
+    function loadShortcutScript() {
+      var script = document.createElement("script");
+      script.src = "/assets/playground-shortcut.js?v=playground-shortcut-1";
+      script.async = false;
+      script.onerror = function () {
+        console.warn("Could not load the Playground shortcut.");
+      };
+      document.body.appendChild(script);
+    }
+    stylesheet.onload = loadShortcutScript;
+    stylesheet.onerror = function () {
+      console.warn("Could not load the Playground shortcut styles.");
+      loadShortcutScript();
+    };
+    document.head.appendChild(stylesheet);
+  }
+  window.kiteEnsurePlaygroundShortcut = ensurePlaygroundShortcut;
+  ensurePlaygroundShortcut(routeKeyFromHash(window.location.hash));
 
   function token() {
     return authUser ? "cookie-session" : null;
@@ -149,16 +194,18 @@
     authUser = data && data.user ? data.user : null;
     authCsrf = data && data.csrf_token ? data.csrf_token : "";
     setMoreMenuAuthState(Boolean(authUser));
+    setBackendStatus("ready", "");
     return authUser;
   }
-  var sessionRequestTimeout = 20000;
-  var defaultRequestTimeout = 60000;
+  var sessionRequestTimeout = 70000;
+  var defaultRequestTimeout = 70000;
   function apiUrl(path) {
     return String(window.KITE_API_BASE || "").replace(/\/+$/, "") + path;
   }
   // fetch() against the configured API origin with an upper time bound, so an unreachable or
   // stalled backend produces a clear error instead of leaving screens waiting indefinitely.
-  function apiFetch(path, options, timeoutMs) {
+  function apiFetch(path, options, timeoutMs, maxAttempts) {
+    maxAttempts = maxAttempts || 2;
     function attempt(attemptNumber) {
       var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
       var timeoutId;
@@ -190,7 +237,7 @@
       return Promise.race([request, timedOut]).finally(function () { clearTimeout(timeoutId); })
         .then(function (response) {
           var method = (options && options.method || "GET").toUpperCase();
-          if (attemptNumber < 2 && method === "GET" &&
+          if (attemptNumber < maxAttempts && method === "GET" &&
               [502, 503, 504].indexOf(response.status) >= 0) {
             return new Promise(function (resolve) { setTimeout(resolve, 1000); })
               .then(function () { return attempt(attemptNumber + 1); });
@@ -199,7 +246,7 @@
         })
         .catch(function (error) {
           var method = (options && options.method || "GET").toUpperCase();
-          if (attemptNumber < 2 && method === "GET" &&
+          if (attemptNumber < maxAttempts && method === "GET" &&
               (error.networkFailure || error.timedOut)) {
             return new Promise(function (resolve) { setTimeout(resolve, 750); })
               .then(function () { return attempt(attemptNumber + 1); });
@@ -211,10 +258,20 @@
   }
   function restoreAuthentication() {
     if (authRestoration) return authRestoration;
+    setBackendStatus("auth-restoring", "Checking your saved session...");
     var restorationVersion = authStateVersion;
+    var slowSessionTimer = window.setTimeout(function () {
+      if (restorationVersion === authStateVersion) {
+        setBackendStatus(
+          "starting",
+          "Kite is taking longer than usual to respond. The service may be starting; your account data has not been loaded.",
+          function () { window.location.reload(); }
+        );
+      }
+    }, 8000);
     function fetchCurrentSession() {
       if (restorationVersion !== authStateVersion) return Promise.resolve(authUser);
-      return apiFetch("/api/auth/session", { method: "GET" }, sessionRequestTimeout)
+      return apiFetch("/api/auth/session", { method: "GET" }, sessionRequestTimeout, 1)
         .then(function (response) { return responseData(response, "/api/auth/session"); }).then(function (data) {
         return acceptAuthSession(data, restorationVersion);
       });
@@ -249,9 +306,10 @@
         if (restorationVersion !== authStateVersion) return authUser;
         if (error.status === 401) {
           clearAuthTokens();
+          setBackendStatus("ready", "");
           return null;
         }
-        authRestoration = null;
+        showSessionFailure(error);
         throw error;
       });
     } else {
@@ -259,12 +317,16 @@
         if (restorationVersion !== authStateVersion) return authUser;
         if (error.status === 401) {
           clearAuthTokens();
+          setBackendStatus("ready", "");
           return null;
         }
-        authRestoration = null;
+        showSessionFailure(error);
         throw error;
       });
     }
+    authRestoration = authRestoration.finally(function () {
+      window.clearTimeout(slowSessionTimer);
+    });
     return authRestoration;
   }
   function signInForRoute(route) {
@@ -2600,6 +2662,8 @@
         if (progressBar) progressBar.style.visibility = "";
       }
       function showHomeUnavailable(doc, error) {
+        var heading = doc.querySelector("h1");
+        if (heading) heading.textContent = "Dashboard unavailable";
         var note = doc.querySelector(".pc small");
         if (note) note.textContent = "Progress data is currently unavailable.";
         var lessonCard = doc.querySelector(".lc:not(.kite-guest-progress)");
@@ -4625,6 +4689,20 @@
     if (authCallback) route = "launch";
     var sessionReady = restoreAuthentication();
     if (route.indexOf("access_token=") === 0 || route.indexOf("error=") === 0) route = "launch";
+    function isCurrentRouteDocument() {
+      if (!frame || frame.contentDocument !== doc) return false;
+      var currentHash = window.location.hash || "#launch";
+      var currentRoute = routeKeyFromHash(currentHash);
+      var currentParams = new URLSearchParams(currentHash.slice(1));
+      var currentAuthCallback = currentParams.has("access_token") ||
+        currentParams.has("error") || currentParams.has("error_description") ||
+        currentParams.get("type") === "recovery" || currentParams.has("token");
+      if (launchViews.indexOf(currentRoute) >= 0 || currentAuthCallback ||
+          knownRoutes.indexOf(currentRoute) < 0) {
+        currentRoute = "launch";
+      }
+      return currentRoute === route;
+    }
     applyPythonBranding(doc, route);
     if (route === "notifications") addNotificationBackButton(doc);
 
@@ -5398,62 +5476,27 @@
 
     if (route === "home") prepareHomeLoading(doc);
     if (route === "lesson") prepareLessonLoading(doc);
-    sessionReady.then(function () {
+    sessionReady.then(function (restoredUser) {
+      if (!isCurrentRouteDocument()) return;
       if (route === "launch") {
         var resetCredential = resetToken();
         var callbackType = new URLSearchParams(window.location.hash.slice(1)).get("type");
         if (resetCredential || callbackType === "recovery") return;
-        if (token()) {
-          api("/api/me").then(function (me) {
-            hydrateShellUser(doc, me);
-            showSignedIn(doc, me.name);
-          }).catch(function (error) {
-            if (error.status !== 401) tell(doc, error.message, true);
-          });
+        if (restoredUser) {
+          hydrateShellUser(doc, restoredUser);
+          showSignedIn(doc, restoredUser.name);
         }
         return;
       }
-      if (route === "home" && token()) {
-        if (!token()) {
-          signInForRoute(route);
-          return;
-        }
-        api("/api/me").then(function (me) {
-          hydrateRouteData(me);
-        }).catch(function (error) {
-          if (error.status === 401) {
-            clearAuthTokens();
-            signInForRoute(route);
-            return;
-          }
-          showHomeUnavailable(doc, error);
-        });
-        return;
-      }
-      if (route === "progress" && token()) {
-        api("/api/me").then(function (me) {
-          hydrateRouteData(me);
-        }).catch(function (error) {
-          if (error.status === 401) {
-            clearAuthTokens();
-            hydrateRouteData(null);
-            return;
-          }
-          showContentUnavailable(doc, doc.querySelector(".scroll"), "progress data",
-            function () { window.location.reload(); }, error);
-        });
-        return;
-      }
-      if (route !== "launch") hydrateRouteData(null);
+      hydrateRouteData(restoredUser);
     }).catch(function (error) {
-      if (error.status !== 404) {
-        tell(doc, "Kite couldn't confirm your saved session. Check your connection and try again.", true);
-      }
-      if (route === "progress") {
-        showContentUnavailable(doc, doc.querySelector(".scroll"), "progress data",
-          function () { window.location.reload(); }, error);
+      if (!isCurrentRouteDocument()) return;
+      if (route === "home") {
+        showHomeUnavailable(doc, error);
       } else if (route !== "launch") {
-        hydrateRouteData(null);
+        tell(doc, "Kite couldn't confirm your saved session. Your account and learning data have not been loaded.", true);
+      } else if (error.status !== 404) {
+        tell(doc, "Kite couldn't confirm your saved session. Check your connection and try again.", true);
       }
     });
     ["b-terms", "b-priv", "b-con"].forEach(function (id) {
@@ -5475,6 +5518,17 @@
       if (frame.contentWindow.location.hash !== hashValue) {
         frame.contentWindow.location.hash = hashValue;
       }
+    }
+    window.kiteInstallFrameDocument = function (routeName) {
+      var doc = frame.contentDocument;
+      if (!doc || !doc.body || doc.body.getAttribute("data-kite-screen") !== routeName) return;
+      install(doc);
+      syncAuthSubroute();
+    };
+    if (window.kitePendingFrameRoute) {
+      var pendingRoute = window.kitePendingFrameRoute;
+      window.kitePendingFrameRoute = null;
+      window.kiteInstallFrameDocument(pendingRoute);
     }
     frame.addEventListener("load", function () {
       try {

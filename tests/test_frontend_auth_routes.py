@@ -8,6 +8,7 @@ import functools
 import http.server
 import json
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -23,6 +24,16 @@ except ImportError:  # pragma: no cover - depends on the local toolchain
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        if self.path == "/__delayed-font.css":
+            time.sleep(3)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/css")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_GET()
 
 
 def _launch_browser(playwright):
@@ -183,6 +194,138 @@ class AuthenticationRouteBrowserTests(unittest.TestCase):
         self.assertTrue(
             self.frame_eval("Boolean(document.querySelector('form[data-kite-reset]'))")
         )
+
+    def test_backend_startup_failure_keeps_shell_visible_without_guest_fallback(self):
+        request_statuses = []
+
+        def backend_starting(route):
+            request_statuses.append(route.request.url)
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"detail": "temporarily unavailable"}),
+            )
+
+        self.page.route("**/api/auth/session", backend_starting)
+        self.open("#home")
+        self.page.wait_for_function(
+            "document.getElementById('kite-backend-status').dataset.state === 'starting'",
+            timeout=5000,
+        )
+
+        status = self.page.locator("#kite-backend-status")
+        self.assertTrue(status.is_visible())
+        self.assertIn("Your account data has not been loaded", status.inner_text())
+        self.assertEqual(len(request_statuses), 1)
+        self.assertEqual(
+            self.page.evaluate("document.getElementById('f').style.opacity"),
+            "1",
+        )
+        self.assertEqual(
+            self.frame_eval("document.querySelector('h1').textContent"),
+            "Dashboard unavailable",
+        )
+        self.assertNotIn("Welcome, Guest", self.frame_eval("document.body.innerText"))
+        self.page.evaluate("window.location.hash = '#learn'")
+        self.page.wait_for_function(
+            "() => { const d = document.getElementById('f').contentDocument;"
+            " return Boolean(d && d.body && d.body.getAttribute('data-kite-screen') === 'learn'); }",
+            timeout=5000,
+        )
+        self.assertEqual(len(request_statuses), 1)
+
+    def test_retry_restores_the_saved_user_without_a_duplicate_profile_request(self):
+        session_requests = []
+        profile_requests = []
+        user = {
+            "id": 73,
+            "email": "ada@example.test",
+            "name": "Ada Lovelace",
+            "xp": 42,
+            "streak": 2,
+            "premium": False,
+            "settings": {},
+        }
+
+        def restore_session(route):
+            session_requests.append(route.request.url)
+            if len(session_requests) == 1:
+                route.fulfill(
+                    status=503,
+                    content_type="application/json",
+                    body=json.dumps({"detail": "temporarily unavailable"}),
+                )
+                return
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"user": user, "csrf_token": "recovered-csrf"}),
+            )
+
+        self.page.on(
+            "request",
+            lambda request: profile_requests.append(request.url)
+            if request.url.endswith("/api/me") else None,
+        )
+        self.page.route("**/api/auth/session", restore_session)
+        self.open("#launch")
+        self.page.wait_for_function(
+            "document.getElementById('kite-backend-status').dataset.state === 'starting'",
+            timeout=5000,
+        )
+        self.assertEqual(len(session_requests), 1)
+
+        self.page.locator("#kite-backend-status").get_by_role("button", name="Retry").click()
+        self.wait_for_heading("You’re in, Ada!")
+        self.assertEqual(len(session_requests), 2)
+        self.assertEqual(profile_requests, [])
+        self.assertFalse(self.page.locator("#kite-backend-status").is_visible())
+
+    def test_initial_screen_and_session_restore_do_not_wait_for_external_font_css(self):
+        font_requests = []
+        self.page.on(
+            "request",
+            lambda request: font_requests.append(request.url)
+            if "fonts.googleapis.com" in request.url else None,
+        )
+        self.page.route(
+            "https://fonts.googleapis.com/**",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/css",
+                body="@import url('" + self.base + "__delayed-font.css');",
+            ),
+        )
+        self.page.route(
+            "**/api/auth/session",
+            lambda route: route.fulfill(
+                status=401,
+                content_type="application/json",
+                body=json.dumps({"detail": "Sign in to continue."}),
+            ),
+        )
+        self.page.goto(self.base + "#launch", wait_until="domcontentloaded")
+        self.page.wait_for_function(
+            "document.getElementById('kite-backend-status').dataset.state === 'ready'",
+            timeout=2000,
+        )
+        self.assertTrue(font_requests)
+        self.assertEqual(self.page.evaluate("document.getElementById('f').style.opacity"), "1")
+        self.assertEqual(
+            self.frame_eval("document.body.getAttribute('data-kite-screen')"),
+            "launch",
+        )
+
+    def test_playground_shortcut_loads_only_for_learning_routes(self):
+        self.open("#learn")
+        self.page.wait_for_selector("#kite-playground-shortcut", timeout=5000)
+        loaded_assets = self.page.evaluate(
+            "() => performance.getEntriesByType('resource').map((entry) => entry.name)"
+        )
+        self.assertTrue(any(
+            "/assets/playground-shortcut.js?v=playground-shortcut-1" in asset
+            for asset in loaded_assets
+        ))
 
     def test_password_reset_requires_matching_passwords_and_completes(self):
         requests = []

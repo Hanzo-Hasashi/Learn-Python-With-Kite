@@ -189,11 +189,50 @@ async function handler(req, res) {
   const isHttps = backendUrl.protocol === 'https:';
   const transport = isHttps ? https : http;
   let attempt = 0;
-  let retryScheduled = false;
+  let retryTimer = null;
+  let activeUpstreamReq = null;
+  let activeUpstreamRes = null;
+  let clientDisconnected = false;
+  const retryableMethod = method === 'GET' || method === 'HEAD';
+
+  function clearRetryTimer() {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  }
+
+  function disconnectClient() {
+    if (res.writableEnded || clientDisconnected) return;
+    clientDisconnected = true;
+    clearRetryTimer();
+    if (activeUpstreamReq && !activeUpstreamReq.destroyed) activeUpstreamReq.destroy();
+    if (activeUpstreamRes && !activeUpstreamRes.destroyed) activeUpstreamRes.destroy();
+  }
+
+  function sendError(statusCode, detail) {
+    if (clientDisconnected || res.writableEnded || res.headersSent) return;
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.end(JSON.stringify({ detail }));
+  }
+
+  function scheduleRetry() {
+    if (clientDisconnected || retryTimer || !retryableMethod || attempt !== 1) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (!clientDisconnected) sendUpstream();
+    }, 1000);
+  }
+
+  res.on('close', disconnectClient);
+  req.on('aborted', disconnectClient);
+  res.on('finish', clearRetryTimer);
 
   function sendUpstream() {
+    if (clientDisconnected) return;
     attempt += 1;
-    const retryableMethod = method === 'GET' || method === 'HEAD';
 
     const requestOptions = {
       protocol: backendUrl.protocol,
@@ -206,14 +245,16 @@ async function handler(req, res) {
     };
 
     const upstreamReq = transport.request(requestOptions, (upstreamRes) => {
+      upstreamReq.setTimeout(0);
       const upstreamStatus = upstreamRes.statusCode || 502;
       if (retryableMethod && attempt === 1 &&
           (upstreamStatus === 502 || upstreamStatus === 503 || upstreamStatus === 504)) {
         upstreamRes.resume();
-        setTimeout(sendUpstream, 1000);
+        scheduleRetry();
         return;
       }
 
+      activeUpstreamRes = upstreamRes;
       res.statusCode = upstreamStatus;
 
       for (const [key, value] of Object.entries(upstreamRes.headers)) {
@@ -227,36 +268,33 @@ async function handler(req, res) {
       }
 
       res.setHeader('Cache-Control', 'private, no-store');
+      upstreamRes.on('error', () => {
+        if (clientDisconnected) return;
+        if (!res.headersSent) sendError(502, 'Kite backend is currently unreachable. Please try again shortly.');
+        else res.destroy();
+      });
       upstreamRes.pipe(res);
     });
+    activeUpstreamReq = upstreamReq;
 
     upstreamReq.on('timeout', () => {
-      upstreamReq.destroy();
-      if (retryableMethod && attempt === 1 && !retryScheduled) {
-        retryScheduled = true;
-        setTimeout(sendUpstream, 1000);
+      if (clientDisconnected) return;
+      if (retryableMethod && attempt === 1) {
+        scheduleRetry();
+        upstreamReq.destroy();
         return;
       }
-      if (!res.headersSent) {
-        res.statusCode = 504;
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'private, no-store');
-        res.end(JSON.stringify({ detail: 'Kite backend request timed out.' }));
-      }
+      upstreamReq.destroy();
+      sendError(504, 'Kite backend request timed out.');
     });
 
-    upstreamReq.on('error', (err) => {
-      if (retryableMethod && attempt === 1 && !retryScheduled) {
-        retryScheduled = true;
-        setTimeout(sendUpstream, 1000);
+    upstreamReq.on('error', () => {
+      if (clientDisconnected) return;
+      if (retryableMethod && attempt === 1) {
+        scheduleRetry();
         return;
       }
-      if (!res.headersSent) {
-        res.statusCode = 502;
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'private, no-store');
-        res.end(JSON.stringify({ detail: 'Kite backend is currently unreachable. Please try again shortly.' }));
-      }
+      sendError(502, 'Kite backend is currently unreachable. Please try again shortly.');
     });
 
     if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && bodyBuffer.length > 0) {

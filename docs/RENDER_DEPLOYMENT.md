@@ -10,7 +10,7 @@
 
 ## 1. Hosting Architecture
 
-Kite uses a decoupled, modern cloud architecture designed for zero recurring infrastructure costs on free tiers:
+Kite uses a decoupled cloud architecture. Free tiers may be suitable for development and evaluation, but do not provide production availability guarantees:
 
 ```
 [ Learner Browser ]
@@ -105,14 +105,16 @@ Kite provides two distinct health endpoints:
 ### A. Liveness Probe: `GET /health` (Render Health Check Path)
 * **URL:** `https://<render-service-name>.onrender.com/health`
 * **Response:** `{"status": "ok"}` with HTTP 200.
-* **Execution:** Ultra-lightweight and fast (<2 ms). Does not query the database, writes zero data, requires no authentication, and is exempt from origin/proxy checks.
+* **Execution:** A lightweight handler that does not query the database, write data, or require authentication, and is exempt from origin/proxy checks. No latency threshold is claimed.
 * **Purpose:** This is the exact endpoint configured in Render's **Health Check Path**. Render pings this endpoint during new deployments and will abort the deploy if it does not return HTTP 200 within 5 seconds.
 
 ### B. Readiness Probe: `GET /health/ready` (Deep Inspection)
 * **URL:** `https://<render-service-name>.onrender.com/health/ready`
 * **Response:** `{"status": "ready", "database": "connected"}` with HTTP 200 (or HTTP 503 if disconnected).
 * **Execution:** Performs a lightweight `SELECT 1` query using the database connection pool.
-* **Purpose:** Used for manual verification or external synthetic monitoring when deep database reachability confirmation is required.
+* **Purpose:** Used for manual database-readiness verification. Do not schedule synthetic requests to defeat Free-plan spin-down.
+
+The `/health` handler itself is independent of database availability once the application has started. Startup deliberately fails closed if database schema or runtime-permission validation cannot complete, so a process that starts while PostgreSQL is unavailable will not serve either health endpoint until the required database checks pass.
 
 ---
 
@@ -143,8 +145,10 @@ Configure these in the Render Dashboard under:
 
 #### Option A: Vercel Same-Origin Serverless Proxy Mode (Implemented & Recommended)
 Browsers enforce strict cross-site cookie boundaries between `vercel.app` and `onrender.com` (both are on the Public Suffix List). Vercel Proxy Mode routes `/api/*` requests through Vercel's serverless proxy function (`web/api/proxy.js`) to Render, injecting the private `x-kite-proxy-secret` header server-side:
-* **Proxy Handler:** Implemented in `web/api/proxy.js` (and mirrored in `api/proxy.js`).
+* **Proxy Handler:** Implemented in `web/api/proxy.js`. The root `api/proxy.js` entry point delegates to it for root-directory deployments.
 * **Vercel Rewrite:** Configured in `web/vercel.json` routing `/api` and `/api/:match*` to `/api/proxy`.
+* **Vercel Project Root:** Set the Vercel project's Root Directory to `web` so its `vercel.json` rewrites, cache headers, and 75-second proxy-function limit are applied. Confirm this dashboard setting; it cannot be verified from the repository.
+* **Cold Starts:** The browser bounds initial session restoration at 70 seconds, and the proxy retries a GET/HEAD upstream request at most once after a 30-second timeout. This can accommodate a typical Render wake-up but does not guarantee recovery or continuous availability.
 * **Vercel Environment Variables (Configure in Vercel Dashboard):**
   * `KITE_PROXY_SECRET`: Shared secret string of at least 32 characters (must match Render).
   * `KITE_BACKEND_URL`: `https://kite-backend-958r.onrender.com` (Render service HTTPS origin).
@@ -229,31 +233,31 @@ Set a stable `KITE_SECRET_KEY` before enabling recovery and keep it unchanged wh
 
 ---
 
-## 11. Automated Keep-Alive via GitHub Actions & cron-job.org
+## 11. Render Free Instance Availability
 
-Render Free Web Services automatically spin down ("sleep") after 15 minutes of inbound HTTP inactivity. To keep the service responsive during active hours:
+The repository's deployment documentation describes the FastAPI backend as a Render Free web service; the live service plan was not verified through the Render Dashboard. Render's Free web services spin down after 15 minutes without inbound traffic and can take about a minute to start. Render describes Free instances as unsuitable for production workloads. Free instance hours are shared across services in a workspace, so synthetic traffic can also consume the monthly allowance.
 
-1. **GitHub Actions Scheduled Keep-Alive (Included in Repository):**
-   * Workflow file: `.github/workflows/keep-alive.yml`
-   * **Schedule:** Every 10 minutes (`*/10 * * * *`)
-   * **Target Endpoint:** `https://kite-backend-958r.onrender.com/health`
-   * Automatically executes on GitHub hosted runners to ping the liveness endpoint, preventing idle sleep.
+Render documents Free-service spin-down and cold starts. The live service plan and account-specific terms have not been verified, and the reviewed public documentation does not establish whether synthetic keep-alive requests are permitted. This repository therefore provides a manual-only health check and does not schedule keep-alive traffic. A manual request may wake a sleeping service but does not guarantee continuous availability. Confirm the current Render terms before considering scheduled requests; an always-on paid instance is the appropriate option when production availability is required.
 
-2. **Optional External Ping via cron-job.org:**
-   * **URL:** `https://kite-backend-958r.onrender.com/health`
-   * **Execution Schedule:** Every 10-12 minutes (`*/10 * * * *`).
-   * **Request Method:** `GET`.
-   * **Failure Notification:** Enable email alerts if the endpoint fails 3 consecutive times.
-3. **Critical Limitations of External Pings:**
-   * **Monthly Free Hours Limit:** Render Free accounts receive 750 free instance hours per calendar month across all free services. A single service running continuously 24/7 uses 744 hours in a 31-day month ($31 \times 24 = 744$). If you run more than one free service or have multiple rebuilds, your 750 hours will be exhausted before the month ends, causing Render to suspend the service until the 1st of the next month.
-   * **Platform Spin-Downs:** Render reserves the right to spin down free instances regardless of synthetic pings during maintenance cycles.
-   * **Conclusion:** Use cron-job.org to prevent cold-starts during learner waking hours (e.g., schedule it between 06:00 and 23:00 UTC), rather than expecting guaranteed 24/7 commercial uptime from a free plan.
+The repository includes a **manual-only** liveness check at `.github/workflows/render-health-check.yml`. To use it:
+
+1. Add a GitHub Actions secret named `RENDER_HEALTH_URL` with the exact value `https://kite-backend-958r.onrender.com/health` (replace the hostname if the Render service URL changes).
+2. Open **Actions → Render Backend Health Check → Run workflow**.
+3. The workflow makes a bounded GET request to `/health`, retries transient network and server errors up to three times, logs only the HTTP status and curl exit code, and does not print the secret URL.
+
+Manually running the check may wake a sleeping instance, but it does not prevent later spin-down. For consistently low latency and production availability, use an always-on Render web-service plan or another approved always-on host. Confirm current pricing and service limits on Render's pricing page before upgrading; no hosting plan or production setting was changed for this task.
+
+### Startup, Health, and Frontend Loading
+
+`GET /health` is a liveness check only: it returns immediately without querying PostgreSQL or Supabase. `GET /health/ready` performs `SELECT 1` against PostgreSQL and should be used when database readiness matters. An unhealthy database must not make the process appear dead to the liveness probe.
+
+The Vercel HTML shell is served independently of Render. It renders before API requests finish and reports session restoration or temporary backend unavailability without treating a failed session request as a signed-out user. Public assets under `/assets/` receive a bounded CDN cache lifetime; API proxy responses remain `private, no-store` and are excluded from service-worker caching.
 
 ---
 
 ## 12. Render Free-Tier Sleeping and Restart Limitations
 
-* **Cold Starts:** If the service has spun down due to 15 minutes of inactivity, the next incoming HTTP request will experience a 30 to 50-second cold-start delay while Render provisions the container and boots Python.
+* **Cold Starts:** If the service has spun down due to 15 minutes of inactivity, the next incoming HTTP request may wait about a minute while Render starts the service. Actual delay varies.
 * **Single Instance:** Free services run on exactly 1 instance. Zero-downtime rolling deploys are not available on the free tier (the old container stops before the new container starts).
 * **Ephemeral Memory:** In-memory rate limiting dictionaries (`auth_attempts`) reset when the service restarts. Persistent abuse tracking is backed by database session checks.
 
@@ -274,7 +278,7 @@ An exhaustive audit of the backend confirms:
 * **No Internal Schedulers:** The backend does **not** run APScheduler, Celery, Celery Beat, or continuous asyncio background loops.
 * **On-Demand Processing:** All subscription checks and payment reconciliations are triggered strictly on-demand by incoming HTTP requests (user actions or payment provider webhooks).
 * **Subscription Expiry:** Subscriptions expire naturally when `expires_at <= utcnow()`. There is no background worker that must run to revoke expired access.
-* **Webhook Reliability:** Payment webhooks (`/api/payment-webhooks/{provider_id}`) will wake up a sleeping Render service, process the payload, update the database, and respond to the payment gateway.
+* **Webhook Reliability:** Payment webhooks (`/api/payment-webhooks/{provider_id}`) can wake a sleeping Render service, but delivery and processing may be affected by the cold-start delay. Verify provider retry and timeout settings before relying on webhooks.
 
 ---
 

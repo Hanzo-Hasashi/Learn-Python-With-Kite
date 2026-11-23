@@ -1,5 +1,6 @@
 import os
 
+_ORIGINAL_ENVIRONMENT = os.environ.copy()
 os.environ.setdefault("KITE_ENV", "development")
 import tempfile
 import unittest
@@ -13,6 +14,9 @@ from sqlalchemy.orm import Session
 
 from backend.app import Base, User
 from backend.db_schema import validate_existing_schema_baseline
+
+os.environ.clear()
+os.environ.update(_ORIGINAL_ENVIRONMENT)
 
 
 ROOT = Path(__file__).parent.parent

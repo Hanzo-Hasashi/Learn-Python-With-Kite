@@ -92,6 +92,41 @@ class ProgressiveWebAppTests(unittest.TestCase):
         self.assertIn('navigator.onLine === false', app)
         self.assertIn("Please check your internet connection and try again.", app)
 
+    def test_static_assets_are_cached_without_publicly_caching_api_responses(self):
+        vercel = json.loads((WEB_ROOT / "vercel.json").read_text(encoding="utf-8"))
+        html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+        app = (WEB_ROOT / "assets" / "app.js").read_text(encoding="utf-8")
+        worker = (WEB_ROOT / "sw.js").read_text(encoding="utf-8")
+        proxy = (WEB_ROOT / "api" / "proxy.js").read_text(encoding="utf-8")
+        headers = {item["source"]: item["headers"] for item in vercel["headers"]}
+
+        asset_cache = next(
+            item["value"] for item in headers["/assets/:match*"]
+            if item["key"].lower() == "cache-control"
+        )
+        shell_cache = next(
+            item["value"] for item in headers["/"]
+            if item["key"].lower() == "cache-control"
+        )
+        self.assertIn("max-age=3600", asset_cache)
+        self.assertIn("stale-while-revalidate=86400", asset_cache)
+        self.assertIn("max-age=0", shell_cache)
+        self.assertNotIn("/api/:match*", headers)
+        self.assertIn("Cache-Control', 'private, no-store", proxy)
+        self.assertIn('url.pathname.indexOf("/api/") === 0', worker)
+
+        self.assertIn('src="/assets/config.js?v=config-1"', html)
+        self.assertIn('"/assets/config.js?v=config-1"', worker)
+        self.assertIn('src="/assets/app.js?v=loading-state-23"', html)
+        self.assertIn('"/assets/app.js?v=loading-state-23"', worker)
+        self.assertIn("/assets/playground-shortcut.js?v=playground-shortcut-1", app)
+        self.assertNotIn('src="/assets/playground-shortcut.js"', html)
+        shell = re.search(r"const APP_SHELL = \[(.*?)\];", worker, re.DOTALL).group(1)
+        self.assertNotIn("playground-shortcut", shell)
+        self.assertIn('const CACHE_NAME = "kite-shell-v11";', worker)
+        self.assertIn("/index.html", headers)
+        self.assertEqual(vercel["functions"]["api/proxy.js"]["maxDuration"], 75)
+
     def test_twa_and_capacitor_use_the_proposed_package_identity(self):
         config = json.loads(TWA_CONFIG_PATH.read_text(encoding="utf-8"))
         capacitor = json.loads((ROOT / "capacitor.config.json").read_text(encoding="utf-8"))
