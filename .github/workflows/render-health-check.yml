@@ -1,4 +1,4 @@
-name: Render Backend Health Check
+name: Production Health Checks
 
 on:
   workflow_dispatch:
@@ -12,31 +12,35 @@ concurrency:
 
 jobs:
   health-check:
-    name: Check Render liveness
+    name: Check ${{ matrix.service }}
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: Render backend liveness
+            url: https://kite-backend-958r.onrender.com/health
+          - service: Vercel frontend availability
+            url: https://learnpythonwithkite.vercel.app/
     steps:
-      - name: Request the liveness endpoint
+      - name: Request the production endpoint
         env:
-          RENDER_HEALTH_URL: ${{ secrets.RENDER_HEALTH_URL }}
+          HEALTH_URL: ${{ matrix.url }}
         run: |
           set -u
 
-          if [ -z "${RENDER_HEALTH_URL:-}" ]; then
-            echo "::error::Configure the RENDER_HEALTH_URL repository or environment secret."
-            exit 2
-          fi
-          case "$RENDER_HEALTH_URL" in
-            https://*/health) ;;
+          case "$HEALTH_URL" in
+            https://*) ;;
             *)
-              echo "::error::RENDER_HEALTH_URL must be an HTTPS URL ending in /health."
+              echo "::error::The production health-check URL must use HTTPS."
               exit 2
               ;;
           esac
 
-          for attempt in 1 2 3; do
+          for attempt in 1 2 3 4; do
             if http_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-              --connect-timeout 10 --max-time 90 "$RENDER_HEALTH_URL"); then
+              --location --max-redirs 5 --connect-timeout 15 --max-time 90 "$HEALTH_URL"); then
               curl_status=0
             else
               curl_status=$?
@@ -44,18 +48,18 @@ jobs:
             fi
 
             if [ "$curl_status" -eq 0 ] && [ "$http_status" = "200" ]; then
-              echo "Liveness check succeeded (HTTP $http_status)."
+              echo "Endpoint check succeeded (HTTP $http_status)."
               exit 0
             fi
 
             echo "Attempt $attempt failed (curl exit $curl_status, HTTP ${http_status:-000})."
-            if [ "$attempt" -eq 3 ]; then
-              echo "::error::Render liveness check failed after 3 attempts."
+            if [ "$attempt" -eq 4 ]; then
+              echo "::error::The production endpoint check failed after 4 attempts."
               exit 1
             fi
 
             case "$http_status" in
-              4*) echo "::error::The liveness endpoint returned a non-retryable client error."; exit 1 ;;
+              4*) echo "::error::The production endpoint returned a non-retryable client error."; exit 1 ;;
             esac
-            sleep "$((attempt * 2))"
+            sleep "$((attempt * 5))"
           done

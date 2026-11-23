@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            .github/workflows/ci.yml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt PyYAML==6.0.2
+
+      - name: Run Python test suite
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Run Node proxy lifecycle tests
+        run: node --test tests/test_proxy_lifecycle.js
+
+      - name: Compile Python sources
+        run: python -m compileall -q backend tests api
+
+      - name: Check JavaScript syntax
+        run: git ls-files -z '*.js' | xargs -0 -r -n 1 node --check
+
+      - name: Validate YAML and JSON configuration
+        run: |
+          python -c "from pathlib import Path; import yaml; files = [Path('render.yaml'), *Path('.github/workflows').glob('*.yml')]; [yaml.safe_load(path.read_text(encoding='utf-8')) for path in files]; print('Validated YAML:', ', '.join(map(str, files)))"
+          python -m json.tool web/vercel.json > /dev/null
+
+      - name: Check patch whitespace
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git diff --check "$PR_BASE_SHA...$GITHUB_SHA"
+          elif [[ "$EVENT_BEFORE" =~ ^0+$ ]]; then
+            git diff-tree --root --check "$GITHUB_SHA"
+          else
+            git diff --check "$EVENT_BEFORE" "$GITHUB_SHA"
+          fi
